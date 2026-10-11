@@ -719,9 +719,40 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
     display: inline-block;
   }
 
-  /* A table's row link (the first column's name) reaches the full row: 44px. */
+  /* A table's row link (the first column's name) reaches the full row: 44px. It wraps block content (the
+     name over its title), and an inline box around blocks draws no focus ring at all, so it is a block:
+     the ring then frames the whole first cell. */
   &.ft-table__rowlink {
     --sleek-target: 44px;
+    display: block;
+  }
+
+  /* A phone number on a line of its own (an emergency contact) stands alone, so it is a 40px target too. */
+  &:is(p > a[href^="tel:"]:only-child) {
+    position: relative;
+  }
+
+  &:is(p > a[href^="tel:"]:only-child)::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 40px;
+    transform: translateY(-50%);
+  }
+
+  /* Links the screens tint with the accent on hover stay ink here: pointing at one firms its underline
+     instead. The accent is for action and place, and the dark accent is a fill color (3.4:1 as words). */
+  &:is(a, button).hover\:text-accent:hover,
+  &.group-hover\:text-accent:is(.group:hover *) {
+    color: var(--ink);
+  }
+
+  &:is(a).hover\:text-accent:hover {
+    text-decoration-line: underline;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
   }
 
   /* The words under a list row's name (the candidate's current job) let clicks through to the name above
@@ -2135,6 +2166,12 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
     box-shadow: inset 3px 0 0 var(--good);
   }
 
+  /* Compliance: a rule that is still years away (25, 36, 50 employees) is not faded: its "Not yet"
+     marker and word already say so, and a fade took its ink-3 line under 4.5:1. */
+  &:is(article[id^="rule-"]).opacity-80 {
+    opacity: 1;
+  }
+
   /* The steps of a sheet flow (Start fresh: Company, Headquarters, You) are a progress track like the
      candidate stepper: a 2px gray bar over each upcoming step, a 4px ink bar and a check over a done one,
      the 4px accent bar and a bold word over the current one. */
@@ -3336,6 +3373,22 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
 
   &:is(table[role="grid"] td[role="gridcell"]):hover {
     background: var(--sleek-hover);
+  }
+
+  /* The chosen day's accent frame is drawn inside the cell (an inset shadow, not the kit's outline), so
+     keyboard focus can add the look's own ring 2px outside it: in light the two would otherwise be the
+     same blue line and focus arriving in the grid would not show. */
+  &:is(table[role="grid"] td[role="gridcell"][aria-selected="true"]) {
+    outline-color: transparent;
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+
+  /* Lifted so the next row's cells cannot paint over the ring's lower edge. */
+  &:is(table[role="grid"] td[role="gridcell"]):focus-visible {
+    position: relative;
+    z-index: 1;
+    outline: var(--focus-width) solid var(--focus);
+    outline-offset: 2px;
   }
 
   &:is(table[role="grid"] td[role="gridcell"]:is(.bg-surface-3\/60, .opacity-55) span.num:first-child:not(.bg-accent)) {

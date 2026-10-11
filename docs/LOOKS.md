@@ -235,7 +235,8 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
   single chip, date pick, a pressed choice button with `aria-pressed`, a switch that is on, the chosen look card and
   cost scenario, checkboxes) is inverse ink (`--sleek-pick`). A multi chip that is on gets a 1px ink frame and an
   accent check; off is the gray frame with no check (so a row of filters that are all on by default stays quieter
-  than the page's rules). Links are ink with a persistent underline (never color alone). `--accent` is re-scoped to ink
+  than the page's rules). Links are ink with a persistent underline (never color alone); a link the screens tint
+  with `hover:text-accent` stays ink when pointed at and firms a 2px underline instead. `--accent` is re-scoped to ink
   inside `.ft-chart`, the compliance ruler, the band meters (`ft-private--block`) and plain data bars, so data is
   never blue. The light theme has no blue wash on the selected card, the palette row or the calendar.
 - **Buttons in four steps.** Primary is the accent fill; secondary a 1px ink frame at 500 weight; ghost (tertiary
@@ -247,9 +248,11 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
   (chevrons, trailing arrows, the disclosure chevron of a summary and callout status icons stay).
 - **Targets.** Every link that stands alone (a name in a list, a table or a ledger, a job title, the job head's plan
   link, a person's manager, "Open the card") is a 40px target: a transparent `::after` 40px tall centered on the
-  words, so nothing moves. A table's row link reaches 44px; a row head's link that wraps is one box
-  (`inline-block`). Links inside a sentence keep the words' own box (the WCAG inline exception). The meta words
-  under an Inbox title, and the job and company line under a list row's name, let clicks through to the 40px
+  words, so nothing moves. A table's row link reaches 44px and is a block (an inline link around the name and
+  title blocks drew no focus ring); a row head's link that wraps is one box (`inline-block`). A phone number on a line
+  of its own (`p > a[href^="tel:"]:only-child`, an emergency contact) takes the 40px target too. Links inside a
+  sentence keep the words' own box (the WCAG inline exception). The meta words under an Inbox title, and the job
+  and company line under a list row's name, let clicks through to the 40px
   title above. Segmented cells are 41px so a strip that wraps still gives each cell 40px; sort heads are at least
   40px wide. Key caps (`ft-kbd`) are keys, not buttons: 22px, a 1px gray frame with a 2px foot, ink-2 letters, no
   hover.
@@ -302,7 +305,11 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
     band. The frozen first column is 132px (112px under 24rem of app column) with a 1px `--line-strong` rule on its
     right, so the scroller's ink edge is drawn on the right only. A matrix with more columns than fit scrolls.
   - Time off calendar: no tinted cells; weekend and out-of-month dates in ink-3, a holiday as its bold name, who is
-    out as ink words with a 3px bar in its status color (dashed amber pending), today in inverse ink.
+    out as ink words with a 3px bar in its status color (dashed amber pending), today in inverse ink. The chosen day's
+    accent frame is an inset 2px shadow, so keyboard focus adds the usual ring 2px outside it (the cell is lifted so the
+    next row never covers the ring).
+  - Compliance milestones: a rule that is years away is not faded (its "Not yet" marker says so; the kit's 80%
+    fade took its ink-3 line under 4.5:1).
   - Compliance calendar dates are unframed two-line type (a micro-caps weekday over the bold date).
   - Band meters put the min and max labels under the band's own edges. The offer letter preview is set in Archivo.
   - People cost is a ruled three-column table; the comp table's band caption sits beside its meter; Cost and runway

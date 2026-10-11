@@ -23,7 +23,7 @@ export default defineConfig(({ mode }) => ({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'server/src/**/*.test.ts', 'server/deploy/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'scripts/careers/**/*.test.ts', 'server/src/**/*.test.ts', 'server/deploy/**/*.test.ts'],
     testTimeout: 20_000,
   },
 }))
