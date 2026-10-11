@@ -701,7 +701,7 @@ function BuilderForm({
           )}
           <div className="rounded-xl bg-surface-2 px-3.5 py-3 text-[13.5px] text-ink-2">
             <p>
-              <Private className="font-semibold text-ink">{num(f.equityShares ?? 0)} options</Private>, <Private>{pct(equity.pctFD)}</Private> of <Private>{num(fd)}</Private> fully diluted shares. {equity.vesting}.
+              <Private className="font-semibold text-ink">{num(f.equityShares ?? 0)} options</Private>, <Private>{pct(equity.pctFD, 3)}</Private> of <Private>{num(fd)}</Private> fully diluted shares. {equity.vesting}.
             </p>
             {capTableIsPlaceholder(db) && (
               <p className="mt-1 flex items-start gap-1.5 font-semibold text-warn">

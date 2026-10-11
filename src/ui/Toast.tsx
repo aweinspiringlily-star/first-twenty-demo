@@ -4,10 +4,15 @@
 // toast whose change has left the history (undone with Ctrl Z, or replaced by the server's copy after
 // a sync conflict) goes away, so a stale Undo is never offered.
 //
-// Placement: bottom center. At phone width only the newest toast shows. While a sheet or dialog with a
-// footer is open the stack sits just above that footer, and (in a sheet or on a page) it moves to the top
-// when it would cover the focused control, so a toast never takes a tap meant for Save or a card's actions
-// and never hides the field being filled in.
+// A newer change's Undo toast replaces the older Undo toasts: their Undo could only refuse ("a newer change
+// came after this one"), and three stacked toasts covered a board column. Toasts without an Undo (a link,
+// a notice) stay until their own time is up.
+//
+// Placement: bottom center. At phone width only the newest toast shows. While a sheet or dialog is open
+// the stack keeps off it where the window has room: below or above a dialog, or beside a sheet (over the
+// dimmed page, which takes no input then). Where it has no room (a phone, a tall dialog on a short
+// window) the stack sits just above the dialog's footer, and moves to the top when it would cover the
+// focused control, so a toast never takes a tap meant for Save and never hides the field being filled in.
 import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { create } from 'zustand'
 import { useDB } from '@/store/db'
@@ -30,11 +35,31 @@ type ToastItem = {
   entryId?: number
 }
 
+/** At most this many toasts at once (the oldest goes first). */
+const MAX_TOASTS = 3
+
+/**
+ * The toasts after `item` arrives. A toast bound to an Undo replaces the older ones bound to an Undo (a newer
+ * change came after theirs, so their Undo could only refuse), except `keepId`, the toast that holds keyboard
+ * focus, which is never pulled out from under the person. Then the oldest go past MAX_TOASTS.
+ */
+export function nextToasts<T extends { id: number; entryId?: number }>(items: T[], item: T, keepId?: number): T[] {
+  const kept = item.entryId === undefined ? items : items.filter((i) => i.entryId === undefined || i.id === keepId)
+  return [...kept, item].slice(-MAX_TOASTS)
+}
+
+/** The toast that holds keyboard focus, if any (its data-toast-id). */
+function focusedToastId(): number | undefined {
+  if (typeof document === 'undefined') return undefined
+  const id = document.activeElement?.closest('[data-toast-id]')?.getAttribute('data-toast-id')
+  return id ? Number(id) : undefined
+}
+
 const useToasts = create<{ items: ToastItem[]; pushes: number; push: (t: Omit<ToastItem, 'id'>) => void; drop: (id: number) => void }>(
   (set) => ({
     items: [],
     pushes: 0,
-    push: (t) => set((s) => ({ items: [...s.items.slice(-2), { ...t, id: Date.now() + Math.random() }], pushes: s.pushes + 1 })),
+    push: (t) => set((s) => ({ items: nextToasts(s.items, { ...t, id: Date.now() + Math.random() }, focusedToastId()), pushes: s.pushes + 1 })),
     drop: (id) => set((s) => ({ items: s.items.filter((i) => i.id !== id) })),
   }),
 )
@@ -165,6 +190,7 @@ function ToastView({ item, hidden }: { item: ToastItem; hidden: boolean }) {
         start()
       }}
       ref={root}
+      data-toast-id={item.id}
       className={cx(
         'ft-toast',
         `ft-toast--${item.tone}`,
@@ -243,20 +269,45 @@ function useNarrow(): boolean {
   return narrow
 }
 
-/** The footer of the topmost open sheet or dialog (where its Save or Cancel lives), if it has one. */
-function openDialogFooter(): HTMLElement | null {
+/** The topmost open sheet or dialog, if any. */
+function openDialog(): HTMLElement | null {
   const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]')
-  return dialogs[dialogs.length - 1]?.querySelector<HTMLElement>('[data-overlay-footer]') ?? null
+  return dialogs[dialogs.length - 1] ?? null
 }
 
-function overlaps(a: DOMRect, b: DOMRect): boolean {
+type Box = { left: number; top: number; right: number; bottom: number }
+
+function overlaps(a: Box, b: Box): boolean {
   return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
+/** Where the stack goes while a sheet or dialog is open (see pickToastSpot). */
+export type ToastSpot = 'bottom' | 'top' | 'beside' | 'footer'
+
+/** The narrowest strip beside a sheet or dialog that still holds a toast without squeezing its words. */
+export const TOAST_SIDE_MIN = 300
+
 /**
- * Keeps the stack off the controls people are about to press: above an open dialog's footer, and at the
- * top of the window while at the bottom it would cover the focused control (a field low in a sheet, or on
- * a page). Runs only while toasts show; focus moves and scrolling place it again.
+ * Picks a place for the toast stack that keeps it off an open sheet or dialog: at the bottom of the window
+ * when the dialog leaves room below it, else at the top when it leaves room above, else in the strip
+ * beside it (left of a sheet, or left of a centered dialog on a wide window). With no room anywhere (a
+ * phone, where the sheet fills the window) it is 'footer': the stack sits just above the dialog's footer.
+ * All boxes are in window pixels; `stack` is the stack's size at the bottom edge, `pad` the strip's inset.
+ */
+export function pickToastSpot(dialog: Box, view: { width: number; height: number }, stack: { width: number; height: number }, pad: number): ToastSpot {
+  const left = (view.width - stack.width) / 2
+  const across = { left, right: left + stack.width }
+  if (!overlaps({ ...across, top: view.height - pad - stack.height, bottom: view.height - pad }, dialog)) return 'bottom'
+  if (!overlaps({ ...across, top: pad, bottom: pad + stack.height }, dialog)) return 'top'
+  if (dialog.left >= TOAST_SIDE_MIN) return 'beside'
+  return 'footer'
+}
+
+/**
+ * Keeps the stack off the controls people are about to press. While a sheet or dialog is open it keeps off
+ * the dialog where the window has room (pickToastSpot); otherwise it sits above the dialog's footer, and at
+ * the top of the window while at the bottom it would cover the focused control (a field low in a sheet, or
+ * on a page). Runs only while toasts show; focus moves, scrolling and a dialog's entry animation place it again.
  */
 function useToasterPlacement(ref: RefObject<HTMLDivElement | null>, active: boolean, shown: string) {
   useLayoutEffect(() => {
@@ -268,51 +319,77 @@ function useToasterPlacement(ref: RefObject<HTMLDivElement | null>, active: bool
       el.dataset.edge = edge
     }
     if (!active) {
+      el.style.right = ''
       settle('bottom')
       return
     }
-    let footer: HTMLElement | null = null
+    let watched: HTMLElement | null = null
     const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => place())
+    const shownToasts = () => Array.from(el.children).filter((t) => (t as HTMLElement).offsetParent !== null)
+    /** True when a visible toast sits over the box (window pixels). */
+    const covers = (box: Box) => shownToasts().some((t) => overlaps(t.getBoundingClientRect(), box))
     /** True when a visible toast sits over the focused control (focus inside a toast does not count). */
     function coversFocus(): boolean {
       const focusedEl = document.activeElement
       if (!el || !(focusedEl instanceof HTMLElement) || focusedEl === document.body || el.contains(focusedEl)) return false
-      const box = focusedEl.getBoundingClientRect()
-      return Array.from(el.children).some((t) => (t as HTMLElement).offsetParent !== null && overlaps(t.getBoundingClientRect(), box))
+      return covers(focusedEl.getBoundingClientRect())
     }
     function place() {
       if (!el) return
-      const foot = openDialogFooter()
-      if (foot !== footer) {
-        if (footer) ro?.unobserve(footer)
-        if (foot) ro?.observe(foot)
-        footer = foot
+      // Watch the dialog (it can grow) and its footer (it can wrap onto a second row).
+      const dialog = openDialog()
+      if (dialog !== watched) {
+        ro?.disconnect()
+        if (dialog) {
+          ro?.observe(dialog)
+          const foot = dialog.querySelector<HTMLElement>('[data-overlay-footer]')
+          if (foot) ro?.observe(foot)
+        }
+        watched = dialog
       }
-      // Measure at the bottom edge, and calibrate CSS px against screen px (the text size zooms the page).
+      // Measure at the bottom edge across the window, and calibrate CSS px against window px (the text size
+      // zooms the page, so a style length and a measured one differ by the zoom).
+      el.style.right = ''
       el.style.top = 'auto'
       el.style.bottom = '0px'
-      const atBottom = el.getBoundingClientRect().bottom
-      if (foot) {
-        el.style.bottom = '100px'
-        const scale = (atBottom - el.getBoundingClientRect().bottom) / 100 || 1
-        const lift = Math.max(0, atBottom - foot.getBoundingClientRect().top)
-        settle('bottom', `${lift / scale}px`)
-      } else settle('bottom')
-      // Above the footer it can still sit on the focused control (a field low in the sheet): then it goes
-      // to the top for as long as that control has focus.
+      const atBottom = el.getBoundingClientRect()
+      const toasts = shownToasts().map((t) => t.getBoundingClientRect())
+      el.style.bottom = '100px'
+      const scale = (atBottom.bottom - el.getBoundingClientRect().bottom) / 100 || 1
+      settle('bottom')
+      if (dialog) {
+        const box = dialog.getBoundingClientRect()
+        const stackTop = Math.min(...toasts.map((r) => r.top), atBottom.bottom)
+        const stackBottom = Math.max(...toasts.map((r) => r.bottom), stackTop)
+        const stack = { width: Math.max(0, ...toasts.map((r) => r.width)), height: stackBottom - stackTop }
+        const spot = pickToastSpot(box, { width: atBottom.right, height: atBottom.bottom }, stack, atBottom.bottom - stackBottom)
+        if (spot === 'top') settle('top')
+        if (spot === 'beside') el.style.right = `${(atBottom.right - box.left) / scale}px`
+        // The words wrap in a narrow strip: if the taller stack now reaches the dialog, fall back.
+        if (spot !== 'footer' && !covers(box)) return
+        el.style.right = ''
+        settle('bottom')
+        const foot = dialog.querySelector<HTMLElement>('[data-overlay-footer]')
+        if (foot) settle('bottom', `${Math.max(0, atBottom.bottom - foot.getBoundingClientRect().top) / scale}px`)
+      }
+      // At the bottom (or above the footer) it can still sit on the focused control (a field low in the
+      // sheet, a control at the foot of the page): then it goes to the top while that control has focus.
       if (coversFocus()) settle('top')
     }
     place()
-    // Sheets and dialogs render in portals at the end of <body>: watch them come and go.
+    // Sheets and dialogs render in portals at the end of <body>: watch them come and go, and place again
+    // once a sheet has slid in or a dialog has popped up (measured mid-animation it is somewhere else).
     const mo = new MutationObserver(() => place())
     mo.observe(document.body, { childList: true })
     document.addEventListener('focusin', place)
+    document.addEventListener('animationend', place, true)
     window.addEventListener('resize', place)
     window.addEventListener('scroll', place, true)
     return () => {
       mo.disconnect()
       ro?.disconnect()
       document.removeEventListener('focusin', place)
+      document.removeEventListener('animationend', place, true)
       window.removeEventListener('resize', place)
       window.removeEventListener('scroll', place, true)
     }

@@ -57,9 +57,10 @@ import {
 import { CandidateBackground, CandidateOffer } from './offers'
 import { offerFocusTarget } from './offers/focus'
 import { CandidateInterviews } from './interviews'
-import { commit, logContact, moveTo } from './actions'
+import { advance, commit, logContact, moveTo } from './actions'
 import { EditConflictCallout, focusEditConflict, useEditConflicts } from './EditConflict'
 import {
+  advanceTarget,
   candidateOfferOn,
   candidateTimeline,
   guessTimezone,
@@ -232,6 +233,7 @@ function ApplicationPanel({ app, job, full }: { app: Application; job: Job; full
   const closed = app.status === 'rejected' || app.status === 'withdrawn'
   const name = db.candidates.find((c) => c.id === app.candidateId)?.firstName ?? 'them'
   const showOffer = canSeeOffer(viewer, db, app)
+  const advanceTo = advanceTarget(job, app)
 
   return (
     <Panel
@@ -342,6 +344,12 @@ function ApplicationPanel({ app, job, full }: { app: Application; job: Job; full
 
             {isActive && (
               <div className="flex flex-wrap gap-2 border-t border-line pt-4">
+                {/* The labeled way forward (the stage names above move too, to any stage): the board's Advance. */}
+                {advanceTo && (
+                  <Button iconRight="arrow-right" onClick={() => advance(app.id, viewer.personId)}>
+                    Advance to {advanceTo.name}
+                  </Button>
+                )}
                 <Button icon="x" onClick={() => setClosing('reject')}>
                   Reject
                 </Button>
@@ -373,8 +381,10 @@ function ApplicationPanel({ app, job, full }: { app: Application; job: Job; full
           </>
         )}
 
-        {/* Embedded blocks are contained so nothing inside them can widen the page at phone width. */}
-        <div className="relative flex min-w-0 flex-col gap-5 overflow-x-clip">
+        {/* Embedded blocks are contained so nothing inside them can widen the page at phone width. The clip edge
+            sits 4px outside the content (padding taken back by the margin), so a focus ring on a control at
+            either edge keeps its sides. */}
+        <div className="relative -mx-1 flex min-w-0 flex-col gap-5 overflow-x-clip px-1">
           <CandidateInterviews applicationId={app.id} />
           {full && showOffer && <CandidateOffer applicationId={app.id} />}
           {full && <CandidateBackground applicationId={app.id} />}

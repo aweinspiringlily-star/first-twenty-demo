@@ -23,6 +23,7 @@ import {
   tooLargeTail,
   tooLargeText,
 } from '@/features/settings/serverLogic'
+import { focusServerStep } from '@/features/settings/serverFocus'
 import {
   clearRefreshed,
   clearReplacedRemotely,
@@ -39,7 +40,7 @@ import {
   useSyncStatus,
 } from '@/sync'
 import { LOOKS } from '@/themes/registry'
-import { cx, Icon, Kbd, Menu, type MenuItem, Modal, restoreFocus, Segmented, Switch, toast } from '@/ui'
+import { cx, Icon, Kbd, Menu, type MenuItem, Modal, restoreFocus, Segmented, Switch, toast, useTwoStepConfirm } from '@/ui'
 import { LookPicker } from './LookPicker'
 import { href, links, navigate } from './router'
 import { keyLabel, useShortcut, useShortcutList } from './shortcuts'
@@ -511,7 +512,7 @@ export function SampleBanner() {
               <span className="hidden sm:inline">Import a backup</span>
             </a>
           ) : (
-            <a href={SERVER_SETTINGS_HREF} className={action}>
+            <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={action}>
               {here.signedIn ? (
                 <>
                   <span className="sm:hidden">Open it</span>
@@ -576,7 +577,7 @@ export function ServerHereBanner() {
       icon="globe"
       onDismiss={dismiss}
       actions={
-        <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
+        <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
           {empty ? 'Upload it' : 'Sign in to your server'}
         </a>
       }
@@ -597,6 +598,15 @@ export function ServerHereBanner() {
 
 /** Settings > Server. */
 export const SERVER_SETTINGS_HREF = href('settings', 'server')
+
+/**
+ * onClick for a link to Settings > Server: on that page already (Start fresh lands there), following the
+ * link would do nothing, so focus moves to where the next step starts (the sign-in form, Upload) instead.
+ */
+function stayOnServerPage(e: { preventDefault: () => void }): void {
+  if (window.location.hash !== SERVER_SETTINGS_HREF) return
+  if (focusServerStep()) e.preventDefault()
+}
 
 /** How long the server must stay unreachable before the offline banner appears. */
 const OFFLINE_BANNER_MS = 60_000
@@ -750,6 +760,7 @@ export function SyncChip({ compact, className }: { compact?: boolean; className?
   return (
     <a
       href={SERVER_SETTINGS_HREF}
+      onClick={stayOnServerPage}
       title={view.tip}
       aria-describedby={tipId}
       className={cx(
@@ -893,26 +904,11 @@ function SyncBanner({
 
 const BANNER_ACTION = 'ft-banner__action inline-flex min-h-10 items-center rounded-lg px-2 font-bold text-accent hover:underline'
 
-/** A banner action that cannot be undone asks for a second click first, as ConfirmButton does. */
+/** A banner action that cannot be undone asks for a second click first, as ConfirmButton does (no timer). */
 function BannerConfirm({ children, confirmLabel, onConfirm }: { children: ReactNode; confirmLabel: string; onConfirm: () => void }) {
-  const [armed, setArmed] = useState(false)
-  useEffect(() => {
-    if (!armed) return
-    const t = setTimeout(() => setArmed(false), 4000)
-    return () => clearTimeout(t)
-  }, [armed])
+  const { armed, ref, onClick, onBlur } = useTwoStepConfirm<HTMLButtonElement>(onConfirm)
   return (
-    <button
-      type="button"
-      aria-live="polite"
-      onBlur={() => setArmed(false)}
-      onClick={() => {
-        if (!armed) return setArmed(true)
-        setArmed(false)
-        onConfirm()
-      }}
-      className={BANNER_ACTION}
-    >
+    <button ref={ref} type="button" aria-live="polite" onBlur={onBlur} onClick={onClick} className={BANNER_ACTION}>
       {armed ? confirmLabel : children}
     </button>
   )
@@ -1183,7 +1179,7 @@ export function SyncBanners() {
           icon="lock"
           onDismiss={dismiss('signed-out')}
           actions={
-            <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
+            <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
               Sign in
             </a>
           }
@@ -1221,7 +1217,7 @@ export function SyncBanners() {
                   {tooLarge.length === 1 ? 'Discard this change' : 'Discard them'}
                 </BannerConfirm>
               )}
-              <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
+              <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
                 Details
               </a>
             </>
@@ -1244,7 +1240,7 @@ export function SyncBanners() {
           icon="alert"
           onDismiss={dismiss('paused')}
           actions={
-            <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
+            <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
               Review
             </a>
           }

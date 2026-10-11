@@ -45,7 +45,8 @@ export function ChipGroup<V extends string>({
             className={cx(
               'ft-chip',
               on && 'ft-chip--on',
-              'inline-flex items-center gap-1.5 rounded-full border font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40',
+              // At least 40px wide too: a one-character label ('5' hours) would leave a 34px target.
+              'inline-flex min-w-10 items-center justify-center gap-1.5 rounded-full border font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40',
               size === 'sm' ? 'h-10 px-3 text-[13px]' : 'h-11 px-4 text-[14px]',
               on
                 ? 'border-accent bg-accent text-accent-ink'
@@ -90,7 +91,7 @@ export function ChipMulti<V extends string>({
             className={cx(
               'ft-chip ft-chip--multi',
               on && 'ft-chip--on',
-              'inline-flex h-10 items-center gap-1.5 rounded-full border px-3.5 text-[13.5px] font-semibold transition-colors',
+              'inline-flex h-10 min-w-10 items-center justify-center gap-1.5 rounded-full border px-3.5 text-[13.5px] font-semibold transition-colors',
               on ? 'border-accent bg-accent-soft text-accent-soft-ink' : 'border-line-strong bg-surface text-ink-2 hover:text-ink',
             )}
           >

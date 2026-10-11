@@ -1,6 +1,6 @@
 // People > Time off: summary, who's-out calendar, requests to approve, balances, leave cases (Admin) and
 // holidays. Every block follows the Viewing-as rules in src/domain/access.ts.
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { canApproveTimeOff, canSeePerson, canSeeTimeOffDetail } from '@/domain/access'
@@ -195,8 +195,10 @@ function RequestsPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
           {groups.map((g, gi) => {
             if (gi > 0 && g.requests.length === 0) return null
             const offset = groups.slice(0, gi).reduce((n, x) => n + x.requests.length, 0)
+            // A fragment, not a wrapper: each group's heading and rows stay direct children of the section,
+            // so the looks that run a section's lists flush with its label still reach them.
             return (
-              <div key={g.key}>
+              <Fragment key={g.key}>
                 <h3 tabIndex={-1} className="px-5 pt-3 text-[13px] font-bold text-ink-3 outline-none">
                   {g.label} ({g.requests.length})
                 </h3>
@@ -212,7 +214,7 @@ function RequestsPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
                     ))}
                   </ul>
                 )}
-              </div>
+              </Fragment>
             )
           })}
         </section>

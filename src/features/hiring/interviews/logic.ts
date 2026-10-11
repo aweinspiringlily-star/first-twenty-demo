@@ -343,3 +343,13 @@ export function medianDaysText(days: number | null, hires: number): string {
   if (days != null) return `${Math.round(days)} ${Math.round(days) === 1 ? 'day' : 'days'}`
   return hires === 0 ? 'No hires yet' : 'Not recorded'
 }
+
+/**
+ * The candidate panel's line when it has no interviews and the viewer cannot schedule one. Someone who sees
+ * every interview (Admin, the hiring team) hears whether any were held; an interviewer, who sees only their
+ * own, hears that theirs show here.
+ */
+export function interviewsEmptyText(o: { seesAll: boolean; active: boolean }): string {
+  if (!o.seesAll) return 'Interviews you are on will show here.'
+  return o.active ? 'None are scheduled yet.' : 'None were held while the application was open.'
+}

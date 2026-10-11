@@ -1,6 +1,7 @@
 // Tiny fixture workspace for the hiring tests (not used by the app). Built from blankDB plus a few
 // hand-made rows, with fixed dates around Friday 2026-10-09.
 import { blankDB } from '@/data/blank'
+import { SAMPLE_ROLE_TEMPLATES } from '@/data/roleTemplates'
 import type { Application, Candidate, DB, Job, Person } from '@/domain/types'
 import { jobStages } from './pipeline'
 
@@ -64,6 +65,8 @@ export function application(id: string, candidateId: string, jobId: string, extr
 
 export function fixtureDB(): DB {
   const db = blankDB({ companyName: 'Ledgerlark', founderFirstName: 'Maya', founderLastName: 'Raman', foundedOn: '2025-02-03' })
+  // The sample company's own role templates, as the sample seed installs them (blankDB has the neutral starters).
+  db.settings.roleTemplates = structuredClone(SAMPLE_ROLE_TEMPLATES)
   db.company.tagline = 'Ledgerlark builds AI agents that help mid-market controllers close the books faster.'
   db.company.hq = { street: '99 S Almaden Blvd', suite: 'Suite 410', city: 'San Jose', state: 'CA', zip: '95113' }
   db.company.workersCompCarrier = { name: 'Golden Poppy Mutual', phone: '(800) 555-0199', policyNumber: 'WC-2026-118', address: '1 Market St, San Francisco, CA 94105' }

@@ -9,7 +9,7 @@ import { familyName, levelLabel } from '@/domain/people'
 import type { RoleTemplate } from '@/domain/types'
 import { escapeHTML, printHTML } from '@/lib/files'
 import { useDB } from '@/store/db'
-import { Badge, Button, cx, EmptyState, MoneyRange, Panel, Select, toast } from '@/ui'
+import { Badge, Button, cx, EmptyState, Icon, MoneyRange, Panel, Select, toast } from '@/ui'
 import { copyWithToast } from './common'
 import { canSeeKitBand } from './logic'
 
@@ -152,8 +152,11 @@ export function InterviewKitsTab() {
               </li>
             ))}
           </ol>
-          <details className="rounded-xl bg-surface-2 px-4 py-3">
-            <summary className="flex min-h-10 cursor-pointer items-center text-[14px] font-semibold text-ink">Job description outline</summary>
+          <details className="group rounded-xl bg-surface-2 px-4 py-3">
+            <summary className="flex min-h-10 w-fit cursor-pointer items-center gap-1.5 text-[14px] font-semibold text-ink">
+              <Icon name="chevron-right" size={16} className="shrink-0 transition-transform group-open:rotate-90 motion-reduce:transition-none" />
+              Job description outline
+            </summary>
             <p className="mt-2 text-[13.5px] whitespace-pre-wrap text-ink-2">{t.jdOutline}</p>
           </details>
         </div>

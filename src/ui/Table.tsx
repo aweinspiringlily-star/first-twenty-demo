@@ -32,11 +32,18 @@ export function DataTable<T>({
   dense,
   caption,
   rowClassName,
+  rowLabel,
 }: {
   rows: T[]
   columns: Array<Column<T>>
   rowKey: (row: T) => string
+  /**
+   * Opens the row (a sheet, a dialog). The whole row takes the click, and the first cell becomes a button
+   * (ft-table__rowlink, as a row link is), so the row opens from the keyboard too. Name it with rowLabel.
+   */
   onRowClick?: (row: T) => void
+  /** The accessible name of the row's button when onRowClick opens it ('Edit the 409A from Mar 20, 2026'). */
+  rowLabel?: (row: T) => string
   /** Makes each row a link (preferred over onRowClick for navigation). */
   rowHref?: (row: T) => string
   empty?: ReactNode
@@ -149,6 +156,15 @@ export function DataTable<T>({
                         <a href={href} className="ft-table__rowlink font-semibold text-ink hover:text-accent">
                           {content}
                         </a>
+                      ) : i === 0 && onRowClick ? (
+                        <button
+                          type="button"
+                          aria-label={rowLabel?.(row)}
+                          onClick={() => onRowClick(row)}
+                          className="ft-table__rowlink block min-h-10 w-full text-left font-semibold text-ink hover:text-accent"
+                        >
+                          {content}
+                        </button>
                       ) : (
                         content
                       )}

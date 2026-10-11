@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_BANDS, DEFAULT_DEPARTMENTS, DEFAULT_FAMILIES, DEFAULT_LEVELS, DEFAULT_STAGES } from '@/data/defaults'
 import { postingLint, salaryHistoryLint } from '@/domain/hiring/postings'
-import { DEFAULT_ROLE_TEMPLATES } from './roleTemplates'
+import { SAMPLE_ROLE_TEMPLATES } from './roleTemplates'
 
-const T = DEFAULT_ROLE_TEMPLATES
+const T = SAMPLE_ROLE_TEMPLATES
 
-describe('DEFAULT_ROLE_TEMPLATES', () => {
+describe('SAMPLE_ROLE_TEMPLATES (Ledgerlark)', () => {
   it('has the 13 roles with unique ids', () => {
     expect(T.map((t) => t.name)).toEqual([
       'Senior full-stack engineer',

@@ -4,6 +4,7 @@ import { canSeeApplication, canSeeCandidate } from '@/domain/access'
 import { application, candidate, fixtureDB, FRI } from '@/domain/hiring/testkit'
 import type { DB, Job, Viewer } from '@/domain/types'
 import {
+  advanceTarget,
   candidateOfferOn,
   changedFields,
   conflictingFields,
@@ -558,5 +559,24 @@ describe('a sender without a work email', () => {
     expect(missingWorkEmailHint({ role: 'manager', personId: 'p-tomas' }, 'p-tomas', 'Tomas Herrera')).toEqual({
       text: 'Ask Admin to add your work email to your profile so replies reach you.',
     })
+  })
+})
+
+describe('Advance on the candidate page (post-merge: no labeled way forward, only the stage names)', () => {
+  const job = { stages: fixtureDB().jobs[0].stages }
+  const stageIds = job.stages.map((s) => s.id)
+
+  it('names the next stage for an active application', () => {
+    const at = stageIds.indexOf('intro')
+    expect(advanceTarget(job, { stageId: 'intro', status: 'active' })?.id).toBe(stageIds[at + 1])
+  })
+
+  it('shows nothing in the Offer stage (Hired belongs to the Hire flow) or for a closed or hired application', () => {
+    const offer = job.stages.find((s) => s.kind === 'offer')
+    if (!offer) throw new Error('no offer stage')
+    expect(advanceTarget(job, { stageId: offer.id, status: 'active' })).toBeNull()
+    expect(advanceTarget(job, { stageId: 'intro', status: 'rejected' })).toBeNull()
+    expect(advanceTarget(job, { stageId: 'intro', status: 'withdrawn' })).toBeNull()
+    expect(advanceTarget(job, { stageId: 'hired', status: 'hired' })).toBeNull()
   })
 })

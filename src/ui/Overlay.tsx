@@ -352,9 +352,56 @@ export function Modal({
   )
 }
 
+/** What moves a two-step confirm: a press on it, or the person moving on (focus leaves, Escape, a press elsewhere). */
+export type TwoStepEvent = 'press' | 'leave'
+
+/**
+ * The two-step rule: the first press arms, a press while armed confirms, and moving on disarms. There is no
+ * timer: an armed button waits (its label says "Press again"), so nobody has to beat a clock, and nothing
+ * reverts behind their back.
+ */
+export function twoStepNext(armed: boolean, event: TwoStepEvent): { armed: boolean; confirm: boolean } {
+  if (event === 'press') return armed ? { armed: false, confirm: true } : { armed: true, confirm: false }
+  return { armed: false, confirm: false }
+}
+
+/**
+ * A two-step confirm for a button (ConfirmButton, the banner actions). While armed, Escape disarms it (and
+ * only that: a dialog around it stays open), and so does a press anywhere else or focus leaving it.
+ */
+export function useTwoStepConfirm<E extends HTMLElement>(onConfirm: () => void) {
+  const [armed, setArmed] = useState(false)
+  const ref = useRef<E>(null)
+  useEffect(() => {
+    if (!armed) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      setArmed(false)
+    }
+    // Touch browsers do not move focus to a tapped button, so a tap elsewhere would never blur it.
+    const onPointer = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setArmed(false)
+    }
+    document.addEventListener('keydown', onKey, true)
+    document.addEventListener('pointerdown', onPointer, true)
+    return () => {
+      document.removeEventListener('keydown', onKey, true)
+      document.removeEventListener('pointerdown', onPointer, true)
+    }
+  }, [armed])
+  const step = (event: TwoStepEvent) => {
+    const next = twoStepNext(armed, event)
+    setArmed(next.armed)
+    if (next.confirm) onConfirm()
+  }
+  return { armed, ref, onClick: () => step('press'), onBlur: () => step('leave') }
+}
+
 /**
  * Two-step button for destructive or irreversible actions: the first press (click, Enter or Space) arms
- * it, the second confirms. Disarms after 4 seconds or on blur.
+ * it, the second confirms. It stays armed until it is pressed again or the person moves on (focus leaves,
+ * Escape, a press elsewhere): no timer (twoStepNext).
  */
 export function ConfirmButton({
   onConfirm,
@@ -363,25 +410,9 @@ export function ConfirmButton({
   variant = 'secondary',
   ...rest
 }: ButtonProps & { onConfirm: () => void; confirmLabel?: string }) {
-  const [armed, setArmed] = useState(false)
-  useEffect(() => {
-    if (!armed) return
-    const t = setTimeout(() => setArmed(false), 4000)
-    return () => clearTimeout(t)
-  }, [armed])
+  const { armed, ref, onClick, onBlur } = useTwoStepConfirm<HTMLButtonElement>(onConfirm)
   return (
-    <Button
-      {...rest}
-      variant={armed ? 'danger' : variant}
-      aria-live="polite"
-      onBlur={() => setArmed(false)}
-      onClick={() => {
-        if (armed) {
-          setArmed(false)
-          onConfirm()
-        } else setArmed(true)
-      }}
-    >
+    <Button {...rest} ref={ref} variant={armed ? 'danger' : variant} aria-live="polite" onBlur={onBlur} onClick={onClick}>
       {armed ? confirmLabel : children}
     </Button>
   )

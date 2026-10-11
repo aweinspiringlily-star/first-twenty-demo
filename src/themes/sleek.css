@@ -276,6 +276,20 @@ html[data-look="sleek"]:has(.ft-palette):not(:has(.ft-sheet)) {
   background: color-mix(in srgb, #000 var(--sleek-scrim-mix), var(--paper));
 }
 
+/* Only the gutter takes that tone. Body is one window tall (styles.css), so on a page scrolled past its
+   first screen the root's canvas shows under the content, and the scrim over the pre-dimmed canvas drew a
+   darker band with a hard edge across the page. A fixed paper layer under everything (the fixed box is the
+   viewport without the gutter) keeps the whole window one tone under the scrim. */
+html[data-look="sleek"]:has(.ft-modal):not(:has(.ft-sheet)) body::before,
+html[data-look="sleek"]:has(.ft-palette):not(:has(.ft-sheet)) body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: var(--paper);
+  pointer-events: none;
+}
+
 /* Scrollbars are part of the register: a square ink-gray thumb on the paper, no arrow buttons, no
    rounded native slab. The page's own bar stays 12px wide (an easy target); inner scrollers 8px. Chrome
    only applies these while scrollbar-width and scrollbar-color are auto, so the rule below resets them. */
@@ -1108,6 +1122,13 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
   &:is(.ft-panel__body:not(.ft-panel__body--padded) > section > :is(h3, h4, p, div)):is(.px-3, .px-4, .px-5, .sm\:px-5),
   &:is(.ft-panel__body:not(.ft-panel__body--padded) > section > :is(ul, ol) > li):is(.px-3, .px-4, .px-5, .sm\:px-5) {
     padding-inline: 0;
+  }
+
+  /* A section that holds several labeled groups (Requests: Waiting for you, then Waiting on a manager):
+     each later group label stands under the same 1px rule as the rows, so a group never reads as more
+     rows of the one above it. */
+  &:is(.ft-panel__body:not(.ft-panel__body--padded) > section > :is(ul, ol, p) + :is(h3, h4)) {
+    border-top: 1px solid var(--line);
   }
 
   /* Rows that are whole links keep a little padding for their hover tint and hang it into the gutter, so
@@ -2047,6 +2068,14 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
     padding-right: 0;
   }
 
+  /* With the first column flush, a focus ring on its row link or sort head (2px, 2px off the box) would
+     fall outside the scroller and lose its left side. The scroller reaches 4px further left and is padded
+     back by as much, so the table does not move and the whole ring shows. */
+  &:is(.ft-panel .ft-table-wrap) {
+    margin-left: -5px;
+    padding-left: 4px;
+  }
+
   /* Figure columns keep the text face (no code-like mono), tabular, at full ink. */
   &.ft-table__cell.num,
   &.ft-table__cell.text-right .num {
@@ -2361,6 +2390,21 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
   &.ft-toast__dismiss:hover {
     background: color-mix(in srgb, var(--paper) 16%, transparent);
     color: var(--paper);
+  }
+
+  /* The toast's link to where the change landed ('Review in Training'): paper words with a paper
+     underline, firmed to 2px when pointed at. Without this the page's ink link color drew it in the
+     toast's own ink, a blank line. */
+  &.ft-toast .ft-toast__link,
+  &.ft-toast .ft-toast__link:hover {
+    color: var(--paper);
+    text-decoration-line: underline;
+    text-decoration-color: color-mix(in srgb, var(--paper) 60%, transparent);
+  }
+
+  &.ft-toast .ft-toast__link:hover {
+    text-decoration-color: var(--paper);
+    text-decoration-thickness: 2px;
   }
 
   /* Focus inside the inverse toast: a paper ring (the accent would vanish on the ink). */
@@ -3222,10 +3266,21 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
     text-align: left;
   }
 
+  /* A stage you can move to is underlined words, as every unframed control is here, so the track reads as
+     something to press and not only as progress (the current stage and Hired are not buttons: no line). */
+  &.ft-stepper__step:not(:disabled) {
+    text-decoration-line: underline;
+    text-decoration-thickness: 1px;
+    text-decoration-color: color-mix(in srgb, var(--ink) 45%, transparent);
+    text-underline-offset: 3px;
+  }
+
   &.ft-stepper__step:hover:not(:disabled) {
     background: var(--sleek-hover);
     color: var(--ink);
     text-decoration: underline;
+    text-decoration-color: currentColor;
+    text-decoration-thickness: 2px;
     text-underline-offset: 3px;
   }
 

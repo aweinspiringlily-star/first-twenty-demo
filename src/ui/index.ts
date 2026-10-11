@@ -23,7 +23,7 @@ export {
 export { Icon, ICON_NAMES, type IconName } from './Icon'
 export { Callout, DescriptionList, EmptyState, Meter, PageHeader, Panel, SectionLabel, Stat } from './Layout'
 export { Money, MoneyRange, Private } from './Money'
-export { ConfirmButton, focusPageStart, Menu, Modal, restoreFocus, Sheet, useEscape, useFocusTrap, type MenuItem } from './Overlay'
+export { ConfirmButton, focusPageStart, Menu, Modal, restoreFocus, Sheet, useEscape, useFocusTrap, useTwoStepConfirm, type MenuItem } from './Overlay'
 export { DataTable, type Column } from './Table'
 export { rovingKeyDown, rovingTabIndex } from './roving'
 export { Tabs, type TabDef } from './Tabs'

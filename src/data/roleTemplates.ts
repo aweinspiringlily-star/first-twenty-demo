@@ -1,5 +1,8 @@
-// Role templates for a financial AI startup that sells month-end close and reconciliation agents to
-// mid-market controllers (NetSuite, Sage Intacct, QuickBooks Online). Each template prefills the
+// The sample company's role templates (Ledgerlark, docs/SAMPLE.md): a financial AI startup that sells
+// month-end close and reconciliation agents to mid-market controllers (NetSuite, Sage Intacct, QuickBooks
+// Online). The sample seed installs them (src/data/seed/hiring.ts); a company that starts fresh gets the
+// company-neutral starter set instead (starterRoleTemplates.ts), since a posting goes out with this text.
+// Each template prefills the
 // level and band (so the posted range), a JD outline, the default stages (the sales role renames
 // Technical to 'Mock discovery call') and an interview plan with 3 to 5 scorecard attributes per
 // step. Every attribute has a one-line anchor (what a strong yes looks like) and 2 suggested
@@ -267,7 +270,7 @@ function jd(doing: string[], bring: string[], nice: string[]): string {
   return `What you'll do\n${list(doing)}\n\nWhat you bring\n${list(bring)}\n\nNice to have\n${list(nice)}`
 }
 
-export const DEFAULT_ROLE_TEMPLATES: RoleTemplate[] = [
+export const SAMPLE_ROLE_TEMPLATES: RoleTemplate[] = [
   {
     id: 'rt-fullstack',
     name: 'Senior full-stack engineer',

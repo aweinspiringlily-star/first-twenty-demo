@@ -166,9 +166,9 @@ What the engine does today (built 2026-10-10), so a look can be written in its o
 | Field and inputs | `ft-field__required`, `ft-select-wrap`, `ft-select__chevron`, `ft-checkbox-row` (`ft-checkbox` is the box itself), `ft-switch-row`, `ft-switch__track`, `ft-switch__thumb`, `ft-segmented--sm / --md`, `ft-searchbox`, `ft-searchbox__icon`, `ft-input--blurred` |
 | Chips | `ft-chips--multi`, `ft-chip--multi`, `ft-datechips`, `ft-cite-link` (the 40px link around `ft-cite`) |
 | Tabs | `ft-tabs-wrap` (the scroller), `ft-tab__count`, `ft-tab__indicator` (the active underline) |
-| DataTable | `ft-table--dense`, `ft-table__headrow`, `ft-table__th`, `ft-table__sort` (+ `--active`), `ft-table__cell`, `ft-table__row--link`, `ft-table__rowlink` |
+| DataTable | `ft-table--dense`, `ft-table__headrow`, `ft-table__th`, `ft-table__sort` (+ `--active`), `ft-table__cell`, `ft-table__row--link`, `ft-table__rowlink` (the first cell's link, or a `button` when the row opens a sheet: `onRowClick`) |
 | Sheet, Modal, Menu | `ft-sheet__title`, `ft-sheet__subtitle`, `ft-sheet__close`, `ft-modal__title`, `ft-modal__close`, `ft-menu__divider`, `ft-menuitem--danger` |
-| Toast | `ft-toast__icon`, `ft-toast__text`, `ft-toast__action`, `ft-toast__dismiss`, `ft-toast__link` (a toast's link to where the change landed, also `ft-link`); `ft-toaster` carries `data-edge="bottom"` or `"top"` (it sits above an open sheet's footer, and moves to the top of the window when at the bottom it would cover the focused control) |
+| Toast | `ft-toast__icon`, `ft-toast__text`, `ft-toast__action`, `ft-toast__dismiss`, `ft-toast__link` (a toast's link to where the change landed, also `ft-link`: a look that colors `ft-link` must recolor it inside its toast too); each toast carries `data-toast-id`; `ft-toaster` carries `data-edge="bottom"` or `"top"`. While a sheet or dialog is open the stack keeps off it where the window has room (below or above a dialog, or beside a sheet, with an inline `right` that narrows the strip); with no room (a phone) it sits above the dialog's footer, and it moves to the top of the window when at the bottom it would cover the focused control. A newer Undo toast replaces the older Undo toasts |
 | Charts | `ft-chart--step / --bars / --segments / --spark`, `ft-chart__track`, `ft-chart__bar`, `ft-chart__legend`, `ft-chart__tip`, `ft-chart__data`; on a step chart's end marker `ft-chart__end` (group), `ft-chart__enddot`, `ft-chart__endlabel` (the value) and `ft-chart__endtag`, a box behind the value that stays invisible (`fill="none"`) unless a look fills it, with the series color in `--ft-series`; `ft-chart__reflabel` (a threshold line's number) and `ft-chart__today` (the Today label) |
 | Money | `ft-private`, `ft-private--on` |
 | Shell | `ft-brand__mark`, `ft-brand__name`, `ft-brand__meta`, `ft-headcount--compact`, `ft-headcount__value / __label / __incoming / __meter`, `ft-navitem__icon`, `ft-viewas__title`, `ft-viewas__roles` (also `ft-segmented`), `ft-rail--sheet` (the phone menu panel, also `ft-rail`), `ft-rail__note`, `ft-topbar__count`, `ft-main__inner`, `ft-header__actions`, `ft-newmenu` (also `ft-btn ft-btn--primary`), `ft-undo` (also `ft-btn ft-btn--ghost`), `ft-backup` (+ `--stale`), `ft-banner__action`, `ft-banner__icon / __text / __actions / __dismiss`, `ft-banner--sync-storage / -replaced / -restored / -signed-out / -offline / -rejected / -paused / -refreshed`, `ft-syncchip__icon / __label / __count`, `ft-decor` (+ `--banner / --footer`), `ft-palette__head / __input / __list / __group / __item (+ --active) / __icon` |
@@ -212,6 +212,8 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
   follows straight on, the two rules collapse into the panel's own. On Home, the candidate page and the person
   overview a 1px rule runs down the middle of the 40px gutter between the main and side columns
   (`ft-split__side::before`). Menus and the palette open like a section: a 1px ink frame with a 3px ink top.
+  A section that holds several labeled groups (Requests: Waiting for you, then Waiting on a manager) puts each
+  later group label under the same 1px rule as its rows.
 - **Boxes become sections.** Hand-built bordered cards and gray wells (`rounded-xl border border-line`,
   `rounded-xl bg-surface-2`, list items drawn as wells such as Settings, Hiring's default pipeline) lose their frame
   and fill and sit flush under a 1px rule; a list of wells becomes a ruled list (a leading figure gets a 32px
@@ -264,7 +266,7 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
   `--ink-3` words and no fade (switches too); a field with `aria-invalid` gets a 2px red frame. A switch that is off
   is an empty outlined track with a gray knob on the left; on is the inverse-ink track with a paper knob.
 - **Overlays.** No shadows anywhere. Sheets, dialogs and menus are framed in ink; the toast is inverse ink (paper
-  words, a paper-framed Undo, inverted key caps, a 40px close).
+  words, a paper-underlined link to the change, a paper-framed Undo, inverted key caps, a 40px close).
 - **Avatars** are square monogram tiles, dropped wherever words follow them (the name or the `#number` already
   says who it is); avatar stacks stay. The person page leads with the employee number at title size, and the
   First twenty wall is a grid of seats, each a 2px rule over a 30px `#n` (planned seats show their number in
@@ -285,7 +287,9 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
     words; the selected card is framed in 2px of ink with the 4px accent bar on its left and keeps the full-width
     accent Advance with its A and R key caps.
   - The stage stepper and a sheet's step list (Start fresh, `ol[aria-label="Progress"]`) are progress tracks: a 2px
-    gray bar upcoming, a 4px ink bar and a check done, the 4px accent bar and bold current, Hired dashed. A stepper
+    gray bar upcoming, a 4px ink bar and a check done, the 4px accent bar and bold current, Hired dashed. A stage you
+    can move to is underlined words (2px when pointed at), as every unframed control is; the current stage and Hired
+    are not buttons and carry no line. The candidate page also has a labeled "Advance to <stage>" button. A stepper
     that still wraps on a wide page keeps a 10px row gap, so a bar never reads as the underline of the row above;
     under 30rem of app column it is a vertical track, one 40px row per stage with its bar on the left (like the
     rail's place mark).
@@ -296,7 +300,9 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
     ink frame, overlapped by 1px, so a strip that wraps reads as a block of cells.
   - Ledgers (`ft-dl`): a 132px term column; a two- or three-up ledger only goes side by side where each column gets
     22rem (so at 1280px the person overview and the candidate's offer are one column and values never split).
-  - Tables: 8px each side of a column; column heads wrap to two lines and sit on the bottom rule. A scroller that
+  - Tables: 8px each side of a column; column heads wrap to two lines and sit on the bottom rule. Inside a section
+    the first column runs flush, so the scroller reaches 4px further left and is padded back by as much: a focus ring
+    on a row link or sort head there keeps its left side. A scroller that
     still runs on (tables, matrices, the board, a phone's tab strips) ends on a hard 1px ink edge on the side that
     continues (a scroll-driven animation on the scroller itself); tab strips drop the kit's soft fade for it and
     keep 16px of scroll padding beside the active tab.
@@ -325,7 +331,8 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
     flush right at the end of a funnel row or a figure column). The funnel bars are square.
   - Checklist task marks are 18px squares: a solid ink box with a paper check when done, an empty 1px ink box when
     open. Two-sided rows whose name is a 40px link (Cost and runway, Contractors) sit on one baseline.
-  - Lists inside an unpadded section (Time off, Requests) run flush with its label, and the palette's "No matches"
+  - Lists inside an unpadded section (Time off, Requests) run flush with its label (their groups are direct
+    children of the section: a wrapper `div` drops out of the flush rule), and the palette's "No matches"
     sits flush left in ink-2 like every other empty state.
   - Phone (the top bar showing): the header row under the top bar sits 8px under it and 12px above the page.
   - Phone at 150% text (app column under 20rem): the top bar drops the brand mark and the "Seed, San Jose" line so
@@ -335,7 +342,9 @@ What `src/themes/sleek.css` does beyond recoloring, so a screen change can be ch
   buttons); a tab strip that runs past a phone's edge scrolls without a bar. While a sheet, a dialog or the palette
   is open the page behind holds still (one scrollbar) and keeps its gutter, so nothing moves sideways when Ctrl K,
   Display or ? opens and closes; beside a dialog or the palette the empty gutter takes the scrimmed paper tone
-  (`--sleek-scrim-mix`, the scrim's alpha), so the dimmed window has no bright strip.
+  (`--sleek-scrim-mix`, the scrim's alpha), so the dimmed window has no bright strip. Only the gutter: body is one
+  window tall, so a fixed paper layer (`body::before`, under everything) covers the canvas below the first screen of
+  a scrolled page, and the scrim lands on one tone everywhere (no darker band past the fold).
 - **The rail.** The headcount is a 48px semi-condensed figure over the tally, redrawn by `sleek/decor.tsx` as an
   instrument scale: groups of five strokes on a 1px baseline with a tick per seat and long ticks numbered 5, 10,
   15, 20 (12px); the ticks at 5, 15 and 20 (where the law changes) reach through the rule and their numbers are

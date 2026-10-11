@@ -8,7 +8,7 @@ import { type OutEntry, whoIsOut } from '@/domain/timeoff'
 import { addDays, fmtDay, fmtMonth, type ISODate, isWeekday, parseDate, today } from '@/lib/dates'
 import { plural } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Badge, Button, cx, Dot, IconButton } from '@/ui'
+import { Badge, Button, cx, Dot, Icon, IconButton } from '@/ui'
 import { entryView, monthEnd, monthStart, monthWeeks, outByDay, shiftMonth, shortRange, weekMonday } from './logic'
 import { PersonName } from './parts'
 
@@ -252,7 +252,8 @@ export function TimeOffCalendar() {
 
       {monthEntries.length > 0 && (
         <details className="group rounded-xl border border-line px-4 py-2">
-          <summary className="flex min-h-10 cursor-pointer items-center text-[14px] font-semibold text-ink-2">
+          <summary className="flex min-h-10 w-fit cursor-pointer items-center gap-1.5 text-[14px] font-semibold text-ink-2">
+            <Icon name="chevron-right" size={16} className="shrink-0 transition-transform group-open:rotate-90 motion-reduce:transition-none" />
             Everyone out in {parseDate(month).toLocaleDateString('en-US', { month: 'long' })} ({monthEntries.length})
           </summary>
           <ul className="flex flex-col pb-1">

@@ -26,7 +26,7 @@ import { copyText } from '@/lib/files'
 import { listJoin, money2, num, pct } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
-import { Avatar, Badge, Button, Callout, Checkbox, CitationChip, DataTable, DateChips, EmptyState, IconButton, Panel, Private, Segmented, toast, type Column } from '@/ui'
+import { Avatar, Badge, Button, Callout, Checkbox, CitationChip, DataTable, DateChips, EmptyState, Panel, Private, Segmented, toast, type Column } from '@/ui'
 import { CapTableSheet, ValuationSheet } from './EquitySetup'
 import { cliffCards } from './helpers'
 
@@ -114,15 +114,17 @@ export function EquityTab() {
       header: 'Holder',
       sort: (g) => holderName(db, g),
       cell: (g) => {
+        // The grant type rides under the name (no column of its own), so the register fits a half page at 1280.
         return (
           <div className="min-w-[150px]">
             <span className="font-semibold">{holderName(db, g)}</span>
-            <div className="text-[12px] text-ink-3">{HOLDER[g.holderType]}</div>
+            <div className="text-[12px] text-ink-3">
+              {HOLDER[g.holderType]}, {g.type}
+            </div>
           </div>
         )
       },
     },
-    { key: 'type', header: 'Type', cell: (g) => g.type },
     { key: 'shares', header: 'Shares', align: 'right', sort: (g) => g.shares, cell: (g) => <Private>{num(g.shares)}</Private> },
     { key: 'pct', header: '% fully diluted', align: 'right', hideBelow: 'sm', sort: (g) => g.shares, cell: (g) => <Private>{pct(pctOfFullyDiluted(db, g.shares), 3)}</Private> },
     { key: 'strike', header: 'Strike', align: 'right', sort: (g) => g.strikePrice, cell: (g) => <Private>{g.strikePrice ? money2(g.strikePrice) : 'Set at grant'}</Private> },
@@ -304,14 +306,28 @@ export function EquityTab() {
             </Button>
           }
         >
+          {/* Each valuation opens for editing from its row (the date cell is its button, named for the edit), and the
+              provider rides under the date: no pencil column, so the table fits its half-width column at 1280 and a
+              phone without hiding the action behind a scrollbar. */}
           <DataTable
             rows={[...db.equity.valuations].sort((a, b) => b.effectiveOn.localeCompare(a.effectiveOn))}
             rowKey={(r) => r.id}
             dense
             caption="409A valuation history"
+            onRowClick={(r) => setValuationSheet({ valuation: r })}
+            rowLabel={(r) => `Edit the 409A from ${fmtDate(r.effectiveOn)}`}
             empty={<EmptyState compact title="No 409A on file" body="Record the valuation report here before the board grants options." />}
             columns={[
-              { key: 'eff', header: 'Effective', cell: (r) => <span className="whitespace-nowrap">{fmtDate(r.effectiveOn)}</span> },
+              {
+                key: 'eff',
+                header: 'Effective',
+                cell: (r) => (
+                  <>
+                    <span className="block whitespace-nowrap">{fmtDate(r.effectiveOn)}</span>
+                    {r.provider && <span className="block text-[12px] font-normal text-ink-3">{r.provider}</span>}
+                  </>
+                ),
+              },
               { key: 'fmv', header: 'Price a share', align: 'right', cell: (r) => <Private>{money2(r.fmvPerShare)}</Private> },
               { key: 'until', header: 'Safe harbor until', cell: (r) => <span className="whitespace-nowrap">{fmtDate(r.expiresOn)}</span> },
               {
@@ -323,13 +339,6 @@ export function EquityTab() {
                   ) : (
                     <Badge tone="outline">{r.effectiveOn > date ? 'Upcoming' : 'Superseded'}</Badge>
                   ),
-              },
-              { key: 'prov', header: 'Provider', hideBelow: 'md', cell: (r) => r.provider },
-              {
-                key: 'edit',
-                header: <span className="sr-only">Edit</span>,
-                align: 'right',
-                cell: (r) => <IconButton icon="edit" size="sm" label={`Edit the 409A from ${fmtDate(r.effectiveOn)}`} onClick={() => setValuationSheet({ valuation: r })} />,
               },
             ]}
           />

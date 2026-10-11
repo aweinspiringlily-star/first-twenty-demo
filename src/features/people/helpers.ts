@@ -391,6 +391,8 @@ export const OWNER_LABEL: Record<ChecklistTask['ownerRole'], string> = {
 export function taskOwnerText(db: DB, checklist: Pick<Checklist, 'personId'>, task: Pick<ChecklistTask, 'ownerRole' | 'assigneeId'>): string {
   const assignee = task.assigneeId ? db.people.find((p) => p.id === task.assigneeId) : undefined
   if (assignee && task.ownerRole === 'admin') return `Owner: ${fullName(assignee)} (Admin tracks it)`
+  // Nobody holds an IT role in a small company: an unassigned IT task is Admin's (isMyTask, the inbox).
+  if (!assignee && task.ownerRole === 'it') return 'Owner: IT (Admin)'
   const managerId = !task.assigneeId && task.ownerRole === 'manager' ? db.people.find((p) => p.id === checklist.personId)?.managerId : undefined
   const owner = assignee ?? (managerId ? db.people.find((p) => p.id === managerId) : undefined)
   return `Owner: ${OWNER_LABEL[task.ownerRole]}${owner ? `, ${fullName(owner)}` : ''}`
@@ -673,13 +675,16 @@ export function canActOnTask(v: Viewer, db: DB, checklist: Checklist, task: Chec
 
 /**
  * Tasks the viewer owns (the checklist's Mine filter), which is narrower than what they may act on:
- * an assigned person owns their task; Admin owns admin tasks; the person's own manager owns
- * manager tasks; the person owns their own new-hire tasks. IT tasks belong to whoever runs IT.
+ * an assigned person owns their task; Admin owns admin tasks and unassigned IT tasks (as in the inbox); the
+ * person's own manager owns manager tasks; the person owns their own new-hire tasks.
  */
 export function isMyTask(v: Viewer, db: DB, checklist: Checklist, task: ChecklistTask): boolean {
   if (task.assigneeId) return !!v.personId && task.assigneeId === v.personId
   switch (task.ownerRole) {
+    // An IT task nobody is assigned is Admin's, as the inbox routes it (taskOwnerId): a small company has no IT
+    // role, and leaving it out made Mine miss work only Admin can do.
     case 'admin':
+    case 'it':
       return v.role === 'admin'
     case 'manager': {
       const person = db.people.find((p) => p.id === checklist.personId)

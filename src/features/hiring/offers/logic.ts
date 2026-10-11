@@ -396,12 +396,62 @@ export function rulesAtThreshold(n: number) {
  * offer's pay, equity, level or start date sends it back to draft (updateOffer), so a draft or an
  * offer waiting for approval never shows an older approval as if it covered the current terms.
  */
-export function approvalLine(offer: Pick<Offer, 'status' | 'approvals'>, needsApproval: boolean, nameOf: (id: ID) => string): string {
+export function approvalLine(offer: Pick<Offer, 'status' | 'approvals'>, needsApproval: boolean, nameOf: (id: ID) => string, drafter?: string): string {
   const last = [...offer.approvals].reverse().find((a) => a.decision === 'approved')
   const pending = offer.status === 'draft' || offer.status === 'awaiting_approval'
   if (last && !pending) return `Approved by ${nameOf(last.approverId)}, ${fmtDay(last.at)}`
-  if (!needsApproval) return 'Drafted by Admin, no separate approval'
+  // The drafter by name, as the panel's subtitle says it ("drafted by Rae Okafor"): Admin is their role.
+  if (!needsApproval) return drafter ? `Drafted by ${drafter} as Admin, no separate approval` : 'Drafted by Admin, no separate approval'
   const waiting = offer.status === 'awaiting_approval' ? 'Waiting for Admin approval' : 'Needs Admin approval'
   if (last) return `${waiting} (changed since the ${fmtShort(last.at)} approval)`
   return pending ? waiting : 'No approval on record'
+}
+
+/** The offer panel's buttons, by key (the component draws each one). */
+export type OfferAction = 'approve' | 'submit' | 'changes' | 'letter' | 'send' | 'edit' | 'accept' | 'decline' | 'extend' | 'reopen'
+/** The offer panel's More menu, by key. */
+export type OfferMoreAction = 'discard-draft' | 'discard' | 'letter' | 'nudge' | 'rescind' | 'backed-out' | 'divider'
+
+/**
+ * Which buttons the offer panel shows for an offer, in order, and which one is the primary action (`lead`:
+ * drawn as the primary button, where focus lands after the offer moves on). An offer that is ready to go out
+ * leads with its letter: Generate letter comes before Mark sent, since the letter is what gets sent and Mark
+ * sent only records the date. Once it is out, the letter stays a visible button (not only in More).
+ * `letter` is false while the viewer may not open the letter yet (a hiring manager before Admin approves).
+ */
+export function offerActionPlan(o: {
+  status: OfferStatus
+  lapsed: boolean
+  needsApproval: boolean
+  isAdmin: boolean
+  hired: boolean
+  letter: boolean
+}): { lead: OfferAction | null; buttons: OfferAction[]; more: OfferMoreAction[] } {
+  const letter: OfferAction[] = o.letter ? ['letter'] : []
+  const rescind: OfferMoreAction[] = o.isAdmin ? ['divider', 'rescind'] : []
+  switch (o.status) {
+    case 'draft':
+      if (o.needsApproval) {
+        const lead = o.isAdmin ? 'approve' : 'submit'
+        return { lead, buttons: [lead, 'edit', ...letter], more: ['discard-draft'] }
+      }
+      return { lead: 'letter', buttons: ['letter', 'send', 'edit'], more: ['discard-draft'] }
+    case 'awaiting_approval':
+      return o.isAdmin
+        ? { lead: 'approve', buttons: ['approve', 'changes', 'edit', ...letter], more: ['discard'] }
+        : { lead: null, buttons: ['edit', ...letter], more: [] }
+    case 'approved':
+      return { lead: 'letter', buttons: ['letter', 'send', 'edit'], more: o.isAdmin ? ['discard'] : [] }
+    case 'sent':
+      // Past its expiry it cannot be accepted until it is extended (markAccepted refuses too).
+      return o.lapsed
+        ? { lead: 'reopen', buttons: ['reopen', 'decline'], more: ['letter', ...rescind] }
+        : { lead: 'accept', buttons: ['accept', 'decline', 'extend', 'letter'], more: ['nudge', ...rescind] }
+    case 'accepted':
+      return { lead: null, buttons: [], more: o.hired ? [] : ['backed-out', 'letter'] }
+    case 'expired':
+      return { lead: 'reopen', buttons: ['reopen', 'decline'], more: [] }
+    default:
+      return { lead: null, buttons: [], more: [] }
+  }
 }

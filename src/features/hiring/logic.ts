@@ -25,6 +25,7 @@ import {
   stageIndex,
   stuckCount,
   findDuplicates,
+  nextStage,
 } from '@/domain/hiring'
 import { planSlotStatus } from '@/domain/pay'
 import { founder, fullName, personNameById } from '@/domain/people'
@@ -879,4 +880,15 @@ export function missingWorkEmailHint(
     text: `Add ${whose} work email to ${self ? 'your' : 'their'} profile so ${reach}.`,
     link: senderId ? { href: links.person(senderId), label: self ? 'Open your profile' : 'Open their profile' } : { href: links.settings('company'), label: 'Open Settings' },
   }
+}
+
+/**
+ * The stage the candidate page's Advance button moves an active application to, or null when there is none
+ * to show: closed or hired applications, and the Offer stage, whose next step (Hired) belongs to the Hire
+ * flow in the offer below.
+ */
+export function advanceTarget(job: Pick<Job, 'stages'>, app: Pick<Application, 'stageId' | 'status'>): JobStage | null {
+  if (app.status !== 'active') return null
+  const next = nextStage(job, app.stageId)
+  return next && next.kind !== 'hired' ? next : null
 }

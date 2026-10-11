@@ -21,7 +21,7 @@ import type { DB, ID, Offer } from '@/domain/types'
 import { addBusinessDays, fmtDay, fmtShort, type ISODate, today } from '@/lib/dates'
 import { num, plural } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Button, Callout, Private } from '@/ui'
+import { Button, Callout, Icon, Private } from '@/ui'
 import { act, copyWithToast } from '../interviews/common'
 import { missingWorkEmailHint } from '../logic'
 import { checkCleared, otherOffersText } from './logic'
@@ -89,8 +89,13 @@ export function HireDetails({ offerId }: { offerId: ID }) {
           You can record the hire now. The onboarding checklist keeps &quot;Background check cleared&quot; open, and it must be done before the start date (SOC 2 evidence).
         </Callout>
       )}
-      <details>
-        <summary className="flex min-h-10 cursor-pointer items-center text-[13.5px] font-semibold text-ink">What Hire does</summary>
+      {/* A flex summary has no native marker: the chevron says it opens (turned down while open). As wide as its
+          words, so its focus ring is a box around them, not two rules across the column. */}
+      <details className="group">
+        <summary className="flex min-h-10 w-fit cursor-pointer items-center gap-1.5 text-[13.5px] font-semibold text-ink">
+          <Icon name="chevron-right" size={16} className="shrink-0 transition-transform group-open:rotate-90 motion-reduce:transition-none" />
+          What Hire does
+        </summary>
         <ul className="mt-1 flex list-disc flex-col gap-1 pl-5 text-[13.5px] text-ink-2">
           <li>
             {startHasPassed(offer, today())

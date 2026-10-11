@@ -3,6 +3,7 @@ import { signedInHere, signedOutText, syncView } from '@/app/Header'
 import type { DB } from '@/domain/types'
 import type { SyncUser } from '@/sync'
 import { makeDB } from '@/sync/testing/kit'
+import { serverStep } from './serverFocus'
 import {
   agoText,
   checkFailureText,
@@ -460,5 +461,23 @@ describe('signed out, or a session that ended (r3-09)', () => {
       syncView({ status: 'signed_out', mode: 'server', pending: 0, rejected: 0, lastSyncAt: null, lastError: null, hold: null, user: null, signedOutByUser })
     expect(chip(false)!.tip).toMatch(/^Your session on your server ended\./)
     expect(chip(true)!.tip).toMatch(/^You signed out of your server\./)
+  })
+})
+
+describe('a link to Settings, Server clicked on that page (post-merge: the banner linked to the page it was on)', () => {
+  const page = (...present: string[]) => (selector: string) => present.includes(selector)
+
+  it('goes to the sign-in form first', () => {
+    expect(serverStep(page('#server-signin input[name="username"]', '#server-connect'))).toEqual({ kind: 'signin' })
+  })
+
+  it('else to the first step panel that shows: Upload, a paused sync, the status', () => {
+    expect(serverStep(page('#server-connect', '#server-status'))).toEqual({ kind: 'panel', id: 'server-connect' })
+    expect(serverStep(page('#server-hold', '#server-status'))).toEqual({ kind: 'panel', id: 'server-hold' })
+    expect(serverStep(page('#server-status'))).toEqual({ kind: 'panel', id: 'server-status' })
+  })
+
+  it('leaves the link alone when no step shows (a server check still running)', () => {
+    expect(serverStep(page())).toBeNull()
   })
 })

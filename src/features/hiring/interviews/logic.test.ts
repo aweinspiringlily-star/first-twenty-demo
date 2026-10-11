@@ -22,7 +22,7 @@ import {
   referralStatus,
   splitName,
 } from './logic'
-import { canSeeKitBand, conversionText, medianDaysText, referralRows, splitMoney } from './logic'
+import { canSeeKitBand, conversionText, interviewsEmptyText, medianDaysText, referralRows, splitMoney } from './logic'
 
 vi.mock('@/data/seed', async () => {
   const { blankDB } = await import('@/data/blank')
@@ -393,5 +393,17 @@ describe('metric wording', () => {
     expect(medianDaysText(1, 1)).toBe('1 day')
     expect(medianDaysText(null, 0)).toBe('No hires yet')
     expect(medianDaysText(null, 2)).toBe('Not recorded')
+  })
+})
+
+describe('interviews panel with no interviews (post-merge: a rejected candidate told Admin "Interviews you are on will show here")', () => {
+  it('tells someone who sees every interview whether any were held', () => {
+    expect(interviewsEmptyText({ seesAll: true, active: true })).toBe('None are scheduled yet.')
+    expect(interviewsEmptyText({ seesAll: true, active: false })).toBe('None were held while the application was open.')
+  })
+
+  it('tells an interviewer, who sees only their own, that theirs show here', () => {
+    expect(interviewsEmptyText({ seesAll: false, active: true })).toBe('Interviews you are on will show here.')
+    expect(interviewsEmptyText({ seesAll: false, active: false })).toBe('Interviews you are on will show here.')
   })
 })

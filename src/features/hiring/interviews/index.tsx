@@ -16,6 +16,7 @@ import { useDB } from '@/store/db'
 import { AvatarStack, Badge, Button, EmptyState, IconButton, Menu, type MenuItem, type Tone } from '@/ui'
 import { act, SubPanel } from './common'
 import { DebriefGrid } from './Debrief'
+import { interviewsEmptyText } from './logic'
 import { CancelSheet, InviteSheet, ScheduleSheet, type ScheduleMode } from './ScheduleSheet'
 import { ScorecardSheet } from './ScorecardSheet'
 
@@ -90,11 +91,11 @@ export function CandidateInterviews({ applicationId }: { applicationId: ID }) {
         <EmptyState
           compact
           icon="calendar"
-          title="No interviews yet"
+          title={app.status === 'active' ? 'No interviews yet' : 'No interviews'}
           body={
             canSchedule
               ? 'Schedule one to send times to the candidate and create owed scorecards. Already talked? Log past interview records it and opens your scorecard.'
-              : 'Interviews you are on will show here.'
+              : interviewsEmptyText({ seesAll: full, active: app.status === 'active' })
           }
         />
       ) : (

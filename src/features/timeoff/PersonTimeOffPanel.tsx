@@ -257,7 +257,8 @@ function LeaveSummary({ leave, person, viewer }: { leave: LeaveCase; person: Per
         <div className="mt-1.5 flex flex-wrap items-center gap-2">
           <span className="text-[13px]">Designation notice:</span>
           <NoticeBadge notice={notice} />
-          <a href={links.people('timeoff')} className="text-[13px] font-semibold text-accent underline">
+          {/* A link on its own: a 40px target in every look (its padding is taken back, so the row keeps its height). */}
+          <a href={links.people('timeoff')} className="-my-2.5 inline-flex min-h-10 items-center text-[13px] font-semibold text-accent underline">
             Manage in Time off
           </a>
         </div>

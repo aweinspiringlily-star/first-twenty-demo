@@ -17,6 +17,7 @@ import {
   keepOfferDraft,
   keptOfferDraft,
   latestPerApplication,
+  offerActionPlan,
   offerDisplayStatus,
   offerStatusLabel,
   otherOffersText,
@@ -238,6 +239,45 @@ describe('approval line', () => {
     expect(approvalLine({ status: 'awaiting_approval', approvals: [] }, true, nameOf)).toBe('Waiting for Admin approval')
     expect(approvalLine({ status: 'draft', approvals: [] }, false, nameOf)).toBe('Drafted by Admin, no separate approval')
     expect(approvalLine({ status: 'sent', approvals: [] }, true, nameOf)).toBe('No approval on record')
+  })
+
+  it('names the drafter as the subtitle does, with Admin as their role (post-merge: "drafted by Rae Okafor" vs "Drafted by Admin")', () => {
+    expect(approvalLine({ status: 'draft', approvals: [] }, false, nameOf, 'Rae Okafor')).toBe('Drafted by Rae Okafor as Admin, no separate approval')
+    expect(approvalLine({ status: 'sent', approvals: [] }, false, nameOf, 'Rae Okafor')).toBe('Drafted by Rae Okafor as Admin, no separate approval')
+  })
+})
+
+describe('offer panel actions (post-merge: Mark sent came before the letter, and the letter hid in More once sent)', () => {
+  const base = { lapsed: false, needsApproval: false, isAdmin: true, hired: false, letter: true }
+
+  it('leads with the letter when an offer is ready to go out, then Mark sent', () => {
+    for (const status of ['draft', 'approved'] as const) {
+      const plan = offerActionPlan({ ...base, status })
+      expect(plan.lead).toBe('letter')
+      expect(plan.buttons.indexOf('letter')).toBeLessThan(plan.buttons.indexOf('send'))
+    }
+  })
+
+  it('keeps the letter a visible button once the offer is out', () => {
+    const plan = offerActionPlan({ ...base, status: 'sent' })
+    expect(plan.lead).toBe('accept')
+    expect(plan.buttons).toEqual(['accept', 'decline', 'extend', 'letter'])
+    expect(plan.more).not.toContain('letter')
+    expect(plan.more).toEqual(['nudge', 'divider', 'rescind'])
+    expect(offerActionPlan({ ...base, status: 'sent', isAdmin: false }).more).toEqual(['nudge'])
+  })
+
+  it('routes a draft that needs approval to Approve or Submit, and gives a hiring manager no letter until it is approved', () => {
+    expect(offerActionPlan({ ...base, status: 'draft', needsApproval: true })).toMatchObject({ lead: 'approve', buttons: ['approve', 'edit', 'letter'] })
+    expect(offerActionPlan({ ...base, status: 'draft', needsApproval: true, isAdmin: false, letter: false })).toMatchObject({ lead: 'submit', buttons: ['submit', 'edit'] })
+    expect(offerActionPlan({ ...base, status: 'awaiting_approval', isAdmin: false, letter: false })).toEqual({ lead: null, buttons: ['edit'], more: [] })
+  })
+
+  it('reopens a lapsed or expired offer, and keeps the letter of an accepted one in More until the hire', () => {
+    expect(offerActionPlan({ ...base, status: 'sent', lapsed: true })).toMatchObject({ lead: 'reopen', buttons: ['reopen', 'decline'], more: ['letter', 'divider', 'rescind'] })
+    expect(offerActionPlan({ ...base, status: 'expired' })).toMatchObject({ lead: 'reopen', buttons: ['reopen', 'decline'] })
+    expect(offerActionPlan({ ...base, status: 'accepted' }).more).toEqual(['backed-out', 'letter'])
+    expect(offerActionPlan({ ...base, status: 'accepted', hired: true })).toEqual({ lead: null, buttons: [], more: [] })
   })
 })
 

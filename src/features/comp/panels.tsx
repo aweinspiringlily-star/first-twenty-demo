@@ -5,7 +5,7 @@ import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { canSeePerson } from '@/domain/access'
-import { cancellationPending, cliffDate, fullyVestedDate, grantsFor, grantSummary, pctOfFullyDiluted, scheduleText, vestedHeld, vestingStop } from '@/domain/equity'
+import { cancellationPending, capTableIsPlaceholder, cliffDate, fullyVestedDate, grantsFor, grantSummary, pctOfFullyDiluted, scheduleText, vestedHeld, vestingStop } from '@/domain/equity'
 import { bandFor, bandLabel, compaRatio, compHistoryByLastDay, fullTimeEquivalentBase, peopleCostSummary } from '@/domain/pay'
 import { canCancelChange, cancelScheduledChange, compReasonLabel } from '@/domain/lifecycle'
 import { fullName, personNameById } from '@/domain/people'
@@ -477,6 +477,8 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
             </>
           )}
         </div>
+        {/* The same caveat the offer and Comp and plan > Equity give while the cap table is Start fresh's example. */}
+        {capTableIsPlaceholder(db) && <p className="-mt-2 text-[13px] text-ink-3">The percent of fully diluted is an estimate from the placeholder cap table.</p>}
 
         {leaving && exit && (
           <Callout tone="warn" icon="clock" title={`Vesting stops ${fmtDay(exit.lastDay)}, the last day`}>

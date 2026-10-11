@@ -12,7 +12,7 @@ import {
   defaultHolidays,
   defaultPolicies,
 } from '@/data/defaults'
-import { DEFAULT_ROLE_TEMPLATES } from '@/data/roleTemplates'
+import { DEFAULT_ROLE_TEMPLATES } from '@/data/starterRoleTemplates'
 import { DEFAULT_CHECKLIST_TEMPLATES } from '@/domain/checklists/templates'
 import type { DB } from '@/domain/types'
 import { today } from '@/lib/dates'
@@ -183,6 +183,7 @@ export function blankDB(input: BlankInput): DB {
         de542Threshold: DEFAULT_LAW.de542Threshold,
         lastReviewedOn: DEFAULT_LAW.lastReviewedOn,
       },
+      // Company-neutral starters: the sample installs its own (src/data/seed/hiring.ts).
       roleTemplates: c(DEFAULT_ROLE_TEMPLATES),
     },
   }

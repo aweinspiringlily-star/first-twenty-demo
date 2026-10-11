@@ -43,7 +43,19 @@ import { BandMeter } from './BandMeter'
 import { offerFocusTarget, offerTitleId } from './focus'
 import { HireDetails, hireNow, StartPassedCallout, WelcomeBanner } from './HireFlow'
 import { LetterSheet } from './LetterSheet'
-import { approvalLine, bandMeterFigures, extendOptions, hasKeptOfferDraft, offerStatusLabel, peerBases, rescindReasonText, trimPeriod } from './logic'
+import {
+  approvalLine,
+  bandMeterFigures,
+  extendOptions,
+  hasKeptOfferDraft,
+  type OfferAction,
+  offerActionPlan,
+  type OfferMoreAction,
+  offerStatusLabel,
+  peerBases,
+  rescindReasonText,
+  trimPeriod,
+} from './logic'
 import { OfferBuilder } from './OfferBuilder'
 import { OfferPay } from './OfferPay'
 import { DeclineModal, RequestChangesModal, RescindModal } from './OfferDialogs'
@@ -239,115 +251,75 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
   // The first primary action of each state carries data-next-action: focus lands there after the state changes.
   const next = { 'data-next-action': app.id }
 
-  const primary: ReactNode[] = []
-  const more: MenuItem[] = []
-  // Admin approves before an offer goes out: until then only Admin opens the letter (marked as a draft).
-  const letterBtn = waitingOnApproval(db, offer, date) && !isAdmin ? null : (
-    <Button key="letter" icon="file" onClick={() => setLetterFor(offer.id)}>
-      Generate letter
-    </Button>
-  )
-  const reopen = <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button variant="primary" icon="clock" {...p} {...next}>Extend and reopen</Button>} />
-  switch (offer.status) {
-    case 'draft':
-      if (needsApproval && isAdmin)
-        primary.push(
-          <Button key="approve" variant="primary" icon="check" onClick={approve} {...next}>
-            Approve
-          </Button>,
-        )
-      else if (needsApproval)
-        primary.push(
-          <Button key="submit" variant="primary" icon="send" onClick={submit} {...next}>
-            Submit for approval
-          </Button>,
-        )
-      else
-        primary.push(
-          <Button key="send" variant="primary" icon="send" onClick={send} {...next}>
-            Mark sent
-          </Button>,
-        )
-      primary.push(
-        <Button key="edit" icon="edit" onClick={() => setBuilder({ offerId: offer.id })}>
-          Edit
-        </Button>,
-        letterBtn,
-      )
-      more.push({ label: 'Discard draft', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
-      break
-    case 'awaiting_approval':
-      if (isAdmin) {
-        primary.push(
-          <Button key="approve" variant="primary" size="lg" icon="check" onClick={approve} {...next}>
-            Approve
-          </Button>,
-          <Button key="changes" onClick={() => setDialog({ kind: 'changes', offerId: offer.id })}>
-            Ask for changes
-          </Button>,
-        )
-      }
-      primary.push(
-        <Button key="edit" icon="edit" onClick={() => setBuilder({ offerId: offer.id })}>
-          Edit
-        </Button>,
-        letterBtn,
-      )
-      if (isAdmin) more.push({ label: 'Discard offer', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
-      break
-    case 'approved':
-      primary.push(
-        <Button key="send" variant="primary" icon="send" onClick={send} {...next}>
-          Mark sent
-        </Button>,
-        letterBtn,
-        <Button key="edit" icon="edit" onClick={() => setBuilder({ offerId: offer.id })}>
-          Edit
-        </Button>,
-      )
-      if (isAdmin) more.push({ label: 'Discard offer', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
-      break
-    case 'sent':
-      if (lapsed) {
-        // Past its expiry: it cannot be accepted until it is extended (markAccepted refuses too).
-        primary.push(
-          reopen,
-          <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
-            Declined
-          </Button>,
-        )
-        more.push({ label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
-      } else {
-        primary.push(
-          <Button key="accept" variant="primary" icon="check" onClick={accept} {...next}>
-            Mark accepted
-          </Button>,
-          <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
-            Declined
-          </Button>,
-          <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button icon="clock" {...p}>Extend expiry</Button>} />,
-        )
-        more.push({ label: 'Copy a friendly nudge', icon: 'copy', onSelect: nudge }, { label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
-      }
-      if (isAdmin) more.push({ divider: true }, { label: 'Rescind offer', icon: 'x', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
-      break
-    case 'accepted':
-      if (!hired) {
-        more.push({ label: 'Candidate backed out', icon: 'x', onSelect: () => setDialog({ kind: 'decline', offerId: offer.id }) })
-        more.push({ label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
-      }
-      break
-    case 'expired':
-      primary.push(
-        reopen,
-        <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
-          Declined
-        </Button>,
-      )
-      break
-    default:
-      break
+  // Which buttons show, in what order, and which one leads: offerActionPlan (logic.ts, unit tested).
+  const plan = offerActionPlan({
+    status: offer.status,
+    lapsed,
+    needsApproval,
+    isAdmin,
+    hired: !!hired,
+    // Admin approves before an offer goes out: until then only Admin opens the letter (marked as a draft).
+    letter: !(waitingOnApproval(db, offer, date) && !isAdmin),
+  })
+  const lead = (key: OfferAction) => (plan.lead === key ? { variant: 'primary' as const, ...next } : {})
+  const button: Record<OfferAction, () => ReactNode> = {
+    approve: () => (
+      <Button key="approve" {...lead('approve')} size={offer.status === 'awaiting_approval' ? 'lg' : 'md'} icon="check" onClick={approve}>
+        Approve
+      </Button>
+    ),
+    submit: () => (
+      <Button key="submit" {...lead('submit')} icon="send" onClick={submit}>
+        Submit for approval
+      </Button>
+    ),
+    changes: () => (
+      <Button key="changes" onClick={() => setDialog({ kind: 'changes', offerId: offer.id })}>
+        Ask for changes
+      </Button>
+    ),
+    // Ready to go out, the letter leads (print it, send it for signature), then Mark sent records the date.
+    letter: () => (
+      <Button key="letter" {...lead('letter')} icon="file" onClick={() => setLetterFor(offer.id)}>
+        Generate letter
+      </Button>
+    ),
+    send: () => (
+      <Button key="send" {...lead('send')} icon="send" onClick={send}>
+        Mark sent
+      </Button>
+    ),
+    edit: () => (
+      <Button key="edit" icon="edit" onClick={() => setBuilder({ offerId: offer.id })}>
+        Edit
+      </Button>
+    ),
+    accept: () => (
+      <Button key="accept" {...lead('accept')} icon="check" onClick={accept}>
+        Mark accepted
+      </Button>
+    ),
+    decline: () => (
+      <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
+        Declined
+      </Button>
+    ),
+    extend: () => <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button icon="clock" {...p}>Extend expiry</Button>} />,
+    reopen: () => (
+      <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button variant="primary" icon="clock" {...p} {...next}>Extend and reopen</Button>} />
+    ),
   }
+  const moreItem: Record<OfferMoreAction, MenuItem> = {
+    'discard-draft': { label: 'Discard draft', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) },
+    discard: { label: 'Discard offer', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) },
+    letter: { label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) },
+    nudge: { label: 'Copy a friendly nudge', icon: 'copy', onSelect: nudge },
+    rescind: { label: 'Rescind offer', icon: 'x', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) },
+    'backed-out': { label: 'Candidate backed out', icon: 'x', onSelect: () => setDialog({ kind: 'decline', offerId: offer.id }) },
+    divider: { divider: true },
+  }
+  const primary: ReactNode[] = plan.buttons.map((k) => button[k]())
+  const more: MenuItem[] = plan.more.map((k) => moreItem[k])
   if (closed && canDraft) {
     primary.push(
       <Button key="new" variant="primary" icon="plus" onClick={() => setBuilder({})} {...next}>
@@ -438,7 +410,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
               value:
                 offer.equityShares > 0 ? (
                   <>
-                    <Private>{num(offer.equityShares)}</Private> {offer.equityType}s, <Private>{pct(equity.pctFD)}</Private> fully diluted
+                    <Private>{num(offer.equityShares)}</Private> {offer.equityType}s, <Private>{pct(equity.pctFD, 3)}</Private> fully diluted
                     {capTableIsPlaceholder(db) ? ' (estimate from the placeholder cap table)' : ''}
                   </>
                 ) : (
@@ -462,7 +434,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
               value: `${offer.employmentType === 'part_time' ? 'Part time' : offer.employmentType === 'intern' ? 'Internship' : 'Full time'}${offer.hoursPerWeek ? `, ${offer.hoursPerWeek} hours a week` : ''}`,
             },
             { label: 'Contingencies', value: offer.contingencies.length ? offer.contingencies.map((c) => CONTINGENCY_LABEL[c]).join(', ') : 'None' },
-            { label: 'Approval', value: approvalLine(offer, needsApproval, (id) => personNameById(db, id, 'Admin')) },
+            { label: 'Approval', value: approvalLine(offer, needsApproval, (id) => personNameById(db, id, 'Admin'), drafter) },
             { label: 'Exception reason', value: <MoneyText text={offer.exceptionReason ?? ''} />, hidden: !offer.exceptionReason },
           ]}
         />

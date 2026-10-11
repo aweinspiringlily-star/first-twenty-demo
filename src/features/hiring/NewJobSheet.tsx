@@ -9,7 +9,7 @@
 import { useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
-import { DEFAULT_ROLE_TEMPLATES } from '@/data/roleTemplates'
+import { DEFAULT_ROLE_TEMPLATES } from '@/data/starterRoleTemplates'
 import { createJob, departmentForFamily, effectiveBand, jobFromTemplate, requestJob, requisitionQuarters, roleTemplates, templateLabel } from '@/domain/hiring'
 import { founder } from '@/domain/people'
 import type { ID, Job, PlanSlot, RoleTemplate } from '@/domain/types'
