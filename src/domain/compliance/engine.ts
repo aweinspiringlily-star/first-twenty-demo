@@ -2,6 +2,7 @@
 // States: not_yet, approaching (projected within 60 days from incoming hires, or from outstanding
 // offers 'if accepted'), applies, done (marked done or every action done), not_applicable.
 // Pure and deterministic: every function takes the date; nothing reads the clock.
+import { fileBy as fileByDay, holidayDates, taskFileBy } from '@/domain/checklists/generate'
 import { fullName, isEmployedOn } from '@/domain/people'
 // trainings imports this module too; both only call each other inside functions, so the cycle is safe.
 import { isStatutoryTraining, openTrainingRows } from '@/domain/trainings'
@@ -15,9 +16,11 @@ import {
   eventHit,
   eventNotYetText,
   firstDateAtOrAbove,
+  firstPaidEmployeeOn,
   hasCaliforniaPresence,
   hasPresenceInCity,
   offerPhantoms,
+  paidEmployeesOn,
   projectionDB,
   qualifyingWeeks,
   rawCount,
@@ -50,6 +53,19 @@ export type RuleResult = {
   projectedIfOffersAccepted?: ISODate
   /** Statutory clock (trigger + dueDaysAfterTrigger) or a deadline the user recorded (status.dueOn). */
   dueOn?: ISODate
+  /**
+   * dueOn comes from an estimated trigger date (EDD DE 1 with no first payroll date in Settings): show it as
+   * 'about', never as a legal deadline that came due, and ask for the real date.
+   */
+  dueEstimated?: boolean
+  /**
+   * An agency filing (rule.agencyFiling, the DE 1) whose exact deadline lands on a weekend or company holiday:
+   * the business day before, to file by. Never set on an estimated date. A date that comes from an overdue
+   * follow-up takes that task's own file-by day (taskFileBy: agency filings such as the DE 34 only).
+   */
+  fileBy?: ISODate
+  /** The law takes effect on this later date (rule.effectiveOn, while the evaluation date is before it). */
+  effectiveOn?: ISODate
   /** Not required yet, but the same count has reached rule.recommendFrom. */
   recommended: boolean
   /** 20-week federal rules: qualifying weeks and the projected 20th week. */
@@ -85,6 +101,11 @@ export type RuleResult = {
     overdueYear?: number
     /** Yearly actions open now. Outside the reopen window they rest on last cycle's completion. */
     open: boolean
+    /**
+     * A yearly employee notice with no one to send it to yet (cycle.requires 'paid_employees': only owners
+     * with no pay so far): nothing is owed this cycle or last.
+     */
+    awaitingEmployees?: boolean
   }
   notApplicableReason?: string
 }
@@ -99,13 +120,22 @@ type TriggerEval = {
   weeks?: { n: number; thisYear: number; lastYear: number }
   /** Site rule: the Settings peak looks out of date (treated as at least approaching). */
   stale?: boolean
+  /** Event rule: the event date is an estimate (EventHit.estimated). */
+  estimated?: boolean
 }
 
 const yearOf = (d: ISODate): number => Number(d.slice(0, 4))
 
 type Detection = ISODate | 'on_file' | undefined
 
-export type RuleFollowUp = { personId: ID; title: string; dueOn: ISODate; source: 'training' | 'checklist' }
+export type RuleFollowUp = {
+  personId: ID
+  title: string
+  dueOn: ISODate
+  source: 'training' | 'checklist'
+  /** An agency filing task (the DE 34) due on a weekend or holiday: the business day before (taskFileBy). */
+  fileBy?: ISODate
+}
 
 /** Rules whose per-person duties live on onboarding or change checklists (template task ids). */
 const PER_PERSON_TASKS: Record<string, string[]> = {
@@ -113,6 +143,29 @@ const PER_PERSON_TASKS: Record<string, string[]> = {
   'form-i9': ['on-i9-section1', 'on-i9-section2'],
   'sb294-new-hire': ['on-notice-sb294'],
   'wage-notice-2810-5': ['on-notice-2810-5', 'ch-wage-notice'],
+}
+
+/** True for a rule whose per-person deadlines live on checklist tasks (the DE 34, I-9, SB 294 and 2810.5 tasks). */
+export function hasPerPersonTasks(ruleId: string): boolean {
+  return ruleId in PER_PERSON_TASKS
+}
+
+/**
+ * The deadline a rule keeps of its own next to the checklist tasks that carry its per-person deadlines, for a
+ * list that shows those tasks too (the Home inbox). A date that only comes from an overdue task (a follow-up)
+ * stays on that task's row, and so does a clock (dueDaysAfterTrigger) started by a hire whose checklist has
+ * the task. What is left: a deadline recorded on the card, or a clock for a hire with no such task.
+ * Rules without per-person tasks keep r.dueOn.
+ */
+export function ruleDeadlineBesideTasks(db: DB, r: RuleResult): ISODate | undefined {
+  const taskIds = PER_PERSON_TASKS[r.rule.id]
+  if (!taskIds || !r.dueOn) return r.dueOn
+  if (r.status?.dueOn) return r.status.dueOn
+  const start = r.firstAppliedOn
+  if (r.rule.dueDaysAfterTrigger === undefined || !start) return undefined
+  const starters = new Set(db.people.filter((p) => p.startDate === start).map((p) => p.id))
+  const onTask = db.checklists.some((c) => starters.has(c.personId) && c.tasks.some((t) => !!t.templateTaskId && taskIds.includes(t.templateTaskId)))
+  return onTask ? undefined : addDays(start, r.rule.dueDaysAfterTrigger)
 }
 
 /** Overdue per-person legal deadlines under a rule, oldest first (see RuleResult.followUps). */
@@ -127,12 +180,14 @@ export function ruleFollowUps(db: DB, rule: ComplianceRule, date: ISODate): Rule
   }
   const taskIds = PER_PERSON_TASKS[rule.id]
   if (taskIds) {
+    const holidays = holidayDates(db)
     for (const c of db.checklists) {
       const person = db.people.find((p) => p.id === c.personId)
       if (!person || (person.endDate && person.endDate < date)) continue
       for (const t of c.tasks) {
         if (!t.templateTaskId || !taskIds.includes(t.templateTaskId) || t.status !== 'open' || !t.statutory || t.dueOn >= date) continue
-        out.push({ personId: person.id, title: `${fullName(person)}: ${t.title}`, dueOn: t.dueOn, source: 'checklist' })
+        const by = taskFileBy(t, c, holidays)
+        out.push({ personId: person.id, title: `${fullName(person)}: ${t.title}`, dueOn: t.dueOn, source: 'checklist', ...(by ? { fileBy: by } : {}) })
       }
     }
   }
@@ -150,10 +205,13 @@ const DETECTORS: Record<string, Record<string, (db: DB) => Detection>> = {
         .filter((d): d is ISODate => !!d)
         .sort()[0],
   },
+  // EDD issues the account number only after registration, and a policy number means the policy is bound.
   'edd-registration': {
+    register: (db) => (db.company.eddAccountNumber?.trim() ? 'on_file' : undefined),
     'save-account': (db) => (db.company.eddAccountNumber?.trim() ? 'on_file' : undefined),
   },
   'workers-comp': {
+    'bind-policy': (db) => (db.company.workersCompCarrier?.policyNumber?.trim() ? 'on_file' : undefined),
     'save-carrier': (db) => (db.company.workersCompCarrier?.name?.trim() ? 'on_file' : undefined),
   },
 }
@@ -197,20 +255,33 @@ function evalTrigger(db: DB, rule: ComplianceRule, date: ISODate): TriggerEval {
   const override = db.complianceStatus[rule.id]?.countOverride
   if (t.kind === 'always') {
     const count = rawCount(db, 'w2_one_in_ca', date)
+    // A law that covers contracts from a later date (stay-or-pay) applies now as preparation; it is in force
+    // from its effective date, never from a founding date before the law existed.
+    const effective = rule.effectiveOn && rule.effectiveOn > (db.company.foundedOn || '') ? rule.effectiveOn : undefined
     return {
       applies: true,
       count,
       computedCount: count,
       overridden: false,
-      howCounted: 'Applies to every employer, at any size.',
-      firstAppliedOn: db.company.foundedOn,
+      howCounted: effective
+        ? `Applies to every employer, at any size, for contracts entered on or after ${fmtDate(effective)}.`
+        : 'Applies to every employer, at any size.',
+      firstAppliedOn: effective ? (effective <= date ? effective : undefined) : db.company.foundedOn,
     }
   }
   if (t.kind === 'event') {
     const hit = eventHit(db, t.event, date)
     const applies = !!hit && hit.date <= date
     const howCounted = hit ? (applies ? hit.text : `Not yet. Scheduled: ${hit.text}`) : `Not yet. ${eventNotYetText(t.event, db)}`
-    return { applies, count: applies ? 1 : 0, computedCount: applies ? 1 : 0, overridden: false, howCounted, firstAppliedOn: applies ? hit?.date : undefined }
+    return {
+      applies,
+      count: applies ? 1 : 0,
+      computedCount: applies ? 1 : 0,
+      overridden: false,
+      howCounted,
+      firstAppliedOn: applies ? hit?.date : undefined,
+      ...(hit?.estimated ? { estimated: true } : {}),
+    }
   }
   if (t.kind === 'site') {
     const res = countFor(db, 'site', date, { n: t.n })
@@ -278,25 +349,27 @@ function notApplicableReason(db: DB, rule: ComplianceRule, date: ISODate, status
   return undefined
 }
 
-function project(db: DB, rule: ComplianceRule, date: ISODate, includeOutstanding: boolean): ISODate | undefined {
+/** When the rule is projected to start; `estimated` when that rests on an estimated event date (EventHit.estimated). */
+function project(db: DB, rule: ComplianceRule, date: ISODate, includeOutstanding: boolean): { on: ISODate; estimated?: boolean } | undefined {
   const pdb = projectionDB(db, date, includeOutstanding)
   const t = rule.trigger
+  const at = (on: ISODate | undefined) => (on ? { on } : undefined)
   switch (t.kind) {
     case 'always':
       return undefined
     case 'site':
-      return firstDateAtOrAbove(pdb, 'site', t.n, { after: date })
+      return at(firstDateAtOrAbove(pdb, 'site', t.n, { after: date }))
     case 'event': {
       const hit = eventHit(pdb, t.event, date)
-      return hit && hit.date > date ? hit.date : undefined
+      return hit && hit.date > date ? { on: hit.date, ...(hit.estimated ? { estimated: true } : {}) } : undefined
     }
     case 'headcount': {
-      if (t.method === 'weeks_20') return estimateTwentyWeeks(pdb, t.n, date)
+      if (t.method === 'weeks_20') return at(estimateTwentyWeeks(pdb, t.n, date))
       if (t.method === 'cobra_prior_year') {
         const next = `${yearOf(date) + 1}-01-01`
-        return rawCount(pdb, t.method, next, { n: t.n, ...rule.countOptions }) >= t.n ? next : undefined
+        return rawCount(pdb, t.method, next, { n: t.n, ...rule.countOptions }) >= t.n ? { on: next } : undefined
       }
-      return firstDateAtOrAbove(pdb, t.method, t.n, { after: date })
+      return at(firstDateAtOrAbove(pdb, t.method, t.n, { after: date }))
     }
   }
 }
@@ -379,6 +452,7 @@ export function cycleOwed(db: DB, rule: ComplianceRule, year: number, date: ISOD
   const due = cycleDueOn(rule, year)
   if (!evalTrigger(db, rule, due < date ? due : date).applies) return false
   if (c.requires === 'contractors_1099' && !contractors1099(db, year - 1).length) return false
+  if (c.requires === 'paid_employees' && !paidEmployeesOn(db, due).length) return false
   return true
 }
 
@@ -433,6 +507,7 @@ function evaluateCycle(db: DB, rule: ComplianceRule, raw: Record<string, ISODate
       lastDoneOn: cycleDoneIn(rule, raw, y - 1),
       overdueYear: overdue ? y - 1 : undefined,
       open,
+      ...(c.requires === 'paid_employees' && !owedNow && !owedPrev ? { awaitingEmployees: true } : {}),
     },
     done,
     notDue,
@@ -447,6 +522,8 @@ export function evaluateRule(db: DB, rule: ComplianceRule, date: ISODate): RuleR
   const actionsDone: Record<string, ISODate> = { ...detected.done }
   for (const a of rule.actions) if (raw[a.id]) actionsDone[a.id] = raw[a.id]
   const t = evalTrigger(db, rule, date)
+  // A yearly employee notice starts with the first person it can go to, never with a founder working unpaid.
+  if (rule.cycle?.requires === 'paid_employees' && t.applies) t.firstAppliedOn = firstPaidEmployeeOn(db, date)
   const na = notApplicableReason(db, rule, date, status)
 
   // Yearly actions count only for their cycle (never 'done forever').
@@ -470,9 +547,12 @@ export function evaluateRule(db: DB, rule: ComplianceRule, date: ISODate): RuleR
 
   let projectedOn: ISODate | undefined
   let projectedIfOffersAccepted: ISODate | undefined
+  let projectedEstimated = false
   if (!t.applies && !t.overridden) {
-    projectedOn = project(db, rule, date, false)
-    const withOffers = project(db, rule, date, true)
+    const projected = project(db, rule, date, false)
+    projectedOn = projected?.on
+    projectedEstimated = !!projected?.estimated
+    const withOffers = project(db, rule, date, true)?.on
     if (withOffers && (!projectedOn || withOffers < projectedOn)) projectedIfOffersAccepted = withOffers
   }
 
@@ -492,9 +572,20 @@ export function evaluateRule(db: DB, rule: ComplianceRule, date: ISODate): RuleR
   else state = 'not_yet'
 
   const dueBase = t.applies ? t.firstAppliedOn : projectedOn
-  const ruleDue = status?.dueOn ?? (rule.dueDaysAfterTrigger !== undefined && dueBase ? addDays(dueBase, rule.dueDaysAfterTrigger) : undefined)
+  const clockDue = rule.dueDaysAfterTrigger !== undefined && dueBase ? addDays(dueBase, rule.dueDaysAfterTrigger) : undefined
+  const ruleDue = status?.dueOn ?? clockDue
   const firstFollowUp = followUps[0]?.dueOn
   const dueOn = firstFollowUp && (!ruleDue || firstFollowUp < ruleDue) ? firstFollowUp : ruleDue
+  // Only a recorded trigger date makes the clock a legal deadline; an estimated one reads 'about'.
+  const dueEstimated = !!dueOn && !status?.dueOn && dueOn === clockDue && dueOn !== firstFollowUp && (t.applies ? !!t.estimated : projectedEstimated)
+  // A filing due on a weekend or company holiday goes in the business day before, never before its trigger. A
+  // date from an overdue task (a DE 34) takes the task's own file-by day, as its checklist row shows.
+  let by: ISODate | null = null
+  if (dueOn && !dueEstimated) {
+    if (rule.agencyFiling && dueOn === ruleDue) by = fileByDay(dueOn, holidayDates(db))
+    else if (dueOn === firstFollowUp) by = followUps.find((f) => f.dueOn === dueOn && f.fileBy)?.fileBy ?? null
+  }
+  const fileBy = by && (!dueBase || by >= dueBase) ? by : undefined
 
   let recommended = false
   if (!t.applies && rule.recommendFrom !== undefined && rule.trigger.kind === 'headcount' && rule.trigger.method !== 'weeks_20') {
@@ -520,6 +611,9 @@ export function evaluateRule(db: DB, rule: ComplianceRule, date: ISODate): RuleR
     projectedOn,
     projectedIfOffersAccepted,
     dueOn,
+    ...(dueEstimated ? { dueEstimated } : {}),
+    ...(fileBy ? { fileBy } : {}),
+    ...(t.applies && rule.effectiveOn && rule.effectiveOn > date ? { effectiveOn: rule.effectiveOn } : {}),
     recommended,
     weeks,
     status,

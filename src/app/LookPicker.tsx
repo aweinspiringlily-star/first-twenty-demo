@@ -3,7 +3,7 @@
 import { useId } from 'react'
 import { usePrefs } from '@/store/prefs'
 import { LOOK_LIST, LOOKS, type LookId } from '@/themes/registry'
-import { Badge, Button, cx, DataTable, Icon, Panel, rovingKeyDown, rovingTabIndex } from '@/ui'
+import { Badge, buttonClass, cx, DataTable, Icon, Panel, rovingKeyDown, rovingTabIndex } from '@/ui'
 
 type SampleRow = { id: string; name: string; stage: string }
 const SAMPLE_ROWS: SampleRow[] = [
@@ -29,13 +29,13 @@ export function LookPreview({ look, className }: { look: LookId; className?: str
     >
       <div className="absolute top-0 left-0 w-[200%] origin-top-left scale-50 p-4">
         <Panel title="Open roles" actions={<Badge tone="good" icon="check">On track</Badge>}>
+          {/* Spans with the Button's hooks, not buttons: the card itself is the control (no nested buttons). */}
           <div className="mb-3 flex gap-2">
-            <Button variant="primary" size="sm" icon="plus" tabIndex={-1}>
+            <span className={buttonClass('primary', 'sm')}>
+              <Icon name="plus" size={16} className="ft-btn__icon shrink-0" />
               Add candidate
-            </Button>
-            <Button size="sm" tabIndex={-1}>
-              Export
-            </Button>
+            </span>
+            <span className={buttonClass('secondary', 'sm')}>Export</span>
           </div>
           <DataTable<SampleRow>
             dense

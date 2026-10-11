@@ -27,6 +27,8 @@ export const CHECKLIST_CITATIONS = {
   },
   // b-w4-de4-de34
   withholding: { label: 'W-4 and DE 4', url: 'https://edd.ca.gov/en/payroll_taxes/rates_and_withholding/' },
+  // b-w4-de4-de34 (checker note: the 2026 Form W-4 is the current revision)
+  w4: { label: 'Form W-4 (2026)', url: 'https://www.irs.gov/forms-pubs/about-form-w-4' },
   // b-i9-deadlines
   i9Section1: {
     label: 'Form I-9 section 1',
@@ -190,6 +192,29 @@ const ONBOARDING: TemplateTask[] = [
     category: 'legal',
     citation: C.i9Section1,
     statutory: true,
+  },
+  {
+    // b-w4-de4-de34: W-4 and DE 4 at hire; without a valid DE 4 the employer withholds as single with zero allowances.
+    id: 'on-w4-de4',
+    title: 'W-4 (2026) and DE 4 completed',
+    why: 'Payroll withholds federal and California income tax from these forms, and without a valid DE 4 it withholds as single with zero allowances. Your PEO may collect these during its onboarding; tick this once it has.',
+    ownerRole: 'employee',
+    due: due('start', 0),
+    category: 'payroll',
+    when: { outsideCA: false },
+    citation: C.withholding,
+    statutory: false,
+  },
+  {
+    id: 'on-w4-state',
+    title: 'W-4 (2026) and the state withholding form completed',
+    why: "Payroll withholds federal income tax from the W-4, and state income tax from the work state's own form where the state has one. Your PEO may collect these during its onboarding; tick this once it has.",
+    ownerRole: 'employee',
+    due: due('start', 0),
+    category: 'payroll',
+    when: { outsideCA: true },
+    citation: C.w4,
+    statutory: false,
   },
   {
     id: 'on-notice-crd',
@@ -834,7 +859,7 @@ const CHANGE: TemplateTask[] = [
   {
     id: 'ch-payroll',
     title: 'Payroll updated before the next cutoff',
-    why: 'The PEO needs the new title, pay or manager before the payroll that covers the effective date.',
+    why: 'The PEO needs the new title, level, pay or overtime status before the payroll that covers the effective date. A manager or team move alone adds no payroll task.',
     ownerRole: 'admin',
     due: due('created', 3, 'business_days'),
     category: 'payroll',
@@ -886,6 +911,10 @@ export const DEFAULT_CHECKLIST_TEMPLATES: ChecklistTemplate[] = [
 export const TASK_IDS = {
   backgroundCheck: 'on-background-check',
   newStatePointer: 'on-new-state',
+  de34: 'on-de34',
+  piia: 'on-piia',
+  /** Not a template task: hireFromOffer adds it to the onboarding checklist when the offer has a sign-on bonus. */
+  signOnBonus: 'on-sign-on-bonus',
   election83b: 'on-83b',
   finalPay: ['off-final-pay-termination', 'off-final-pay-contract-end', 'off-final-pay-notice', 'off-final-pay-72h'],
   /** Separation notices, COBRA and HIPP: nothing to send when the person never started work. */
@@ -906,6 +935,11 @@ export const TASK_IDS = {
    * report, the I-9 and the ACA notice are still owed even if they leave before the due date.
    */
   survivesExit: ['on-i9-section1', 'on-i9-section2', 'on-de34', 'on-state-new-hire-report', 'on-notice-aca'],
+  /**
+   * Filings with an agency (EDD's DE 34, another state's new hire registry, an 83(b) election with the IRS).
+   * Only these get a "file by" day when the deadline lands on a weekend or holiday (taskFileBy in generate.ts).
+   */
+  agencyFilings: ['on-de34', 'on-state-new-hire-report', 'on-83b'],
 } as const
 
 /** Checklist tasks that are harassment prevention training, and the training tracker kind each completes. */

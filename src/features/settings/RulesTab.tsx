@@ -26,7 +26,7 @@ import {
   TextLink,
 } from '@/ui'
 import { commit, EditSheet, Row, RowList } from './kit'
-import { exemptFloorFrom, reviewedDate } from './logic'
+import { exemptFloorFrom, exemptRecheck, exemptRecheckText, reviewedDate } from './logic'
 
 const NOT_ADVICE = 'Not legal advice; confirm with counsel or your PEO.'
 
@@ -170,10 +170,8 @@ function ReviewPrompt({ law }: { law: LawSettings }) {
   const keys = [...PAY_FLOORS, ...THRESHOLDS].map((d) => d.key as string).concat(TAX_ROWS.map((r) => `tax.${r.key}`))
   const stale = keys.filter((k) => isStale(reviewedDate(law, k), year)).length
   const flags = useMemo(() => exemptFlags(db, t), [db, t])
-  const exemptCount = useMemo(
-    () => db.people.filter((p) => p.flsa === 'exempt' && (!p.endDate || p.endDate >= t)).length,
-    [db.people, t],
-  )
+  // Only exempt people with a salary on file are checked; the others are named, not counted as passing.
+  const recheck = useMemo(() => exemptRecheck(db, t), [db, t])
   const december = month === 12
   return (
     <Panel title="Yearly review" icon="calendar-check" subtitle="Minimum wages, the exempt floor and wage bases change on January 1.">
@@ -203,9 +201,19 @@ function ReviewPrompt({ law }: { law: LawSettings }) {
             </ul>
           </Callout>
         ) : (
+          <p className="text-[14px] text-ink-2">Exempt recheck: {exemptRecheckText(recheck, law.exemptSalaryMin)}</p>
+        )}
+        {recheck.noSalary.length > 0 && (
           <p className="text-[14px] text-ink-2">
-            Exempt recheck: all {exemptCount} exempt {exemptCount === 1 ? 'salary clears' : 'salaries clear'} the{' '}
-            {money(law.exemptSalaryMin)} floor and the computer professional minimum where it applies.
+            No salary on file:{' '}
+            {recheck.noSalary.map((p, i) => (
+              <span key={p.personId}>
+                {i > 0 && ', '}
+                <TextLink href={links.person(p.personId, 'job')}>{p.name}</TextLink>
+                {p.founder && ' (founder)'}
+              </span>
+            ))}
+            . Pay is checked once it is recorded (Change job or pay on the profile).
           </p>
         )}
         <div className="flex flex-wrap items-center gap-3">

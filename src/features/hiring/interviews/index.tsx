@@ -16,7 +16,7 @@ import { useDB } from '@/store/db'
 import { AvatarStack, Badge, Button, EmptyState, IconButton, Menu, type MenuItem, type Tone } from '@/ui'
 import { act, SubPanel } from './common'
 import { DebriefGrid } from './Debrief'
-import { InviteSheet, ScheduleSheet, type ScheduleMode } from './ScheduleSheet'
+import { CancelSheet, InviteSheet, ScheduleSheet, type ScheduleMode } from './ScheduleSheet'
 import { ScorecardSheet } from './ScorecardSheet'
 
 export { HiringPulse, OpenRolesList } from './pulse'
@@ -33,12 +33,17 @@ const STATUS: Record<Interview['status'], { label: string; tone: Tone }> = {
 
 const FORMAT_LABEL: Record<Interview['format'], string> = { video: 'Video', onsite: 'On site', phone: 'Phone' }
 
-/** Candidate profile block: interviews (schedule, .ics, message), scorecards and debrief. */
+/**
+ * Candidate profile block: interviews (schedule, reschedule, .ics, message), scorecards and debrief.
+ * Cancelling one opens the note and cancellation files for telling the candidate.
+ */
 export function CandidateInterviews({ applicationId }: { applicationId: ID }) {
   const db = useDB((s) => s.db)
   const viewer = useViewer()
   const [scheduling, setScheduling] = useState<ScheduleMode | null>(null)
+  const [rescheduling, setRescheduling] = useState<ID | null>(null)
   const [inviteFor, setInviteFor] = useState<ID | null>(null)
+  const [cancelledFor, setCancelledFor] = useState<ID | null>(null)
   const [filling, setFilling] = useState<ID | null>(null)
   const app = db.applications.find((a) => a.id === applicationId)
   const job = app ? db.jobs.find((j) => j.id === app.jobId) : undefined
@@ -105,12 +110,22 @@ export function CandidateInterviews({ applicationId }: { applicationId: ID }) {
             const missing = cards.filter((s) => !s.submittedAt)
             const items: MenuItem[] = []
             if (manage && i.status !== 'cancelled') items.push({ label: 'Message and calendar files', icon: 'mail', onSelect: () => setInviteFor(i.id) })
+            if (manage && i.status === 'cancelled') items.push({ label: 'Cancellation note and calendar files', icon: 'mail', onSelect: () => setCancelledFor(i.id) })
+            if (canSchedule && i.status === 'scheduled') items.push({ label: 'Reschedule', icon: 'calendar', onSelect: () => setRescheduling(i.id) })
             if (manage && i.status === 'scheduled' && started) {
               items.push({ label: 'Mark completed', icon: 'check', onSelect: () => act(`Marked the ${lowerFirst(i.name)} with ${name} completed`, (d) => setInterviewStatus(d, i.id, 'completed', { date: today() })) })
               items.push({ label: 'Mark as no-show', icon: 'alert', onSelect: () => act(`Marked ${name} as a no-show for the ${lowerFirst(i.name)}`, (d) => setInterviewStatus(d, i.id, 'no_show', { date: today() })) })
             }
             if (manage && i.status === 'scheduled') {
-              items.push({ label: 'Cancel interview', icon: 'x', danger: true, onSelect: () => act(`Cancelled the ${lowerFirst(i.name)} with ${name}`, (d) => cancelInterview(d, i.id, { date: today() })) })
+              items.push({
+                label: 'Cancel interview',
+                icon: 'x',
+                danger: true,
+                onSelect: () => {
+                  // Then prompt to tell the candidate, who already has the confirmation and maybe the invite.
+                  if (act(`Cancelled the ${lowerFirst(i.name)} with ${name}`, (d) => cancelInterview(d, i.id, { date: today() }))) setCancelledFor(i.id)
+                },
+              })
             }
             if (viewer.role === 'admin' && started && i.status !== 'cancelled' && i.status !== 'no_show') {
               const others = missing.filter((s) => s.interviewerId !== viewer.personId)
@@ -163,7 +178,22 @@ export function CandidateInterviews({ applicationId }: { applicationId: ID }) {
         <DebriefGrid applicationId={app.id} onFill={setFilling} />
       </div>
       <ScheduleSheet key={scheduling ?? 'closed'} applicationId={app.id} open={!!scheduling} mode={scheduling ?? 'schedule'} onClose={() => setScheduling(null)} />
+      {rescheduling && <ScheduleSheet key={`re-${rescheduling}`} applicationId={app.id} open rescheduleId={rescheduling} onClose={() => setRescheduling(null)} />}
       {inviteFor && <InviteSheet interviewId={inviteFor} open onClose={() => setInviteFor(null)} />}
+      {cancelledFor && (
+        <CancelSheet
+          interviewId={cancelledFor}
+          onClose={() => setCancelledFor(null)}
+          onScheduleNew={
+            canSchedule
+              ? () => {
+                  setCancelledFor(null)
+                  setScheduling('schedule')
+                }
+              : undefined
+          }
+        />
+      )}
       <ScorecardSheet scorecardId={filling} open={!!filling} onClose={() => setFilling(null)} />
     </SubPanel>
   )

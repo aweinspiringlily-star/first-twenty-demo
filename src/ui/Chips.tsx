@@ -1,8 +1,8 @@
 // Chip pickers: the app prefers one tap over typing. ChipGroup picks one option;
 // DateChips offers Today / Tomorrow / Next Mon / +1 week / +2 weeks / Pick (native date input).
 import type { ReactNode } from 'react'
-import { useId, useState } from 'react'
-import { addDays, fmtDay, isWeekday, parseDate, toISODate, today } from '@/lib/dates'
+import { useEffect, useId, useRef, useState } from 'react'
+import { addDays, fmtDate, fmtDayAnyYear, isUsableDate, isWeekday, parseDate, toISODate, today } from '@/lib/dates'
 import { cx } from './cx'
 import { Icon, type IconName } from './Icon'
 import { rovingKeyDown, rovingTabIndex } from './roving'
@@ -111,8 +111,9 @@ function nextMonday(from: string): string {
 
 /**
  * The default date chips. With `weekdaysOnly`, a chip that lands on a weekend moves to Monday and is
- * labeled with that date ("Mon, Oct 12"), and chips that land on the same day are merged (keeping the
- * one whose words still fit), so on a Saturday "Today" never quietly picks Monday.
+ * labeled with that date ("Mon, Oct 12", with the year when it is not this year's), and chips that land
+ * on the same day are merged (keeping the one whose words still fit), so on a Saturday "Today" never
+ * quietly picks Monday.
  */
 export function defaultDateChips(t: string, weekdaysOnly: boolean): Array<{ label: string; date: string }> {
   const raw = [
@@ -128,7 +129,7 @@ export function defaultDateChips(t: string, weekdaysOnly: boolean): Array<{ labe
     let d = c.date
     while (!isWeekday(d)) d = addDays(d, 1)
     const exact = d === c.date
-    const chip = { label: exact ? c.label : fmtDay(d).replace(/,? \d{4}$/, ''), date: d, exact }
+    const chip = { label: exact ? c.label : fmtDayAnyYear(d, t), date: d, exact }
     const dup = out.findIndex((x) => x.date === d)
     if (dup === -1) out.push(chip)
     else if (!out[dup].exact && exact) out[dup] = chip
@@ -136,7 +137,22 @@ export function defaultDateChips(t: string, weekdaysOnly: boolean): Array<{ labe
   return out.map(({ label, date }) => ({ label, date }))
 }
 
-/** Date picker that leads with chips. `presets` can replace the defaults. */
+/**
+ * Why a date typed in a DateChips field cannot be used, or null when it can (or the field is empty). A
+ * browser's year box takes up to 6 digits, and passes on '20266-03-16' as readily as '2026-03-16'.
+ */
+export function pickedDateProblem(text: string, min?: string, max?: string): string | null {
+  if (!text) return null
+  if (!isUsableDate(text)) return 'Enter a date with a 4-digit year'
+  if (min && text < min) return `Enter a date on or after ${fmtDate(min)}`
+  if (max && text > max) return `Enter a date on or before ${fmtDate(max)}`
+  return null
+}
+
+/**
+ * Date picker that leads with chips. `presets` can replace the defaults. A typed date reaches onChange
+ * only when it is usable (pickedDateProblem); otherwise the field keeps what was typed and says what to fix.
+ */
 export function DateChips({
   value,
   onChange,
@@ -164,6 +180,36 @@ export function DateChips({
   const chips = presets ?? defaultDateChips(t, !!weekdaysOnly)
   const matched = chips.some((c) => c.date === value)
   const [picking, setPicking] = useState(!!value && !matched)
+  // What the date field holds: the value, or what was typed while it cannot be used. It follows the value
+  // whenever that changes (a chip, or a form reset).
+  const [draft, setDraft] = useState(value ?? '')
+  const [shownValue, setShownValue] = useState(value)
+  if (value !== shownValue) {
+    setShownValue(value)
+    setDraft(value ?? '')
+  }
+  // A year typed digit by digit reads 0002, 0020, 0202 on its way to 2026: while the field has focus,
+  // such a date is not called wrong yet (a 5-digit year or a date out of range is, at once).
+  const [left, setLeft] = useState(false)
+  const problem = pickedDateProblem(draft, min, max)
+  const shownProblem = problem && (left || !draft.startsWith('0')) ? problem : null
+  const problemId = `${id}-problem`
+  const pickRef = useRef<HTMLButtonElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  // Pick moves focus into the date field it reveals (not on first render, where it may already be open).
+  const focusInput = useRef(false)
+  useEffect(() => {
+    if (!picking || !focusInput.current) return
+    focusInput.current = false
+    inputRef.current?.focus()
+  }, [picking])
+  // aria-invalid is shared with Field (which sets it for a save error), so it is set by hand, as NumberInput does.
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    if (shownProblem) el.setAttribute('aria-invalid', 'true')
+    else if (!document.getElementById(`${el.id}-hint`)?.classList.contains('ft-field__error')) el.removeAttribute('aria-invalid')
+  }, [shownProblem, picking])
   return (
     <div role="group" aria-label={label} className="ft-datechips flex flex-col gap-2">
       <div className="ft-chips flex flex-wrap gap-2">
@@ -176,9 +222,10 @@ export function DateChips({
               type="button"
               aria-pressed={on}
               disabled={disabled}
-              title={fmtDay(c.date)}
+              title={fmtDayAnyYear(c.date, t)}
               onClick={() => {
                 setPicking(false)
+                setDraft(c.date)
                 onChange(c.date)
               }}
               className={cx(
@@ -193,9 +240,16 @@ export function DateChips({
           )
         })}
         <button
+          ref={pickRef}
           type="button"
           aria-pressed={picking}
-          onClick={() => setPicking(true)}
+          onClick={() => {
+            if (picking) inputRef.current?.focus()
+            else {
+              focusInput.current = true
+              setPicking(true)
+            }
+          }}
           className={cx(
             // One choice among the date chips (not a multi-select), so it is chosen in the same style as they are.
             'ft-chip ft-chip--pick',
@@ -210,17 +264,46 @@ export function DateChips({
       </div>
       {picking && (
         <input
+          ref={inputRef}
           id={id}
           type="date"
           aria-label={`${label}: pick a date`}
+          aria-describedby={shownProblem ? problemId : undefined}
+          data-range-error={shownProblem ? '' : undefined}
           min={min}
           max={max}
-          value={value ?? ''}
-          onChange={(e) => e.target.value && (!max || e.target.value <= max) && onChange(e.target.value)}
+          value={draft}
+          onChange={(e) => {
+            const typed = e.target.value
+            setDraft(typed)
+            if (typed && !pickedDateProblem(typed, min, max)) onChange(typed)
+          }}
+          onFocus={() => setLeft(false)}
+          onBlur={() => setLeft(true)}
+          onKeyDown={(e) => {
+            // Escape steps back to Pick (and folds the field away when no picked date would be hidden),
+            // instead of closing the sheet or dialog around it. A typed date that cannot be used is dropped.
+            if (e.key !== 'Escape') return
+            e.preventDefault()
+            e.stopPropagation()
+            if (problem) setDraft(value ?? '')
+            if (!value || matched) setPicking(false)
+            pickRef.current?.focus()
+          }}
           className="ft-input num h-11 w-full max-w-[220px] rounded-lg border border-control bg-surface px-3 text-[14.5px] text-ink focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/25"
         />
       )}
-      {value && <span className="text-[12.5px] text-ink-3">{fmtDay(value)}</span>}
+      {picking && shownProblem && (
+        <p id={problemId} className="ft-field__error text-[12.5px] font-semibold text-bad">
+          {shownProblem}
+        </p>
+      )}
+      {value && (
+        <span className="text-[12.5px] text-ink-3">
+          {/* While the field holds a date it cannot use, the date picked before stays (and Save keeps it). */}
+          {picking && shownProblem ? `Still set to ${fmtDayAnyYear(value, t)}` : fmtDayAnyYear(value, t)}
+        </span>
+      )}
     </div>
   )
 }

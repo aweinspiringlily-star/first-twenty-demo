@@ -67,8 +67,12 @@ export type RuleCycle = {
   actionIds: string[]
   /** First year the yearly duty exists (SB 294's first notice was due Feb 1, 2026). */
   firstYear?: number
-  /** contractors_1099: owed only when a contractor was paid at or above the 1099-NEC threshold in the year before. */
-  requires?: 'contractors_1099'
+  /**
+   * contractors_1099: owed only when a contractor was paid at or above the 1099-NEC threshold in the year before.
+   * paid_employees: owed only when someone other than an owner with no pay is employed on the due date (the
+   * yearly employee notices; a solo founder working unpaid has no one to send them to).
+   */
+  requires?: 'contractors_1099' | 'paid_employees'
 }
 
 export type ComplianceRule = {
@@ -98,6 +102,21 @@ export type ComplianceRule = {
   supersededBy?: string
   /** Statutory clock: the first action is due this many days after the trigger date. */
   dueDaysAfterTrigger?: number
+  /**
+   * A filing with an agency (EDD's DE 1 and DE 34): when its deadline lands on a weekend or company holiday it
+   * gets a 'file by' day, the business day before, like the DE 34 checklist task (taskFileBy).
+   */
+  agencyFiling?: boolean
+  /**
+   * What the rule's own deadline asks for, finishing '<title>: <dueLabel>' on the compliance calendar and Home
+   * ('file the 25102(o) notice with the DFPI'), where the title alone would not say. Without one: '<title>: due'.
+   */
+  dueLabel?: string
+  /**
+   * The law takes effect on this date (for example, contracts entered on or after it). Until then the rule
+   * applies as preparation ('Applies to contracts from Jan 1, 2027: prepare now'), never 'since' founding.
+   */
+  effectiveOn?: ISODate
   /** Counting tweaks for this rule (Cal-COBRA falls back to the prior quarter for a business with no employees last year). */
   countOptions?: { priorQuarterFallback?: boolean }
   /** Yearly actions (see RuleCycle). */
@@ -316,6 +335,7 @@ export const RULES: ComplianceRule[] = [
     citation: SRC.eddRegister,
     category: 'tax',
     dueDaysAfterTrigger: 15,
+    agencyFiling: true,
     lawIds: ['a-edd-register-1'],
   }),
   rule({
@@ -332,6 +352,7 @@ export const RULES: ComplianceRule[] = [
     ],
     citation: SRC.de34,
     category: 'tax',
+    agencyFiling: true,
     lawIds: ['a-de34-1', 'b-w4-de4-de34'],
   }),
   rule({
@@ -478,7 +499,7 @@ export const RULES: ComplianceRule[] = [
     ],
     citation: SRC.lc1553,
     category: 'notices',
-    cycle: { kind: 'annual', dueMonthDay: '02-01', actionIds: ['send-annual', 'record-dates'], firstYear: 2026 },
+    cycle: { kind: 'annual', dueMonthDay: '02-01', actionIds: ['send-annual', 'record-dates'], firstYear: 2026, requires: 'paid_employees' },
     lawIds: ['a-sb294-1', 'b-ca-sb294-rights-notice'],
   }),
   rule({
@@ -528,7 +549,7 @@ export const RULES: ComplianceRule[] = [
     ],
     citation: SRC.victims,
     category: 'notices',
-    cycle: { kind: 'annual', dueMonthDay: '02-01', actionIds: ['annual'] },
+    cycle: { kind: 'annual', dueMonthDay: '02-01', actionIds: ['annual'], requires: 'paid_employees' },
     lawIds: ['a-victims-leave-25'],
   }),
   rule({
@@ -599,6 +620,7 @@ export const RULES: ComplianceRule[] = [
       'For contracts entered on or after Jan 1, 2027, do not make workers repay training costs or pay a fee for leaving. A sign-on bonus clawback is allowed only in a separate agreement that is prorated over no more than 2 years, charges no interest, allows deferral, gives 5 business days to consult a lawyer, and applies only if they quit or are fired for misconduct.',
     jurisdiction: 'california',
     trigger: { kind: 'always' },
+    effectiveOn: '2027-01-01',
     countMethod: 'All employers. "Worker" includes prospective employees.',
     actions: [
       { id: 'review-offers', title: 'Check offer templates for repayment clauses before Jan 1, 2027' },
@@ -727,6 +749,7 @@ export const RULES: ComplianceRule[] = [
     citation: SRC.corp25102o,
     category: 'equity',
     dueDaysAfterTrigger: 30,
+    dueLabel: 'file the 25102(o) notice with the DFPI',
     lawIds: [],
     verification: 'needs_review',
   }),

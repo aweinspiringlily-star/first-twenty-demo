@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { fixtureDB } from '@/domain/hiring/testkit'
-import type { Interview, InterviewStep, Job, JobStage } from '@/domain/types'
+import type { Interview, InterviewStep, Job, JobStage, Offer } from '@/domain/types'
 import {
   clockLabel,
   confirmationBody,
@@ -15,6 +15,8 @@ import {
   orderedSteps,
   pickedStart,
   pickTimes,
+  pulseJobs,
+  pulseOfferLines,
   ratingTone,
   ratingWord,
   referralStatus,
@@ -119,6 +121,89 @@ describe('pulse lines', () => {
     expect(expiryPhrase('2026-10-10', '2026-10-09')).toBe('Expires tomorrow')
     expect(expiryPhrase('2026-10-08', '2026-10-09')).toBe('Expired Thu, Oct 8')
   })
+
+  it('lowercases only the leading word mid-sentence, keeping day and month names capitalized', () => {
+    expect(expiryPhrase('2026-10-14', '2026-10-19', { midSentence: true })).toBe('expired Wed, Oct 14')
+    expect(expiryPhrase('2026-10-09', '2026-10-09', { midSentence: true })).toBe('expires today')
+    expect(expiryPhrase('2026-10-14', '2026-10-09', { midSentence: true })).toBe('expires in 5 days')
+  })
+
+  it('phrases a sent offer past its expiry as expired, not out', () => {
+    expect(offerPulseLine({ ...base, status: 'sent', expiresOn: '2026-10-16' }, 'Kenji Mori', '2026-10-19')).toBe('Offer to Kenji Mori expired Fri, Oct 16')
+    expect(offerPulseLine({ ...base, status: 'sent', expiresOn: '2026-10-19' }, 'Kenji Mori', '2026-10-19')).toBe('Offer out to Kenji Mori, expires today')
+  })
+
+  it('keeps an offer marked expired in the pulse while the candidate is still active', () => {
+    expect(offerPulseLine({ ...base, status: 'expired', expiresOn: '2026-10-16' }, 'Rosa Delgado', '2026-10-19')).toBe('Offer to Rosa Delgado expired Fri, Oct 16')
+    expect(offerPulseLine({ ...base, status: 'expired', expiresOn: '2026-10-16' }, 'Rosa Delgado', '2026-10-19', { appActive: true })).toBe('Offer to Rosa Delgado expired Fri, Oct 16')
+    expect(offerPulseLine({ ...base, status: 'expired', expiresOn: '2026-10-16' }, 'Rosa Delgado', '2026-10-19', { appActive: false })).toBeNull()
+  })
+
+  describe('jobs and lines', () => {
+    const offer = (id: string, applicationId: string, candidateId: string, extra: Partial<Offer>): Offer =>
+      ({
+        id,
+        applicationId,
+        candidateId,
+        jobId: 'j-fullstack',
+        version: 1,
+        status: 'sent',
+        expiresOn: '2026-10-16',
+        startDate: '2026-11-09',
+        createdOn: '2026-10-05',
+        ...extra,
+      }) as Offer
+    const withOffers = (jobStatus: Job['status'], offers: Offer[]) => {
+      const db = fixtureDB()
+      const job = db.jobs.find((j) => j.id === 'j-fullstack')
+      if (job) job.status = jobStatus
+      db.offers.push(...offers)
+      return db
+    }
+
+    it('lists an expired offer for an active candidate, and drops it once the application closes', () => {
+      const db = withOffers('open', [offer('o-1', 'a-alex', 'c-alex', { status: 'expired' })])
+      expect(pulseOfferLines(db, 'j-fullstack', '2026-10-19')).toEqual(['Offer to Alex Kim expired Fri, Oct 16'])
+      const alex = db.applications.find((a) => a.id === 'a-alex')
+      if (alex) alex.status = 'rejected'
+      expect(pulseOfferLines(db, 'j-fullstack', '2026-10-19')).toEqual([])
+    })
+
+    it('speaks for the newest offer version only', () => {
+      const db = withOffers('open', [offer('o-1', 'a-alex', 'c-alex', { status: 'rescinded' }), offer('o-2', 'a-alex', 'c-alex', { version: 2, status: 'awaiting_approval' })])
+      expect(pulseOfferLines(db, 'j-fullstack', '2026-10-09')).toEqual(['Offer for Alex Kim waiting for approval'])
+    })
+
+    it('keeps a filled job in the pulse while an offer on it is still out', () => {
+      const hired = offer('o-1', 'a-alex', 'c-alex', { status: 'accepted', personId: 'p-new' })
+      expect(pulseJobs(withOffers('filled', [hired])).map((j) => j.id)).toEqual([])
+      for (const status of ['sent', 'awaiting_approval', 'approved'] as const) {
+        const db = withOffers('filled', [hired, offer('o-2', 'a-ben', 'c-ben', { status })])
+        expect(pulseJobs(db).map((j) => j.id)).toEqual(['j-fullstack'])
+      }
+      const acceptedNotStarted = withOffers('filled', [hired, offer('o-2', 'a-ben', 'c-ben', { status: 'accepted' })])
+      expect(pulseJobs(acceptedNotStarted).map((j) => j.id)).toEqual(['j-fullstack'])
+      expect(pulseOfferLines(acceptedNotStarted, 'j-fullstack', '2026-10-09')).toEqual(['Alex Kim accepted, starts Mon, Nov 9', 'Ben Ortiz accepted, starts Mon, Nov 9'])
+      expect(pulseJobs(withOffers('filled', [hired, offer('o-2', 'a-ben', 'c-ben', { status: 'declined' })]))).toEqual([])
+      expect(pulseJobs(withOffers('closed', [offer('o-2', 'a-ben', 'c-ben', { status: 'sent' })]))).toEqual([])
+      expect(pulseJobs(withOffers('open', [])).map((j) => j.id)).toEqual(['j-fullstack'])
+    })
+
+    it('keeps a filled job while its expired offer to an active candidate waits for a decision', () => {
+      const hired = offer('o-1', 'a-alex', 'c-alex', { status: 'accepted', personId: 'p-new' })
+      const db = withOffers('filled', [hired, offer('o-2', 'a-ben', 'c-ben', { status: 'expired', expiresOn: '2026-10-14' })])
+      expect(pulseJobs(db).map((j) => j.id)).toEqual(['j-fullstack'])
+      expect(pulseOfferLines(db, 'j-fullstack', '2026-10-19')).toEqual(['Alex Kim accepted, starts Mon, Nov 9', 'Offer to Ben Ortiz expired Wed, Oct 14'])
+      // Once the application closes, the job drops out of the pulse.
+      const ben = db.applications.find((a) => a.id === 'a-ben')
+      if (ben) ben.status = 'withdrawn'
+      expect(pulseJobs(db)).toEqual([])
+      // A sent offer past its expiry (not marked expired yet) keeps the job too.
+      const lapsed = withOffers('filled', [hired, offer('o-2', 'a-ben', 'c-ben', { status: 'sent', expiresOn: '2026-10-14' })])
+      expect(pulseJobs(lapsed).map((j) => j.id)).toEqual(['j-fullstack'])
+      expect(pulseOfferLines(lapsed, 'j-fullstack', '2026-10-19')).toEqual(['Alex Kim accepted, starts Mon, Nov 9', 'Offer to Ben Ortiz expired Wed, Oct 14'])
+    })
+  })
 })
 
 describe('referrals', () => {
@@ -170,6 +255,36 @@ describe('confirmation message', () => {
     expect(body).toContain('It runs 75 minutes, on video')
     expect(body).toContain('You will meet Hannah Kim and Ravi Subramanian.')
     expect(body).not.toMatch(/—/)
+  })
+
+  it('puts the video link in the message, or promises one, and never claims an attachment', () => {
+    const base = { firstName: 'R', interviewName: 'Intro call', when: 'x', durationMin: 30, format: 'video' as const, panel: [], companyName: 'C', senderName: 'S' }
+    const linked = confirmationBody({ ...base, videoLink: 'https://meet.example.com/room' })
+    expect(linked).toContain('It runs 30 minutes, on video.')
+    expect(linked).toContain('Join here: https://meet.example.com/room')
+    const bare = confirmationBody(base)
+    expect(bare).toContain('It runs 30 minutes, on video. I will send the video link before the call.')
+    for (const body of [linked, bare, confirmationBody({ ...base, format: 'onsite' }), confirmationBody({ ...base, format: 'phone' })]) {
+      expect(body).not.toMatch(/attached|attachment|in the calendar invite/i)
+    }
+    expect(confirmationBody({ ...base, format: 'phone', videoLink: 'https://x' })).not.toContain('https://x')
+  })
+
+  it('says when an interview moved, and asks to drop the old time', () => {
+    const body = confirmationBody({
+      firstName: 'Maya',
+      interviewName: 'Intro call',
+      when: 'Thu, Oct 15, 10:00 AM PT',
+      movedFrom: 'Tue, Oct 13, 1:00 PM PT',
+      durationMin: 30,
+      format: 'video',
+      panel: [],
+      companyName: 'Ledgerlark',
+      senderName: 'S',
+    })
+    expect(body).toContain('Your intro call with Ledgerlark has moved from Tue, Oct 13, 1:00 PM PT to:\n\nThu, Oct 15, 10:00 AM PT')
+    expect(body).toContain('Please take the old time off your calendar.')
+    expect(body).not.toContain('You are confirmed')
   })
 
   it('keeps acronyms in interview names', () => {

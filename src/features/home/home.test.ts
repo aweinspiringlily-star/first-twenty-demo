@@ -1,6 +1,7 @@
 import { produce } from 'immer'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
+import { generateChecklist } from '@/domain/checklists/generate'
 import { addContractor, addPerson, makeDB } from '@/domain/compliance/testkit'
 import type { DB, Viewer } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
@@ -66,6 +67,62 @@ describe('first hire kit', () => {
     expect(after.find((i) => i.key === 'kit-payroll')).toMatchObject({ done: true, onFile: 'Link saved in Settings' })
     db = produce(db, (d) => setKitItemDone(d, kit.find((i) => i.key === 'kit-templates')!, false, FRI))
     expect(db.complianceStatus['kit-templates']).toBeUndefined()
+  })
+
+  it('points the option pool and 409A item at Comp and plan > Equity, done once both are on file', () => {
+    const db = solo()
+    const kit = () => firstHireKit(db, FRI).find((i) => i.key === 'kit-409a')!
+    expect(kit()).toMatchObject({ done: false, go: { label: 'Open Comp and plan > Equity', href: '#comp.equity' } })
+    expect(kit().link.label).toBe('Corporations Code 25102(o)')
+    db.equity.valuations = [{ id: 'v-1', effectiveOn: '2026-10-01', fmvPerShare: 0.1, provider: 'Carta', expiresOn: '2027-10-01' }]
+    // The Start fresh cap table is still placeholder numbers: the pool is not set up yet.
+    expect(kit().done).toBe(false)
+    db.equity.capTableConfirmedOn = FRI
+    expect(kit()).toMatchObject({ done: true, onFile: '409A and cap table on file' })
+  })
+
+  it("ticks EDD registration and workers' comp from the account and policy numbers saved in Settings", () => {
+    const db = solo()
+    addPerson(db, { id: 'p-sam', firstName: 'Sam', lastName: 'Rivera', startDate: '2026-11-02' })
+    db.company.eddAccountNumber = '123-4567-8'
+    db.company.workersCompCarrier = { name: 'Golden Poppy Mutual', phone: '800-555-0100', policyNumber: 'WC-0042' }
+    const items = firstHireKit(db, FRI)
+    expect(items.find((i) => i.key === 'edd-registration')).toMatchObject({ done: true, onFile: 'EDD account number saved in Settings' })
+    // The pamphlet step stays open on the rule; the kit item is the policy.
+    expect(items.find((i) => i.key === 'workers-comp')).toMatchObject({ done: true, onFile: 'Policy number saved in Settings' })
+    expect(items.find((i) => i.key === 'workers-comp')?.neededBy).toBeUndefined()
+    expect(kitProgress(items).done).toBe(2)
+  })
+
+  it("ticking workers' comp records the policy step on the rule card, and unticking reopens it", () => {
+    let db = solo()
+    const kit = firstHireKit(db, FRI)
+    const wc = kit.find((i) => i.key === 'workers-comp')!
+    db = produce(db, (d) => setKitItemDone(d, wc, true, FRI))
+    expect(db.complianceStatus['workers-comp']?.actionsDone).toEqual({ 'bind-policy': FRI })
+    expect(db.complianceStatus['workers-comp']?.status).toBeUndefined()
+    expect(firstHireKit(db, FRI).find((i) => i.key === 'workers-comp')).toMatchObject({ done: true, doneOn: FRI })
+    db = produce(db, (d) => setKitItemDone(d, wc, false, FRI))
+    expect(db.complianceStatus['workers-comp']?.actionsDone).toEqual({})
+    expect(firstHireKit(db, FRI).find((i) => i.key === 'workers-comp')?.done).toBe(false)
+  })
+
+  it('shows the DE 1 due date on the kit before the first hire starts, as an estimate until payroll is dated', () => {
+    const db = solo()
+    // Nobody paid yet: no date to show.
+    expect(firstHireKit(db, FRI).find((i) => i.key === 'edd-registration')?.due).toBeUndefined()
+    addPerson(db, { id: 'p-sam', firstName: 'Sam', lastName: 'Rivera', startDate: '2026-11-02' })
+    expect(firstHireKit(db, FRI).find((i) => i.key === 'edd-registration')?.due).toEqual({
+      text: 'Due about Tue, Nov 17 (estimated)',
+      estimated: true,
+    })
+    db.company.firstPayrollOn = '2026-11-13'
+    // Due Sat Nov 28, after the Thanksgiving holidays: file by Wed Nov 25, as the DE 34 task says.
+    expect(firstHireKit(db, FRI).find((i) => i.key === 'edd-registration')?.due).toEqual({ text: 'Due Sat, Nov 28, file by Wed, Nov 25', estimated: false })
+    const admin: Viewer = { role: 'admin', person: db.people[0], personId: db.people[0].id }
+    expect(weekEvents(db, admin, '2026-11-20', '2026-11-30').find((e) => e.kind === 'deadline' && /DE 1/.test(e.text))?.text).toBe(
+      'EDD employer registration (DE 1): due, file by Wed, Nov 25',
+    )
   })
 })
 
@@ -159,6 +216,22 @@ describe('this week', () => {
     expect(kofi.find((e) => e.kind === 'interview')?.text).toContain('you are on the panel')
     const lee = weekEvents(db, viewer(db, 'employee', 'p-lee'), FRI, '2026-10-15', { scope: 'personal' })
     expect(lee.some((e) => e.kind === 'interview')).toBe(false)
+  })
+})
+
+describe('compliance deadlines on Home', () => {
+  it("shows a hire's DE 34 with its file-by day and says what the 25102(o) deadline is for", () => {
+    const db = makeDB('2026-01-01')
+    const maria = addPerson(db, { id: 'p-maria', firstName: 'Maria', lastName: 'Gonzalez', startDate: '2026-11-02' })
+    db.checklists.push(generateChecklist(db, { id: 'ck-maria', person: maria, templateId: 'tpl-onboarding', anchorDate: '2026-11-02', createdOn: '2026-10-11' }))
+    db.equity.firstIssuanceOn = '2026-10-11'
+    const later = thisWeek(db, viewer(db, 'admin', 'p-founder'), '2026-10-30').comingUp.map((e) => [e.date, e.text])
+    expect(later).toEqual(
+      expect.arrayContaining([
+        ['2026-11-10', 'First stock option grant: file the 25102(o) notice with the DFPI'],
+        ['2026-11-22', 'New hire reporting (DE 34): due for Maria Gonzalez, file by Fri, Nov 20'],
+      ]),
+    )
   })
 })
 

@@ -2,6 +2,7 @@
 // choice), read-only work details, and the 'Data we don't keep' note.
 import { useRef, useState } from 'react'
 import { links } from '@/app/router'
+import { useViewer } from '@/app/useViewer'
 import { departmentName, fullName, getPerson, locationName } from '@/domain/people'
 import type { DB, EmergencyContact, Person } from '@/domain/types'
 import { fmtDate, today } from '@/lib/dates'
@@ -38,7 +39,7 @@ import {
   withSb294Choice,
 } from './profile'
 import { stateName, US_STATES } from './states'
-import { dayText, nextAnniversary, tenureText } from './summary'
+import { dayText, nextAnniversary, payrollProviderName, tenureText } from './summary'
 
 const LC_1555 = 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?sectionNum=1555.&lawCode=LAB'
 
@@ -410,17 +411,31 @@ function WorkDetailsPanel({ db, person }: { db: DB; person: Person }) {
   const date = today()
   const manager = getPerson(db, person.managerId)
   const anniversary = nextAnniversary(person.startDate, date)
+  const admin = useViewer().role === 'admin'
   return (
-    <Panel title="Work details" icon="briefcase" subtitle="Ask an admin to change these.">
+    <Panel title="Work details" icon="briefcase" subtitle={admin ? 'Change these on your profile page.' : 'Ask an admin to change these.'}>
       <DescriptionList
         items={[
-          { label: 'Work email', value: person.workEmail },
+          {
+            label: 'Work email',
+            value: person.workEmail || (
+              <span className="flex flex-wrap items-center gap-x-3">
+                <span className="text-ink-3">Not set</span>
+                {/* Interview invites and candidate emails need it; Admin sets it on the person page. */}
+                {admin && (
+                  <a href={links.person(person.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline decoration-accent/30 underline-offset-2">
+                    Set it on your profile page
+                  </a>
+                )}
+              </span>
+            ),
+          },
           { label: 'Title', value: person.title },
           { label: 'Team', value: departmentName(db, person.departmentId) },
           {
             label: 'Manager',
             value: manager ? (
-              <a href={links.person(manager.id)} className="font-semibold text-accent underline decoration-accent/30 underline-offset-2">
+              <a href={links.person(manager.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline decoration-accent/30 underline-offset-2">
                 {fullName(manager)}
               </a>
             ) : (
@@ -452,6 +467,7 @@ const NOT_KEPT = [
 
 function DataWeDontKeep({ db }: { db: DB }) {
   const peo = db.company.payrollProvider
+  const peoName = payrollProviderName(db)
   return (
     <Panel title="Data we don't keep" icon="eye-off" subtitle="This app stores status and dates, never these.">
       <ul className="grid gap-x-6 gap-y-2 text-[14px] text-ink-2 sm:grid-cols-2">
@@ -463,12 +479,12 @@ function DataWeDontKeep({ db }: { db: DB }) {
         ))}
       </ul>
       <p className="mt-4 text-[14px] text-ink-2">
-        Your payroll, tax, bank and benefits details live with {peo?.name ? <strong className="text-ink">{peo.name}</strong> : 'the payroll provider'}
+        Your payroll, tax, bank and benefits details live with {peoName ? <strong className="text-ink">{peoName}</strong> : 'the payroll provider'}
         . Update them there.
         {peo?.url && (
           <>
             {' '}
-            <a href={peo.url} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 font-semibold text-accent underline">
+            <a href={peo.url} target="_blank" rel="noreferrer noopener" className="-my-2.5 inline-flex min-h-10 items-center gap-1 font-semibold text-accent underline">
               Open {peo.kind === 'PEO' ? 'the PEO' : 'payroll'}
               <Icon name="external" size={13} />
             </a>

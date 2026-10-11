@@ -8,8 +8,10 @@ import {
   bandFor,
   candidateName,
   compHistory,
+  fullTimeEquivalentBase,
   type LoadedCost,
   loadedCost,
+  type PayFields,
   planSlotStatus,
   slotBudgetBase,
   slotJob,
@@ -72,6 +74,32 @@ export function planStatusCounts(db: DB): Record<PlanSlot['status'], number> {
   const counts: Record<PlanSlot['status'], number> = { planned: 0, open: 0, offer: 0, filled: 0, cut: 0 }
   for (const s of db.plan) counts[planSlotStatus(db, s)] += 1
   return counts
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hiring onto the plan
+// ---------------------------------------------------------------------------------------------
+
+/** A plan line nobody holds yet: not filled or cut, and no person on it. */
+function freeSlot(s: PlanSlot): boolean {
+  return s.status !== 'filled' && s.status !== 'cut' && !s.personId
+}
+
+/**
+ * The plan line a hire from this offer fills: the job's own line (its planSlotId), else the first line
+ * linked to the job by jobId, as long as nobody holds it yet. A second hire from the same job finds the
+ * first hire's line taken and gets undefined, so hireFromOffer adds a filled line for the extra seat
+ * instead of moving the first hire off theirs (SPEC: ONE-CLICK HIRE).
+ */
+export function planSlotForHire(db: DB, offer: Pick<Offer, 'jobId'>, job?: Pick<Job, 'planSlotId'>): PlanSlot | undefined {
+  const own = job?.planSlotId ? db.plan.find((s) => s.id === job.planSlotId) : undefined
+  if (own && freeSlot(own)) return own
+  return db.plan.find((s) => s.jobId === offer.jobId && freeSlot(s))
+}
+
+/** Whether any plan line is linked to the job, held or not (a hire past it adds a seat outside the plan). */
+export function jobHasPlanLine(db: DB, offer: Pick<Offer, 'jobId'>, job?: Pick<Job, 'planSlotId'>): boolean {
+  return db.plan.some((s) => (!!job?.planSlotId && s.id === job.planSlotId) || s.jobId === offer.jobId)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,8 +188,13 @@ export type VarianceRow = {
   status: 'filled' | 'offer'
   budgetBase: number | null
   budgetFromBand: boolean
-  /** Offered base (the deciding offer) or the hire's starting base. */
+  /**
+   * Offered base (the deciding offer) or the hire's starting base, restated at full time (40 hours a week)
+   * the way the comp table compares pay with bands: budgets and band midpoints are full-time figures.
+   */
   actualBase: number | null
+  /** Set when actualBase restates part-time pay: the hours a week the offer or hire is for. */
+  restatedFromHours?: number
   source: 'offer' | 'comp' | null
   /** actualBase - budgetBase (positive = over budget). */
   variance: number | null
@@ -170,7 +203,10 @@ export type VarianceRow = {
   offerId?: ID
 }
 
-/** Budgeted versus offered or actual base for each filled slot and each slot with an offer out. */
+/**
+ * Budgeted versus offered or actual base for each filled slot and each slot with an offer out. Part-time pay
+ * is restated at full time before the comparison, so a 30-hour hire is not counted as under budget.
+ */
 export function budgetVariance(db: DB): { rows: VarianceRow[]; totals: { budget: number; actual: number; variance: number } } {
   const rows: VarianceRow[] = []
   for (const slot of db.plan) {
@@ -179,19 +215,22 @@ export function budgetVariance(db: DB): { rows: VarianceRow[]; totals: { budget:
     const { base: budgetBase, fromBand } = slotBudgetBase(db, slot)
     const offer = slotOffer(db, slot)
     const person = slotPerson(db, slot)
-    let actualBase: number | null = null
+    // The pay and its hours: the deciding offer, else the hire's first record.
+    let paid: { rec: PayFields; hours: number } | null = null
     let source: VarianceRow['source'] = null
     if (offer) {
-      actualBase = annualBase(offer, offer.hoursPerWeek ?? 40)
+      paid = { rec: offer, hours: offer.hoursPerWeek ?? 40 }
       source = 'offer'
     } else if (person) {
       const history = compHistory(db, person.id)
       const hire = history.find((c) => c.reason === 'hire') ?? history[0]
       if (hire) {
-        actualBase = annualBase(hire, person.hoursPerWeek)
+        paid = { rec: hire, hours: person.hoursPerWeek || 40 }
         source = 'comp'
       }
     }
+    const actualBase = paid ? fullTimeEquivalentBase(paid.rec, paid.hours) : null
+    const restatedFromHours = paid && actualBase !== annualBase(paid.rec, paid.hours) ? paid.hours : undefined
     const variance = budgetBase != null && actualBase != null ? actualBase - budgetBase : null
     rows.push({
       slotId: slot.id,
@@ -200,6 +239,7 @@ export function budgetVariance(db: DB): { rows: VarianceRow[]; totals: { budget:
       budgetBase,
       budgetFromBand: fromBand,
       actualBase,
+      ...(restatedFromHours != null ? { restatedFromHours } : {}),
       source,
       variance,
       variancePct: variance != null && budgetBase ? variance / budgetBase : null,

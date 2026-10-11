@@ -2,7 +2,7 @@
 // buttons, built to take under 10 seconds per candidate. Ends with a summary line
 // ('9 touched: 2 advanced, 4 closed with notes, 3 snoozed').
 import { useState } from 'react'
-import { links, navigate } from '@/app/router'
+import { links, navigate, navigateTo } from '@/app/router'
 import { useShortcut } from '@/app/shortcuts'
 import { useViewer } from '@/app/useViewer'
 import { attentionReasonLabel, attentionReasons, dbHolidays, nextStage, openOffer, slaDetail, stageById } from '@/domain/hiring'
@@ -51,7 +51,7 @@ export function Sweep({ job }: { job: Job }) {
       setToBook(moved && stepToSchedule(now, moved) ? app.id : null)
       next('advanced')
     }
-    if (outcome === 'needs_hire') navigate('candidate', app.candidateId)
+    if (outcome === 'needs_hire') navigateTo(links.candidateOffer(app.candidateId, app.id))
   }
   const doSnooze = () => {
     if (!app || !live) return

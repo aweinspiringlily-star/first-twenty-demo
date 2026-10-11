@@ -7,30 +7,40 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { replaceRoute, useRoute } from '@/app/router'
 import { fmtDateTime, fmtTime } from '@/lib/dates'
+import { useDB } from '@/store/db'
 import {
   clearRefreshed,
   connect,
+  discardRejected,
   disconnect,
+  type RecordRef,
   retryRejected,
   signOut,
   STORAGE_FULL_MESSAGE,
+  type SyncMode,
   syncNow,
   type SyncUser,
   useSyncStatus,
+  waitingCount,
 } from '@/sync'
 import { Badge, Button, Callout, ConfirmButton, DescriptionList, Icon, Panel, toast } from '@/ui'
 import { downloadBackup, StartFreshSheet } from './DataTab'
 import { focusPanelTitle, focusSignInField } from './serverFocus'
-import { Row, RowList } from './kit'
+import { ButtonLink, Row, RowList } from './kit'
 import {
   agoText,
   checkFailureText,
   classifyCheckFailure,
+  describeRecord,
   detectHostContext,
   plural,
+  refreshedNames,
+  refusedText,
   retryIn,
   serverAddress,
+  signInSubtitle,
   statusView,
+  tooLargeText,
 } from './serverLogic'
 import {
   BusyNote,
@@ -43,7 +53,8 @@ import {
   useBusy,
 } from './serverParts'
 
-type Check = { kind: 'checking' } | { kind: 'missing' } | { kind: 'unreachable'; message: string } | { kind: 'ready' }
+/** What the last server check found, and the connection mode it ran in (a check made while connected is stale once the mode changes). */
+type Check = ({ kind: 'checking' } | { kind: 'missing' } | { kind: 'unreachable'; message: string } | { kind: 'ready' }) & { mode?: SyncMode }
 
 function pageOrigin(): string {
   return typeof window === 'undefined' ? '' : window.location.origin
@@ -86,27 +97,32 @@ export function ServerTab() {
   const hold = useSyncStatus((s) => s.hold)
   const status = useSyncStatus((s) => s.status)
   const statusUser = useSyncStatus((s) => s.user)
-  const [check, setCheck] = useState<Check>(host === 'web' ? { kind: 'checking' } : { kind: 'missing' })
+  const signedOutByUser = useSyncStatus((s) => s.signedOutByUser)
+  const [rawCheck, setCheck] = useState<Check>(host === 'web' ? { kind: 'checking' } : { kind: 'missing' })
   const [session, setSession] = useState<SyncUser | null>(null)
   const [needsSignIn, setNeedsSignIn] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  // Whether the server holds no workspace yet, from the check (signed in) or the connect step's look.
+  const [serverEmpty, setServerEmpty] = useState<boolean | undefined>(undefined)
 
   const runCheck = useCallback(
     async (focusAfter = false) => {
       // Never a network call where no server can live at this origin (a file, the artifact viewer).
       if (host !== 'web') return
-      setCheck({ kind: 'checking' })
+      const ranIn = useSyncStatus.getState().mode
+      setCheck({ kind: 'checking', mode: ranIn })
       const res = await connect.checkServer()
       if (res.ok) {
-        setCheck({ kind: 'ready' })
+        setCheck({ kind: 'ready', mode: ranIn })
         setSession(res.signedIn ? res.user : null)
         setNeedsSignIn(!res.signedIn)
+        setServerEmpty(res.empty)
       } else {
         const online = typeof navigator === 'undefined' ? true : navigator.onLine
         setCheck(
           classifyCheckFailure(res.kind) === 'missing'
-            ? { kind: 'missing' }
-            : { kind: 'unreachable', message: checkFailureText(res, online, pageOrigin()) },
+            ? { kind: 'missing', mode: ranIn }
+            : { kind: 'unreachable', message: checkFailureText(res, online, pageOrigin()), mode: ranIn },
         )
       }
       if (focusAfter) focusPanelTitle(res.ok ? (res.signedIn ? 'server-connect' : 'server-signin') : 'server-unreachable')
@@ -117,6 +133,22 @@ export function ServerTab() {
   useEffect(() => {
     void runCheck()
   }, [runCheck])
+
+  // A check made while connected says nothing about now once the connection ends (Disconnect here or in
+  // another tab): it shows as Checking and runs again. So does one made offline, once back online.
+  const stale = host === 'web' && mode !== 'server' && rawCheck.kind !== 'checking' && rawCheck.mode !== undefined && rawCheck.mode !== mode
+  const check: Check = stale ? { kind: 'checking' } : rawCheck
+  useEffect(() => {
+    if (stale) void runCheck()
+  }, [stale, runCheck])
+  useEffect(() => {
+    if (host !== 'web' || typeof window === 'undefined') return
+    const again = () => {
+      if (useSyncStatus.getState().mode !== 'server') void runCheck()
+    }
+    window.addEventListener('online', again)
+    return () => window.removeEventListener('online', again)
+  }, [host, runCheck])
 
   // Arriving from somewhere else (the banner's Sign in, the header chip, Settings, Data) leaves focus on
   // that link, far from what needs doing. Once the tab knows its state, focus moves to the next step:
@@ -162,10 +194,8 @@ export function ServerTab() {
           <SignInPanel
             id="server-signin"
             title="Sign in to keep syncing"
-            subtitle={
-              notice ??
-              'Your session on the server ended. Keep working: this browser keeps an offline copy and holds your changes until you sign in.'
-            }
+            // A sign-out the user chose keeps saying so after edits and reloads (status signedOutByUser).
+            subtitle={notice ?? signInSubtitle({ signedOutByUser })}
             // After a deliberate sign-out the engine forgets the user; SignInPanel falls back to the remembered email.
             defaultEmail={email ?? undefined}
             onSignedIn={(user) => {
@@ -189,9 +219,10 @@ export function ServerTab() {
         <AccountPanel
           signedOut={showSignIn}
           onSignedOut={(message) => {
-            // The engine's message says whether the server confirmed the sign-out (LOGOUT_PENDING_MESSAGE when not).
+            // The engine's message says whether the server confirmed the sign-out (LOGOUT_PENDING_MESSAGE when
+            // not) and how many changes could not be sent first.
             toast({ text: message })
-            toSignIn('You signed out. This browser keeps an offline copy; changes you make wait here until you sign in again.')
+            toSignIn(null)
           }}
           onDisconnected={(message) => {
             toast({ text: message })
@@ -253,6 +284,7 @@ export function ServerTab() {
           focusPanelTitle('server-status')
         }}
         onSignedOut={() => toSignIn('Signed out. Sign in again to choose what syncs.')}
+        onInspected={setServerEmpty}
       />
     )
   }
@@ -263,7 +295,13 @@ export function ServerTab() {
       {wantsFresh && (
         <StartFreshSheet
           onClose={() => replaceRoute('settings', 'server')}
-          onDone={() => focusPanelTitle(useSyncStatus.getState().mode === 'server' ? 'server-status' : 'server-connect')}
+          // Not connected: what the check found, so the sheet can upload to an empty server or say what is next.
+          server={mode !== 'server' && check.kind === 'ready' ? { signedIn: !!session && !!statusUser, empty: serverEmpty } : null}
+          onDone={() => {
+            if (useSyncStatus.getState().mode === 'server') focusPanelTitle('server-status')
+            else if (session && useSyncStatus.getState().user) focusPanelTitle('server-connect')
+            else focusSignInField()
+          }}
         />
       )}
     </div>
@@ -278,6 +316,10 @@ function StatusPanel({ email }: { email: string | null }) {
   const s = useSyncStatus()
   const now = useNow()
   const view = statusView(s)
+  const db = useDB((d) => d.db)
+  const refreshedList = refreshedNames(db, s.refreshed, s.refreshedKeys, s.refreshedKeys.length)
+  const tooLarge = s.rejectedKeys.filter((r) => r.tooLarge)
+  const refused = s.rejected - tooLarge.length
   const { busy, run } = useBusy()
   // What the last Sync now (or Retry) ended with, and the state it described. Once the state moves on
   // (back online, signed in again, refusals cleared) the line would contradict the badge, so it goes.
@@ -301,6 +343,16 @@ function StatusPanel({ email }: { email: string | null }) {
     })
     const after = useSyncStatus.getState()
     setResult({ text: syncResultText(after), state: stateKey(after) })
+  }
+
+  /** Drops a change too large to sync and puts the server's copy back; says how it went. */
+  const discard = async (ref: RecordRef) => {
+    const res = await run('discard', () => discardRejected([ref]))
+    if (!res) return
+    if (res.ok) {
+      toast({ text: 'Change discarded. This browser shows what your server has.' })
+      afterRemoved()
+    } else toast({ text: res.message, tone: 'bad' })
   }
 
   /** The button that removed itself is gone: land on Sync now (or the panel title while paused). */
@@ -345,9 +397,9 @@ function StatusPanel({ email }: { email: string | null }) {
             {
               label: 'Changes waiting in this browser',
               value:
-                s.pending + s.rejected === 0
+                waitingCount(s) === 0
                   ? 'None'
-                  : [s.pending > 0 && plural(s.pending, 'change to send', 'changes to send'), s.rejected > 0 && `${s.rejected} refused`]
+                  : [s.pendingEdits > 0 && plural(s.pendingEdits, 'change to send', 'changes to send'), s.rejected > 0 && `${s.rejected} refused`]
                       .filter(Boolean)
                       .join(', '),
             },
@@ -372,11 +424,30 @@ function StatusPanel({ email }: { email: string | null }) {
           </Callout>
         )}
         {s.refreshed > 0 && (
-          <Callout tone="accent" icon="rotate-ccw" title={`${plural(s.refreshed, 'item was', 'items were')} refreshed from your server`}>
+          <Callout tone="accent" icon="rotate-ccw" title={`${plural(s.refreshed, 'item was', 'items were')} replaced by your server's copy`}>
             <p>
-              {s.refreshed === 1 ? 'It was' : 'They were'} changed on another computer at the same time as here, and the server's version wins.
-              This browser now shows what your server has, so check recent records if something you typed is missing.
+              Your server's copy of {s.refreshed === 1 ? 'it' : 'each'} was different (changed on another computer, or restored from an
+              earlier copy), and the server's version wins. This browser now shows what your server has, so check{' '}
+              {s.refreshed === 1 ? 'it' : 'them'} if something you typed is missing.
             </p>
+            {refreshedList.names.length > 0 && (
+              <ul className="mt-2 flex flex-col gap-1" aria-label="Replaced by your server's copy">
+                {refreshedList.names.map((n, i) => (
+                  <li key={`${i}-${n.label}`}>
+                    {/* One per line, so each link gets the full 40px hit area. */}
+                    {n.href ? (
+                      <a href={n.href} className="inline-flex min-h-10 items-center font-semibold text-accent underline">
+                        {n.label}
+                      </a>
+                    ) : (
+                      n.label
+                    )}
+                    {n.removed && ' (removed on another computer, so your edit was dropped)'}
+                  </li>
+                ))}
+                {refreshedList.more > 0 && <li>{plural(refreshedList.more, 'more item', 'more items')}</li>}
+              </ul>
+            )}
             <div className="mt-3 flex flex-wrap gap-2">
               <Button
                 size="sm"
@@ -390,15 +461,44 @@ function StatusPanel({ email }: { email: string | null }) {
             </div>
           </Callout>
         )}
-        {s.rejected > 0 && (
+        {tooLarge.length > 0 && (
+          <Callout tone="bad" title={tooLarge.length === 1 ? 'A change is too large to sync' : `${tooLarge.length} changes are too large to sync`}>
+            <p>Your server takes records up to 256 KB. Retrying cannot help; discarding puts back what your server has.</p>
+            <ul className="mt-2 flex flex-col gap-3" aria-label="Too large to sync">
+              {tooLarge.map((r) => {
+                const label = describeRecord(db, r.collection, r.id)
+                return (
+                  <li key={`${r.collection}:${r.id}`} className="flex flex-col gap-2">
+                    <span>{tooLargeText(label, r.collection)}</span>
+                    <span className="flex flex-wrap gap-2">
+                      {label.href && (
+                        <ButtonLink href={label.href} variant="ghost">
+                          Open it
+                        </ButtonLink>
+                      )}
+                      <ConfirmButton
+                        size="sm"
+                        icon="trash"
+                        confirmLabel="Press again to discard it"
+                        onConfirm={() => !busy && void discard(r)}
+                        aria-disabled={busy ? true : undefined}
+                      >
+                        Discard this change
+                      </ConfirmButton>
+                    </span>
+                  </li>
+                )
+              })}
+            </ul>
+          </Callout>
+        )}
+        {refused > 0 && (
           // Counts are saved records, and one edit can save two (the record and its activity log entry),
           // so the title says "some changes" and the number is explained where it appears.
           <Callout tone="bad" title="Your server refused some changes">
             <p>
-              {plural(s.rejected, 'saved record stays', 'saved records stay')} in this browser and still {s.rejected === 1 ? 'counts' : 'count'}{' '}
-              as waiting. One edit can save more than one record, such as the record and its activity log entry. A server refuses what it
-              cannot accept, such as a very long note. Retry sends {s.rejected === 1 ? 'it' : 'them'} again. If the server keeps refusing,
-              download a backup and ask whoever runs the server to check its log.
+              {refusedText(refused)} One edit can save more than one record, such as the record and its activity log entry. Retry sends{' '}
+              {refused === 1 ? 'it' : 'them'} again. If your server keeps refusing, download a backup; the server's log says why it refused.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button
@@ -434,7 +534,9 @@ function AccountPanel({
   onSignedOut: (message: string) => void
   onDisconnected: (message: string) => void
 }) {
-  const waiting = useSyncStatus((s) => s.pending + s.rejected)
+  const waiting = useSyncStatus(waitingCount)
+  // Signed out, Sync now cannot send anything: the way to keep waiting changes is to sign in first.
+  const cannotSend = useSyncStatus((s) => s.status === 'signed_out' || s.logoutPending)
   const { busy, run } = useBusy()
   const [error, setError] = useState<{ message: string; n: number } | null>(null)
   const [forgetBlocked, setForgetBlocked] = useState<{ message: string; n: number } | null>(null)
@@ -479,7 +581,7 @@ function AccountPanel({
           {!signedOut && (
             <Row
               title="Sign out"
-              meta="Ends your session on the server. This browser keeps an offline copy you can keep working in; changes wait here and sync when you sign in again."
+              meta="Sends waiting changes first, then ends your session on the server. This browser keeps an offline copy you can keep working in; changes you make wait here and sync when you sign in again."
               actions={
                 <Button icon="log-out" onClick={() => !busy && void doSignOut()} {...guard}>
                   Sign out
@@ -502,7 +604,7 @@ function AccountPanel({
               </>
             }
             actions={
-              <ConfirmButton icon="trash" confirmLabel="Click again to remove this browser's data" onConfirm={() => !busy && void doForget(false)} {...guard}>
+              <ConfirmButton icon="trash" confirmLabel="Press again to remove this browser's data" onConfirm={() => !busy && void doForget(false)} {...guard}>
                 Sign out and remove data
               </ConfirmButton>
             }
@@ -522,10 +624,16 @@ function AccountPanel({
             <Callout tone="bad" title="Nothing was removed">
               <p>{forgetBlocked.message}</p>
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button icon="rotate-ccw" onClick={() => !busy && void syncNow()} {...guard}>
-                  Sync now
-                </Button>
-                <ConfirmButton icon="trash" confirmLabel="Click again to lose them" onConfirm={() => !busy && void doForget(true)} {...guard}>
+                {cannotSend ? (
+                  <Button icon="key" onClick={() => focusSignInField()}>
+                    Sign in
+                  </Button>
+                ) : (
+                  <Button icon="rotate-ccw" onClick={() => !busy && void syncNow()} {...guard}>
+                    Sync now
+                  </Button>
+                )}
+                <ConfirmButton icon="trash" confirmLabel="Press again to lose them" onConfirm={() => !busy && void doForget(true)} {...guard}>
                   Remove anyway and lose {waiting === 1 ? 'it' : 'them'}
                 </ConfirmButton>
               </div>
@@ -543,7 +651,7 @@ function AccountPanel({
               <div className="mt-3 flex flex-wrap gap-2">
                 <ConfirmButton
                   icon="trash"
-                  confirmLabel="Click again to remove this browser's data"
+                  confirmLabel="Press again to remove this browser's data"
                   onConfirm={() => !busy && void doForget(sessionOpen.discardPending, true)}
                   {...guard}
                 >
@@ -561,7 +669,7 @@ function AccountPanel({
                 <Button icon="rotate-ccw" onClick={() => !busy && void syncNow()} {...guard}>
                   Sync now
                 </Button>
-                <ConfirmButton icon="x" confirmLabel="Click again to disconnect" onConfirm={() => !busy && void doDisconnect(true)} {...guard}>
+                <ConfirmButton icon="x" confirmLabel="Press again to disconnect" onConfirm={() => !busy && void doDisconnect(true)} {...guard}>
                   Disconnect anyway
                 </ConfirmButton>
               </div>

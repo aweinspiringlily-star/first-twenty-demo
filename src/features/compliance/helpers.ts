@@ -122,11 +122,16 @@ export function statusLine(r: RuleResult): string {
   const done = r.rule.actions.filter((a) => r.actionsDone[a.id]).length
   switch (r.state) {
     case 'applies': {
+      if (r.effectiveOn) return `Applies to contracts from ${fmtDate(r.effectiveOn)}: prepare now. ${done} of ${total} done.`
+      // A yearly employee notice with only unpaid owners on payroll: nothing is owed yet.
+      if (r.cycle?.awaitingEmployees && r.openActions.length === 0 && !r.followUps?.length) {
+        return 'Nothing is due yet: it starts once someone other than an unpaid owner works here.'
+      }
       const since = r.firstAppliedOn ? `Applies since ${fmtDate(r.firstAppliedOn)}` : 'Applies now'
       if (r.followUps?.length) {
         return `${since}. ${done} of ${total} done; overdue for ${plural(followUpPeople(r), 'person', 'people')} since ${fmtDate(r.followUps[0].dueOn)}.`
       }
-      const due = r.dueOn ? `; due ${fmtDate(r.dueOn)}` : ''
+      const due = r.dueOn ? `; due ${r.dueEstimated ? 'about ' : ''}${fmtDate(r.dueOn)}` : ''
       return `${since}${due}. ${done} of ${total} done.`
     }
     case 'approaching': {
@@ -156,7 +161,10 @@ export function whyText(r: RuleResult): string {
   const t = r.rule.trigger
   const unit = t.kind === 'headcount' && t.method === 'w2_plus_contractors' ? 'employees and contractors' : 'employees'
   if (r.state === 'not_applicable') return r.notApplicableReason ?? 'It was marked not applicable.'
-  if (t.kind === 'always') return 'This applies to every California employer, whatever the size.'
+  if (t.kind === 'always') {
+    if (r.effectiveOn) return `This covers every California employer, whatever the size, for contracts entered on or after ${fmtDate(r.effectiveOn)}. Get ready before then.`
+    return 'This applies to every California employer, whatever the size.'
+  }
   if (t.kind === 'event') {
     return r.state === 'not_yet' ? `It starts with an event that has not happened yet. ${r.howCounted.replace(/^Not yet\. /, '')}` : `It started with an event: ${r.howCounted}`
   }
@@ -190,6 +198,7 @@ export function twentyWeekPaceText(est: ISODate, fromHires: boolean): string {
 export function cycleLine(r: RuleResult): string | null {
   const c = r.cycle
   if (!c) return null
+  if (c.awaitingEmployees) return `Due each ${fmtShort(c.dueOn)} once someone other than an unpaid owner works here.`
   const parts = [`Next due ${fmtDate(c.dueOn)}`]
   if (c.overdueYear) parts.push(`the ${c.overdueYear} cycle is still open`)
   else if (c.doneOn) parts.push(`done for ${c.year} on ${fmtDate(c.doneOn)}`)

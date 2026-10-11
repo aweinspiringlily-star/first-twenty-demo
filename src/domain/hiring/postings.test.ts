@@ -1,7 +1,7 @@
 import { produce } from 'immer'
 import { describe, expect, it, vi } from 'vitest'
 import type { DB, Offer } from '@/domain/types'
-import { payRangeLine, postingBlockReason, postingHeadcount, postingLint, postingText, salaryHistoryLint } from './postings'
+import { healthPlanUnrecorded, offersHealthPlanOn, payRangeLine, postingBlockReason, postingHeadcount, postingLint, postingText, salaryHistoryLint } from './postings'
 import { fixtureDB, FRI, person } from './testkit'
 
 vi.mock('@/data/seed', async () => {
@@ -75,7 +75,10 @@ describe('postingBlockReason (hard stop 1)', () => {
 
 describe('postingText', () => {
   it('includes the range, equity, benefits, no-salary-history line, Fair Chance, EEO and sponsorship', () => {
-    const t = postingText(fixtureDB(), 'j-fullstack')
+    const db = produce(fixtureDB(), (d) => {
+      d.company.groupHealthPlanStartedOn = '2025-05-12'
+    })
+    const t = postingText(db, 'j-fullstack')
     expect(t.startsWith('Senior full-stack engineer\nSan Jose, CA (hybrid) | Full time\n')).toBe(true)
     expect(t).toContain('About Ledgerlark\nLedgerlark builds AI agents')
     expect(t).toContain("What you'll do")
@@ -87,6 +90,26 @@ describe('postingText', () => {
     expect(t).toContain('in a manner consistent with the California Fair Chance Act')
     expect(t).toContain('Ledgerlark is an equal opportunity employer.')
     expect(t.includes(String.fromCharCode(0x2014))).toBe(false)
+  })
+
+  it('promises health coverage only once the company has a group health plan, never from the runway cost assumption', () => {
+    const benefits = (db: DB, date?: string) => postingText(db, 'j-fullstack', date).split('\n').find((l) => l.startsWith('Benefits:'))
+    const base = fixtureDB()
+    expect(base.company.costModel.benefitsPerHeadMonthly).toBeGreaterThan(0)
+    expect(base.company.groupHealthPlanStartedOn).toBeUndefined()
+    expect(healthPlanUnrecorded(base)).toBe(true)
+    expect(benefits(base)).toBe('Benefits: 15 days of vacation a year, California paid sick leave and 11 paid company holidays.')
+    const none = produce(base, (d) => {
+      d.company.groupHealthPlanStartedOn = null
+    })
+    expect(healthPlanUnrecorded(none)).toBe(false)
+    expect(benefits(none)).not.toContain('medical')
+    const starting = produce(base, (d) => {
+      d.company.groupHealthPlanStartedOn = '2026-11-01'
+    })
+    expect(offersHealthPlanOn(starting, FRI)).toBe(false)
+    expect(benefits(starting, FRI)).not.toContain('medical')
+    expect(benefits(starting, '2026-11-01')).toContain('medical, dental and vision coverage')
   })
 
   it('lints clean on its own output', () => {

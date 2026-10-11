@@ -3,7 +3,7 @@
 // counting rule on top of this (see src/domain/compliance).
 import type { DB, ID, Person, Role } from '@/domain/types'
 import { format } from 'date-fns'
-import { addDays, type ISODate, parseDate, today } from '@/lib/dates'
+import { addDays, daysBetween, type ISODate, parseDate, today } from '@/lib/dates'
 
 export function fullName(p: { firstName: string; lastName: string; preferredName?: string }): string {
   return `${p.preferredName || p.firstName} ${p.lastName}`
@@ -135,7 +135,6 @@ export function familyName(db: DB, id: ID | null | undefined): string {
   return db.families.find((f) => f.id === id)?.name ?? ''
 }
 
-/** Employees whose home state differs from every company location state (multi-state payroll). */
 /**
  * The person's earlier stint at the company when this record is a rehire: the explicit
  * rehireOfPersonId, else the most recent former record that ended before this start date with the same
@@ -153,6 +152,11 @@ export function priorStint(db: Pick<DB, 'people'>, person: Pick<Person, 'id' | '
       return `${p.firstName} ${p.lastName}`.trim().toLowerCase() === name
     })
     .sort((a, b) => (b.endDate as string).localeCompare(a.endDate as string))[0]
+}
+
+/** Whole days someone was away between a last day and a new start date (Aug 28 to Oct 12 is 44 days away). */
+export function daysAway(lastDay: ISODate, startDate: ISODate): number {
+  return Math.max(0, daysBetween(lastDay, startDate) - 1)
 }
 
 /**
@@ -191,6 +195,7 @@ export function welcomeEmail(
   return { to: person.personalEmail ?? person.workEmail, subject: fill(template.subject), body: fill(template.body) }
 }
 
+/** Employees whose home state differs from every company location state (multi-state payroll). */
 export function outOfStatePeople(db: DB, date: ISODate = today()): Person[] {
   return employedOn(db, date).filter((p) => p.homeState !== 'CA')
 }

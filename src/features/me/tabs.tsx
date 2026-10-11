@@ -14,12 +14,13 @@ import { plural } from '@/lib/format'
 import { Badge, Button, Callout, cx, Icon, Panel } from '@/ui'
 import { change, LineItem } from './bits'
 import { acknowledgePolicy } from './profile'
-import { coveredByTasks, dayText, myTaskItems, policyStatuses, SOON_DAYS, taskCounts, trainingStatusText } from './summary'
+import { coveredByTasks, dayText, myTaskItems, payrollProviderName, policyStatuses, SOON_DAYS, taskCounts, trainingStatusText } from './summary'
 
 // ---- Job and pay ------------------------------------------------------------------------------
 
 export function JobTab({ db, person }: { db: DB; person: Person }) {
   const peo = db.company.payrollProvider
+  const peoName = payrollProviderName(db) ?? 'the payroll provider'
   // PersonJobPayPanel (comp) shows the current job, pay, the band for the position with the Labor Code
   // 432.3 line, and the effective-dated history. Me adds only the privacy note and where payroll lives.
   return (
@@ -28,11 +29,11 @@ export function JobTab({ db, person }: { db: DB; person: Person }) {
       <Callout tone="neutral" icon="lock" title="Who sees this">
         Your manager and teammates never see your pay or equity in this app. Pay stubs, tax forms and direct deposit live with{' '}
         {peo?.url ? (
-          <a href={peo.url} target="_blank" rel="noreferrer noopener" className="font-semibold text-accent underline">
-            {peo.name}
+          <a href={peo.url} target="_blank" rel="noreferrer noopener" className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline">
+            {peoName}
           </a>
         ) : (
-          (peo?.name ?? 'the payroll provider')
+          peoName
         )}
         .
       </Callout>

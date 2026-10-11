@@ -9,8 +9,8 @@ export type TabDef<K extends string = string> = { key: K; label: ReactNode; coun
  * Underline tabs. Pass `href` on each tab to make them links (deep-linkable sub-views): they render
  * as a <nav> of links with aria-current, since each one loads its own view. Pass `onChange` for local
  * state: they render as an ARIA tablist with arrow-key movement.
- * On narrow screens the strip scrolls sideways; the active tab is kept in view and a fade shows
- * that more tabs exist.
+ * On narrow screens the strip scrolls sideways; the active tab and the focused one are kept in view and a
+ * fade shows that more tabs exist.
  */
 export function Tabs<K extends string>({
   tabs,
@@ -38,31 +38,53 @@ export function Tabs<K extends string>({
     setEdges((e) => (e.left === left && e.right === right ? e : { left, right }))
   }, [])
 
-  // Keep the active tab in view (horizontally only, so the page never jumps).
-  useLayoutEffect(() => {
-    const sc = scroller.current
-    const el = sc?.querySelector<HTMLElement>('[data-active="true"]')
-    if (sc && el) {
-      const scr = sc.getBoundingClientRect()
-      const r = el.getBoundingClientRect()
-      const scale = sc.offsetWidth ? scr.width / sc.offsetWidth : 1
-      const l = (r.left - scr.left) / scale + sc.scrollLeft
-      const w = r.width / scale
-      if (l < sc.scrollLeft) sc.scrollLeft = Math.max(0, l - 24)
-      else if (l + w > sc.scrollLeft + sc.clientWidth) sc.scrollLeft = l + w - sc.clientWidth + 24
-    }
-    measure()
-  }, [value, tabs.length, measure])
+  const fade = 28
 
+  // Scroll the strip until a tab is clear of the edge fade, with room for its focus ring. Horizontal only
+  // (never scrollIntoView), so the page never jumps. Text size zooms the page: rects come back zoomed while
+  // scroll offsets do not, hence the scale.
+  const keepInView = useCallback((el: HTMLElement | null | undefined) => {
+    const sc = scroller.current
+    if (!sc || !el) return
+    const scr = sc.getBoundingClientRect()
+    const r = el.getBoundingClientRect()
+    const scale = sc.offsetWidth ? scr.width / sc.offsetWidth : 1
+    const l = (r.left - scr.left) / scale + sc.scrollLeft
+    const w = r.width / scale
+    const room = fade + 8
+    // The fades show only where the strip can scroll further.
+    const leftFade = sc.scrollLeft > 2 ? room : 0
+    const rightFade = sc.scrollLeft + sc.clientWidth < sc.scrollWidth - 2 ? room : 0
+    if (l < sc.scrollLeft + leftFade) sc.scrollLeft = Math.max(0, l - room)
+    else if (l + w > sc.scrollLeft + sc.clientWidth - rightFade) sc.scrollLeft = l + w - sc.clientWidth + room
+  }, [])
+
+  // Keep the active tab in view.
+  const reveal = useCallback(() => {
+    keepInView(scroller.current?.querySelector<HTMLElement>('[data-active="true"]'))
+    measure()
+  }, [keepInView, measure])
+
+  useLayoutEffect(reveal, [value, tabs.length, reveal])
+
+  // A page opened straight on a later tab (#settings.server at 375px) lays the strip out before the web
+  // fonts and the column width settle, so the first reveal can fall short: reveal again when the strip
+  // or its tabs change size, and once the fonts are ready.
   useEffect(() => {
     const sc = scroller.current
-    if (!sc || typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(measure)
-    ro.observe(sc)
-    return () => ro.disconnect()
-  }, [measure])
-
-  const fade = 28
+    if (!sc) return
+    let live = true
+    document.fonts?.ready.then(() => {
+      if (live) reveal()
+    })
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(reveal)
+    ro?.observe(sc)
+    if (sc.firstElementChild) ro?.observe(sc.firstElementChild)
+    return () => {
+      live = false
+      ro?.disconnect()
+    }
+  }, [reveal])
   const mask =
     edges.left || edges.right
       ? `linear-gradient(to right, ${edges.left ? `transparent 0, #000 ${fade}px` : '#000 0'}, ${edges.right ? `#000 calc(100% - ${fade}px), transparent 100%` : '#000 100%'})`
@@ -116,6 +138,8 @@ export function Tabs<K extends string>({
     <div
       ref={scroller}
       onScroll={measure}
+      // A tab reached with Tab or the arrow keys scrolls fully into view too, not only the active one.
+      onFocusCapture={(e) => keepInView((e.target as HTMLElement).closest<HTMLElement>('.ft-tab'))}
       className={cx('ft-tabs-wrap scroll-thin -mx-1 overflow-x-auto overflow-y-hidden', className)}
       style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
     >

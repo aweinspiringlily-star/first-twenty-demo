@@ -139,14 +139,17 @@ export function JobPage({ route }: PageProps) {
             {job.postedOn && job.status === 'open' && <span>Posted {fmtDate(job.postedOn)}</span>}
             {slot &&
               (isAdmin ? (
-                <a href={links.comp('plan')} className="inline-flex items-center gap-1 font-semibold text-accent underline-offset-2 hover:underline">
-                  <Icon name="layers" size={14} />
-                  Plan: {fmtQuarter(slot.quarter)} {slot.title}
-                  {budget != null && (
-                    <>
-                      , budget <Money value={budget} short />
-                    </>
-                  )}
+                // A 40px hit area (the negative margins keep the subtitle compact); the text wraps inside its own span.
+                <a href={links.comp('plan')} className="-my-2 inline-flex min-h-10 items-center gap-1 font-semibold text-accent underline-offset-2 hover:underline">
+                  <Icon name="layers" size={14} className="shrink-0" />
+                  <span>
+                    Plan: {fmtQuarter(slot.quarter)} {slot.title}
+                    {budget != null && (
+                      <>
+                        , budget <Money value={budget} short />
+                      </>
+                    )}
+                  </span>
                 </a>
               ) : (
                 <span className="inline-flex items-center gap-1">

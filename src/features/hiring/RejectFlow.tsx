@@ -20,7 +20,7 @@ import { nowISO, today } from '@/lib/dates'
 import { useDB } from '@/store/db'
 import { Button, Callout, ChipGroup, Field, focusFirstInvalid, Icon, IconButton, Modal, Segmented, TextArea, toast } from '@/ui'
 import { commit } from './actions'
-import { candidateOfferOn, rejectReasons, textIssueError, textIssues, withdrawalMessage, withdrawReasons } from './logic'
+import { candidateOfferOn, NOTE_MAX_CHARS, rejectReasons, textIssueError, textIssues, withdrawalMessage, withdrawReasons } from './logic'
 import { TextIssueNotes } from './parts'
 
 export type RejectResult = { closed: boolean; notified: boolean }
@@ -149,7 +149,7 @@ function RejectFlowInner({
             </Callout>
           )}
           <Field label="Private note (optional)" hint="Kept on the record, never sent. No pay history." error={noteError}>
-            {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={2} value={note} onChange={(e) => setNote(e.target.value)} />}
+            {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={2} maxLength={NOTE_MAX_CHARS} value={note} onChange={(e) => setNote(e.target.value)} />}
           </Field>
           <TextIssueNotes issues={noteIssues} />
           <div>
@@ -231,7 +231,7 @@ function RejectFlowInner({
                 />
               </div>
               <Field label="Note" hint="Edit before you send. Nothing is sent from this app.">
-                {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={7} value={text} onChange={(e) => setBody(e.target.value)} />}
+                {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={7} maxLength={NOTE_MAX_CHARS} value={text} onChange={(e) => setBody(e.target.value)} />}
               </Field>
             </>
           )}

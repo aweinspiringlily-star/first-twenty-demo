@@ -111,6 +111,119 @@ describe('createApi', () => {
     }
   })
 
+  it('asks who is signed in with GET /api/auth/session: nobody is an answer, not a 401 (r2-48)', async () => {
+    let signedIn = false
+    const { fn, calls } = fakeFetch((url) => {
+      if (url === '/api/auth/session') return json(200, { user: signedIn ? { id: 'u1', email: 'admin@example.test', role: 'admin' } : null })
+      return json(500, {})
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.session()).toEqual({ ok: true, status: 200, data: { user: null } })
+    signedIn = true
+    expect(await api.session()).toEqual({ ok: true, status: 200, data: { user: { id: 'u1', email: 'admin@example.test', role: 'admin' } } })
+    expect(calls.map((c) => [c.url, c.init.method])).toEqual([
+      ['/api/auth/session', 'GET'],
+      ['/api/auth/session', 'GET'],
+    ])
+    const odd = createApi({ fetch: fakeFetch(() => json(200, { nobody: true })).fn })
+    expect(await odd.session()).toMatchObject({ ok: false, kind: 'bad_response' })
+    const down = createApi({ fetch: fakeFetch(() => Promise.reject(new TypeError('Failed to fetch'))).fn })
+    expect(await down.session()).toMatchObject({ ok: false, kind: 'offline' })
+  })
+
+  it('falls back to /api/auth/me on a server from before /api/auth/session, and remembers', async () => {
+    let signedIn = false
+    const { fn, calls } = fakeFetch((url) => {
+      if (url === '/api/auth/session') return json(404, { error: 'not_found' })
+      return signedIn ? json(200, { user: { id: 'u1', email: 'admin@example.test', role: 'admin' } }) : json(401, { error: 'unauthorized' })
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.session()).toEqual({ ok: true, status: 401, data: { user: null } })
+    signedIn = true
+    expect(await api.session()).toMatchObject({ ok: true, data: { user: { email: 'admin@example.test' } } })
+    // The missing route is asked once per page.
+    expect(calls.map((c) => c.url)).toEqual(['/api/auth/session', '/api/auth/me', '/api/auth/me'])
+  })
+
+  it('asks whether the server is empty with GET /api/workspace/status: empty is an answer, not a 404 (r3-06)', async () => {
+    let empty = true
+    const { fn, calls } = fakeFetch((url) => {
+      if (url === '/api/workspace/status') return json(200, empty ? { empty: true } : { empty: false, workspaceId: 'default', historyId: 'h-1', seq: '42' })
+      return json(500, {})
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.workspaceStatus()).toEqual({ ok: true, status: 200, data: { empty: true } })
+    empty = false
+    expect(await api.workspaceStatus()).toEqual({ ok: true, status: 200, data: { empty: false, workspaceId: 'default', historyId: 'h-1', seq: 42 } })
+    expect(calls.map((c) => [c.url, c.init.method])).toEqual([
+      ['/api/workspace/status', 'GET'],
+      ['/api/workspace/status', 'GET'],
+    ])
+    const signedOut = createApi({ fetch: fakeFetch(() => json(401, { error: 'unauthorized' })).fn })
+    expect(await signedOut.workspaceStatus()).toMatchObject({ ok: false, kind: 'signed_out' })
+    const odd = createApi({ fetch: fakeFetch(() => json(200, { empty: 'maybe' })).fn })
+    expect(await odd.workspaceStatus()).toMatchObject({ ok: false, kind: 'bad_response' })
+  })
+
+  it('falls back to GET /api/workspace on a server from before the status route, and remembers', async () => {
+    let hasWorkspace = false
+    const snapshot = { workspaceId: 'default', historyId: 'h-2', seq: 7, db: { schemaVersion: 1 }, versions: {} }
+    const { fn, calls } = fakeFetch((url) => {
+      if (url === '/api/workspace/status') return json(404, { error: 'not_found' })
+      if (url === '/api/workspace') return hasWorkspace ? json(200, snapshot) : json(404, { error: 'empty' })
+      return json(500, {})
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.workspaceStatus()).toEqual({ ok: true, status: 404, data: { empty: true } })
+    hasWorkspace = true
+    // The workspace it had to download comes along, so nobody fetches it twice.
+    expect(await api.workspaceStatus()).toEqual({
+      ok: true,
+      status: 200,
+      data: { empty: false, workspaceId: 'default', historyId: 'h-2', seq: 7, snapshot: { ...snapshot, db: { schemaVersion: 1 } } },
+    })
+    // Without the fallback (a cheap check on every page load) it says not_found and downloads nothing.
+    expect(await api.workspaceStatus({ fallback: false })).toMatchObject({ ok: false, kind: 'not_found' })
+    // The missing route is asked once per page.
+    expect(calls.map((c) => c.url)).toEqual(['/api/workspace/status', '/api/workspace', '/api/workspace'])
+    // Anything other than a missing route stays a failure.
+    const down = createApi({ fetch: fakeFetch(() => json(503, { error: 'unavailable' })).fn })
+    expect(await down.workspaceStatus()).toMatchObject({ ok: false, kind: 'server' })
+  })
+
+  it('reads the existing, byYou and landed flags of a push answer, and ignores anything else', async () => {
+    const api = createApi({
+      fetch: fakeFetch(() =>
+        json(200, {
+          seq: 9,
+          applied: [
+            { collection: 'activity', id: 'act-1', version: 4, existing: true },
+            { collection: 'people', id: 'p-2', version: 9, existing: 'yes' },
+          ],
+          conflicts: [
+            { collection: 'people', id: 'p-1', serverVersion: 8, serverData: { id: 'p-1' }, byYou: true, landed: true },
+            { collection: 'jobs', id: 'j-1', serverVersion: null, serverData: null, byYou: 1 },
+          ],
+        }),
+      ).fn,
+    })
+    expect(await api.postChanges([])).toEqual({
+      ok: true,
+      status: 200,
+      data: {
+        seq: 9,
+        applied: [
+          { collection: 'activity', id: 'act-1', version: 4, existing: true },
+          { collection: 'people', id: 'p-2', version: 9 },
+        ],
+        conflicts: [
+          { collection: 'people', id: 'p-1', serverVersion: 8, serverData: { id: 'p-1' }, byYou: true, landed: true },
+          { collection: 'jobs', id: 'j-1', serverVersion: null, serverData: null },
+        ],
+      },
+    })
+  })
+
   it('parses health, login, me and logout', async () => {
     const { fn } = fakeFetch((url) => {
       if (url === '/api/health') return json(200, { ok: true, db: 'up', version: '0.1.0' })

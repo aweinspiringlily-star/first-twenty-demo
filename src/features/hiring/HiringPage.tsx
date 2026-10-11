@@ -226,9 +226,11 @@ function JobRow({ row }: { row: JobRowData }) {
   const ni = row.nextInterview
   const age = jobAgeText(job, today(), fmtShort)
   return (
-    <li className="grid grid-cols-1 gap-x-5 gap-y-2 px-5 py-4 md:grid-cols-[minmax(0,2.2fr)_minmax(0,1.1fr)_auto_minmax(0,1.6fr)] md:items-center">
+    // The title link stretches over the whole row (its ::after covers the li), so the row is the hit
+    // target; links inside the row sit above it (relative z-10) and keep working.
+    <li className="relative grid grid-cols-1 gap-x-5 gap-y-2 px-5 py-4 hover:bg-surface-2/70 md:grid-cols-[minmax(0,2.2fr)_minmax(0,1.1fr)_auto_minmax(0,1.6fr)] md:items-center">
       <div className="min-w-0">
-        <a href={links.job(job.id)} className="font-bold text-ink hover:text-accent">
+        <a href={links.job(job.id)} className="font-bold text-ink after:absolute after:inset-0 after:content-[''] hover:text-accent">
           {job.title}
         </a>
         <div className="mt-1 flex flex-wrap gap-1.5">
@@ -248,7 +250,7 @@ function JobRow({ row }: { row: JobRowData }) {
         {age && <span>{age}</span>}
         {row.access === 'full' && job.status !== 'filled' && job.status !== 'closed' && (row.active > 0 || row.stuck > 0) && (
           row.stuck > 0 ? (
-            <a href={links.job(job.id, 'sweep')} className="-my-2 inline-flex min-h-10 items-center rounded-full focus-visible:outline-2" aria-label={`${row.stuck} stuck: sweep ${job.title}`}>
+            <a href={links.job(job.id, 'sweep')} className="relative z-10 -my-2 inline-flex min-h-10 items-center rounded-full focus-visible:outline-2" aria-label={`${row.stuck} stuck: sweep ${job.title}`}>
               <Badge tone="warn" icon="alert">
                 {row.stuck} stuck
               </Badge>

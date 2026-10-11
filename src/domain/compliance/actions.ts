@@ -55,6 +55,9 @@ export function setRuleStatus(
  * cycle year it completes ('send-annual@2027', a late filing counts for last year's cycle), and once every
  * yearly action of that cycle is done the whole-cycle key the calendar reads ('year-2027') is set too, the
  * same key markAnnualDone writes. Clearing a yearly action reopens its latest recorded cycle.
+ * SB 553 'Train everyone' also records training for everyone in scope: trainingsRecordedBy says how many
+ * beforehand, so the toast can name what was recorded. (No return value: recipes are often written as
+ * `(d) => setRuleActionDone(...)`, and an Immer recipe that returns a value replaces the state.)
  */
 export function setRuleActionDone(draft: Draft<DB>, ruleId: string, actionId: string, date: ISODate | null): void {
   const s = ensureStatus(draft, ruleId)
@@ -99,6 +102,14 @@ export function setRuleActionDone(draft: Draft<DB>, ruleId: string, actionId: st
     kind: 'compliance_action',
     text: date === null ? `Reopened "${label}"${forYear} (${title(ruleId)})` : `Done${forYear}: "${label}" (${title(ruleId)})`,
   })
+}
+
+/**
+ * How many WVPP training records ticking the rule action would create on the date: everyone in scope with
+ * no completion (only the SB 553 'Train everyone' action creates records; any other action, none).
+ */
+export function trainingsRecordedBy(db: DB, ruleId: string, actionId: string, date: ISODate): number {
+  return ruleId === 'wvpp' && actionId === 'train' ? openTrainingRows(db, date, 'wvpp').length : 0
 }
 
 /** The latest cycle year in which a yearly action is recorded done (by its own key, the whole-cycle key or a plain date). */
@@ -263,6 +274,7 @@ export function anonymizeCandidate(draft: Draft<DB>, candidateId: ID, date: ISOD
   delete c.currentCompany
   delete c.summary
   delete c.desiredPay
+  delete c.desiredPayUnit
   delete c.sourceDetail
   c.tags = []
   c.archived = true

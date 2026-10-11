@@ -13,7 +13,17 @@ import type { ID, LeaveCase } from '@/domain/types'
 import { addBusinessDays, addDays, addMonths, fmtDay, today } from '@/lib/dates'
 import { useDB } from '@/store/db'
 import { Badge, Button, Callout, ChipGroup, DateChips, Field, Icon, SectionLabel, Select, Sheet, TextArea, toast } from '@/ui'
-import { defaultLeaveReturn, LEAVE_KIND_LABEL, leaveDatesValid, leaveKindsFor, leaveSheetMode, nextWorkdayOnOrAfter, weekMonday } from './logic'
+import {
+  defaultLeaveReturn,
+  LEAVE_KIND_LABEL,
+  leaveDatesValid,
+  leaveKindsFor,
+  leaveSheetMode,
+  leaveStartPresets,
+  nextWorkdayOnOrAfter,
+  noteCountText,
+  TIMEOFF_NOTE_MAX_CHARS,
+} from './logic'
 import { LEAVE_LINKS, LegalNote } from './parts'
 
 const KIND_HINT: Record<LeaveCase['kind'], string> = {
@@ -44,7 +54,6 @@ function StartLeaveInner({ onClose, personId }: { onClose: () => void; personId?
   const kinds = leaveKindsFor(mode)
   const [kind, setKind] = useState<LeaveCase['kind']>('bonding')
   const [requestedOn, setRequestedOn] = useState<string>(t)
-  const nextMon = addDays(weekMonday(t), 7)
   const [startDate, setStartDate] = useState<string | null>(null)
   const [expectedReturn, setExpectedReturn] = useState<string | null>(null)
   const [note, setNote] = useState('')
@@ -65,13 +74,7 @@ function StartLeaveInner({ onClose, personId }: { onClose: () => void; personId?
   const askedOn = self ? t : requestedOn
   const designationDue = addBusinessDays(askedOn, 5, holidays)
   const elig = person && startDate ? leaveEligibility(db, person.id, kind, startDate) : null
-  const startChips = [
-    { label: 'Today', date: t },
-    { label: 'Next Mon', date: nextMon },
-    { label: 'In 2 weeks', date: addDays(nextMon, 7) },
-    { label: 'In 4 weeks', date: addDays(nextMon, 21) },
-    { label: 'In 6 weeks', date: addDays(nextMon, 35) },
-  ]
+  const startChips = leaveStartPresets(t, db.holidays)
   const returnChips = startDate
     ? [
         { label: '6 weeks', date: nextWorkdayOnOrAfter(addDays(startDate, 42), db.holidays) },
@@ -82,6 +85,7 @@ function StartLeaveInner({ onClose, personId }: { onClose: () => void; personId?
     : []
   const valid = !!person && kinds.includes(kind) && leaveDatesValid(startDate, expectedReturn)
   const name = person ? fullName(person) : ''
+  const noteCount = noteCountText(note)
 
   const submit = () => {
     if (!valid || !person || !startDate || !expectedReturn) return
@@ -231,8 +235,21 @@ function StartLeaveInner({ onClose, personId }: { onClose: () => void; personId?
         )}
 
         {!self && (
-          <Field label="Note (optional)" hint="Coverage or logistics only. Never medical details. Dictation works here (Win+H or macOS dictation).">
-            {(id, describedBy) => <TextArea id={id} aria-describedby={describedBy} rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Who covers what while they are out" />}
+          <Field
+            label="Note (optional)"
+            hint={`Coverage or logistics only. Never medical details. Dictation works here (Win+H or macOS dictation).${noteCount ? ` ${noteCount}.` : ''}`}
+          >
+            {(id, describedBy) => (
+              <TextArea
+                id={id}
+                aria-describedby={describedBy}
+                rows={2}
+                maxLength={TIMEOFF_NOTE_MAX_CHARS}
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Who covers what while they are out"
+              />
+            )}
           </Field>
         )}
       </form>

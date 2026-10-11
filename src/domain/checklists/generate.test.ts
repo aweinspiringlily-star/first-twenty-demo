@@ -10,9 +10,11 @@ import {
   generateChecklist,
   holidayDates,
   openTasks,
+  rehireDaysAway,
   type TaskContext,
   taskApplies,
   taskDueOn,
+  taskFileBy,
 } from '@/domain/checklists/generate'
 import { DEFAULT_CHECKLIST_TEMPLATES } from '@/domain/checklists/templates'
 import type { Checklist, Contractor, DB, Person } from '@/domain/types'
@@ -626,5 +628,93 @@ describe('template copy', () => {
     for (const tpl of DEFAULT_CHECKLIST_TEMPLATES) {
       for (const t of tpl.tasks) expect(`${t.title} ${t.why ?? ''}`, t.id).not.toMatch(/72 hours notice/)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end review fixes
+// ---------------------------------------------------------------------------------------------
+
+describe('taskFileBy', () => {
+  const holidays = holidayDates(baseDB())
+
+  it('gives agency filings due on a weekend the business day before', () => {
+    const db = baseDB()
+    const p = addPerson(db, 'p-lucas', { startDate: START })
+    const cl = onboarding(db, p)
+    const de34 = task(cl, 'on-de34')
+    expect(de34?.dueOn).toBe('2026-11-08')
+    expect(taskFileBy(de34 ?? { dueOn: '' }, cl, holidays)).toBe('2026-11-06')
+    // A non-filing deadline on the same weekend day gets none
+    expect(taskFileBy({ templateTaskId: 'on-notice-aca', dueOn: '2026-11-08' }, cl, holidays)).toBeNull()
+  })
+
+  it('never gives final pay or other last-day tasks a day before the termination', () => {
+    const db = baseDB()
+    const p = addPerson(db, 'p-kofi')
+    // Terminated on Saturday, Oct 10, recorded that day
+    const fired = generateChecklist(db, { person: p, templateId: 'tpl-offboarding', anchorDate: '2026-10-10', createdOn: '2026-10-10', separationType: 'terminated' })
+    expect(task(fired, 'off-final-pay-termination')?.dueOn).toBe('2026-10-10')
+    for (const t of fired.tasks) expect(taskFileBy(t, fired, holidays), t.templateTaskId).toBeNull()
+  })
+
+  it('never returns a day before the checklist existed or its anchor', () => {
+    const cl = { createdOn: '2026-11-07', anchorDate: '2026-10-19' }
+    expect(taskFileBy({ templateTaskId: 'on-de34', dueOn: '2026-11-08' }, cl, holidays)).toBeNull()
+    expect(taskFileBy({ templateTaskId: 'on-de34', dueOn: '2026-11-08' }, { createdOn: '2026-10-01', anchorDate: '2026-11-07' }, holidays)).toBeNull()
+  })
+
+  it('feeds the open task list', () => {
+    const db = baseDB()
+    const p = addPerson(db, 'p-kofi')
+    db.checklists.push(generateChecklist(db, { person: p, templateId: 'tpl-offboarding', anchorDate: '2026-10-10', createdOn: '2026-10-10', separationType: 'terminated' }))
+    expect(openTasks(db, '2026-10-10').every((x) => x.fileBy === null)).toBe(true)
+  })
+})
+
+describe('W-4 and DE 4 on the onboarding checklist', () => {
+  it('asks a California hire for the W-4 and DE 4 on day 1', () => {
+    const db = baseDB()
+    const p = addPerson(db, 'p-lucas', { startDate: START })
+    const cl = onboarding(db, p)
+    expect(task(cl, 'on-w4-de4')).toMatchObject({ title: 'W-4 (2026) and DE 4 completed', ownerRole: 'employee', assigneeId: 'p-lucas', dueOn: START, category: 'payroll', statutory: false })
+    expect(task(cl, 'on-w4-de4')?.citation?.label).toBe('W-4 and DE 4')
+    expect(task(cl, 'on-w4-de4')?.why).toMatch(/single with zero allowances/)
+    expect(ids(cl)).not.toContain('on-w4-state')
+  })
+
+  it('asks someone working in another state for the W-4 and that state form', () => {
+    const db = baseDB()
+    const p = addPerson(db, 'p-caleb', { startDate: START, homeState: 'TX', homeCity: 'Austin', workMode: 'remote' })
+    const cl = onboarding(db, p)
+    expect(task(cl, 'on-w4-state')).toMatchObject({ title: 'W-4 (2026) and the state withholding form completed', dueOn: START, ownerRole: 'employee' })
+    expect(ids(cl)).not.toContain('on-w4-de4')
+  })
+})
+
+describe('DE 34 for a rehire', () => {
+  function rehireDB(lastDay: string): { db: DB; person: Person } {
+    const db = baseDB()
+    addPerson(db, 'p-omar', { firstName: 'Omar', lastName: 'Haddad', startDate: '2025-01-13', endDate: lastDay })
+    const person = addPerson(db, 'p-omar-haddad', { firstName: 'Omar', lastName: 'Haddad', startDate: '2026-10-12', rehireOfPersonId: 'p-omar' })
+    return { db, person }
+  }
+
+  it('marks it not required when the rehire was away less than 60 days', () => {
+    const { db, person } = rehireDB('2026-08-28')
+    expect(rehireDaysAway(db, person)).toBe(44)
+    const cl = onboarding(db, person)
+    expect(task(cl, 'on-de34')).toMatchObject({ status: 'not_applicable', statutory: true })
+    expect(task(cl, 'on-de34')?.note).toBe("Not required: back after 44 days away. EDD's new hire report covers a rehire only after a separation of at least 60 consecutive days.")
+    expect(cl.completedOn).toBeUndefined()
+  })
+
+  it('keeps it after a separation of 60 days or more, and for a same-name hire that is not linked', () => {
+    const { db, person } = rehireDB('2026-08-12')
+    expect(rehireDaysAway(db, person)).toBe(60)
+    expect(task(onboarding(db, person), 'on-de34')?.status).toBe('open')
+    const near = rehireDB('2026-08-28')
+    delete near.person.rehireOfPersonId
+    expect(task(onboarding(near.db, near.person), 'on-de34')?.status).toBe('open')
   })
 })

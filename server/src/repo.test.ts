@@ -104,12 +104,105 @@ describe('repo', () => {
     expect(rows.rows).toEqual([{ op: 'delete', version: expect.anything(), data: null }])
     expect(Number(rows.rows[0].version)).toBe(deleted.applied[0].version)
     expect((await db.query(`SELECT 1 FROM change_log WHERE data::text LIKE '%187654%' OR data::text LIKE '%191357%'`)).rows).toHaveLength(0)
-    // A pull from before the deletes gets the delete; re-creating still gets a newer version.
+    // A pull from before the deletes gets the delete; re-creating (as new, the way a client that saw the
+    // delete sends it) still gets a newer version.
     const pull = await changesSince(db, seq)
     if ('resync' in pull) throw new Error('unexpected resync')
     expect(pull.changes.filter((c) => c.id === 'j-pay')).toEqual([expect.objectContaining({ op: 'delete', version: deleted.applied[0].version })])
-    const back = await applyChanges(db, parseChanges({ changes: [{ ...salary, baseVersion: v2 }] }), null)
+    const back = await applyChanges(db, parseChanges({ changes: [{ ...salary, baseVersion: null }] }), null)
     expect(back.applied[0].version).toBeGreaterThan(deleted.applied[0].version)
+  })
+
+  describe('a record another device deleted (r2-44)', () => {
+    let deviceOne: string
+    let deviceTwo: string
+    beforeEach(async () => {
+      // Two logins, so the flags can tell who wrote what.
+      const users = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash) VALUES ('one@example.test', 'x'), ('two@example.test', 'x') RETURNING id::text AS id`,
+      )
+      ;[deviceOne, deviceTwo] = users.rows.map((r) => r.id)
+    })
+    const dept = (name: string, baseVersion: number | null) => ({ collection: 'departments', id: 'd-ops', op: 'upsert', data: { id: 'd-ops', name }, baseVersion })
+
+    it('refuses a stale edit that would bring it back: a conflict with nothing on the server', async () => {
+      const up = await replaceWorkspace(db, workspace(), deviceOne)
+      const v = up.versions['departments:d-ops']
+      const gone = await applyChanges(db, parseChanges({ changes: [{ collection: 'departments', id: 'd-ops', op: 'delete', baseVersion: v }] }), deviceOne)
+      // Device two edited it on the copy from before the delete.
+      const stale = await applyChanges(db, parseChanges({ changes: [dept('Finance and ops', v)] }), deviceTwo)
+      expect(stale.applied).toEqual([])
+      expect(stale.conflicts).toEqual([{ collection: 'departments', id: 'd-ops', serverVersion: null, serverData: null }])
+      expect(stale.seq).toBe(gone.seq)
+      expect((await snapshot(db))?.versions['departments:d-ops']).toBeUndefined()
+      // The same user's stale edit says the delete was theirs.
+      const mine = await applyChanges(db, parseChanges({ changes: [dept('Finance and ops', v)] }), deviceOne)
+      expect(mine.conflicts).toEqual([{ collection: 'departments', id: 'd-ops', serverVersion: null, serverData: null, byYou: true }])
+    })
+
+    it('accepts a re-create from a client that believes it is new or saw the delete', async () => {
+      const up = await replaceWorkspace(db, workspace(), deviceOne)
+      const v = up.versions['departments:d-ops']
+      const gone = await applyChanges(db, parseChanges({ changes: [{ collection: 'departments', id: 'd-ops', op: 'delete', baseVersion: v }] }), deviceOne)
+      // Undo of one's own delete: the client dropped the version after the delete, so it sends no base.
+      const fresh = await applyChanges(db, parseChanges({ changes: [dept('Back again', null)] }), deviceOne)
+      expect(fresh.applied).toEqual([{ collection: 'departments', id: 'd-ops', version: fresh.seq }])
+      const removed = await applyChanges(db, parseChanges({ changes: [{ collection: 'departments', id: 'd-ops', op: 'delete', baseVersion: fresh.seq }] }), deviceOne)
+      // A base as new as the delete itself is a client that saw it.
+      const sawIt = await applyChanges(db, parseChanges({ changes: [dept('Seen the delete', removed.applied[0].version)] }), deviceTwo)
+      expect(sawIt.applied).toEqual([{ collection: 'departments', id: 'd-ops', version: sawIt.seq }])
+      expect(sawIt.seq).toBeGreaterThan(gone.seq)
+    })
+
+    it('a missing document is still recreated whatever its base', async () => {
+      await replaceWorkspace(db, workspace(), deviceOne)
+      await db.query(`DELETE FROM workspace_docs WHERE key = 'inboxState'`)
+      const res = await applyChanges(db, parseChanges({ changes: [{ collection: '$doc', id: 'inboxState', op: 'upsert', data: {}, baseVersion: 3 }] }), deviceTwo)
+      expect(res.applied).toHaveLength(1)
+    })
+  })
+
+  describe('flags for a client that lost answers (r2-45)', () => {
+    let deviceOne: string
+    let deviceTwo: string
+    beforeEach(async () => {
+      const users = await db.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash) VALUES ('one@example.test', 'x'), ('two@example.test', 'x') RETURNING id::text AS id`,
+      )
+      ;[deviceOne, deviceTwo] = users.rows.map((r) => r.id)
+    })
+    const app = (stage: string, baseVersion: number | null) => ({ collection: 'applications', id: 'a-1', op: 'upsert', data: { id: 'a-1', stage }, baseVersion })
+
+    it('marks a retry the server already holds as existing, and writes nothing', async () => {
+      await replaceWorkspace(db, workspace(), deviceOne)
+      const first = await applyChanges(db, parseChanges({ changes: [app('Technical', null)] }), deviceOne)
+      const again = await applyChanges(db, parseChanges({ changes: [app('Technical', null)] }), deviceOne)
+      expect(again.applied).toEqual([{ collection: 'applications', id: 'a-1', version: first.applied[0].version, existing: true }])
+      expect(again.seq).toBe(first.seq)
+      // A write that did happen carries no flag.
+      expect(first.applied[0]).toEqual({ collection: 'applications', id: 'a-1', version: first.seq })
+    })
+
+    it('says who wrote the copy that won, and whether this very edit landed before it', async () => {
+      await replaceWorkspace(db, workspace(), deviceOne)
+      const v0 = (await applyChanges(db, parseChanges({ changes: [app('Applied', null)] }), deviceOne)).seq
+      // Three moves land; the client hears none of the answers and retries the first.
+      const v1 = (await applyChanges(db, parseChanges({ changes: [app('Technical', v0)] }), deviceOne)).seq
+      const v2 = (await applyChanges(db, parseChanges({ changes: [app('Onsite', v1)] }), deviceOne)).seq
+      const v3 = (await applyChanges(db, parseChanges({ changes: [app('Offer', v2)] }), deviceOne)).seq
+      const retry = await applyChanges(db, parseChanges({ changes: [app('Technical', v0)] }), deviceOne)
+      expect(retry.conflicts).toEqual([
+        { collection: 'applications', id: 'a-1', serverVersion: v3, serverData: { id: 'a-1', stage: 'Offer' }, byYou: true, landed: true },
+      ])
+      // Another login sees the same copy, without byYou.
+      const other = await applyChanges(db, parseChanges({ changes: [app('Technical', v0)] }), deviceTwo)
+      expect(other.conflicts).toEqual([{ collection: 'applications', id: 'a-1', serverVersion: v3, serverData: { id: 'a-1', stage: 'Offer' }, landed: true }])
+      // An edit that never reached the server did not land, and one from before the base does not count.
+      const never = await applyChanges(db, parseChanges({ changes: [app('Rejected', v0)] }), deviceOne)
+      expect(never.conflicts[0]).toEqual({ collection: 'applications', id: 'a-1', serverVersion: v3, serverData: { id: 'a-1', stage: 'Offer' }, byYou: true })
+      const older = await applyChanges(db, parseChanges({ changes: [app('Technical', v1)] }), deviceOne)
+      expect(older.conflicts[0].landed).toBeUndefined()
+    })
   })
 
   it('removes the replaced workspace from the change log on a full replace', async () => {

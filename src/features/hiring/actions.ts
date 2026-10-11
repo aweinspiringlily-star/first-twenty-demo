@@ -54,7 +54,10 @@ function names(appId: ID): { name: string; job?: DB['jobs'][number] } {
 
 export type AdvanceOutcome = 'moved' | 'needs_hire' | 'none'
 
-/** Advance one stage. From Offer the next stage is Hired, which belongs to the Hire flow. */
+/**
+ * Advance one stage. From Offer the next stage is Hired, which belongs to the Hire flow: the caller opens
+ * the offer on the profile (links.candidateOffer), where focus lands on its next action.
+ */
 export function advance(appId: ID, actorId: ID | null): AdvanceOutcome {
   const db = useDB.getState().db
   const app = db.applications.find((a) => a.id === appId)
@@ -62,7 +65,7 @@ export function advance(appId: ID, actorId: ID | null): AdvanceOutcome {
   if (!app || !job || app.status !== 'active') return 'none'
   if (advanceNeedsHire(job, app.stageId)) {
     const n = names(appId).name
-    toast({ text: app.conditionalOfferOn ? `Hire ${n} from the accepted offer on their profile.` : `Finish ${n}'s offer on their profile. Hire comes after they accept.`, tone: 'neutral' })
+    toast({ text: app.conditionalOfferOn ? `Hire ${n} from the accepted offer.` : `Finish ${n}'s offer. Hire comes after they accept.`, tone: 'neutral' })
     return 'needs_hire'
   }
   const next = nextStage(job, app.stageId)
@@ -79,7 +82,7 @@ export function moveTo(appId: ID, stageId: string, actorId: ID | null): AdvanceO
   const stage = job && stageById(job, stageId)
   if (!app || !job || !stage) return 'none'
   if (stage.kind === 'hired') {
-    toast({ text: `Hire ${names(appId).name} from the accepted offer on their profile.`, tone: 'neutral' })
+    toast({ text: `Hire ${names(appId).name} from the accepted offer.`, tone: 'neutral' })
     return 'needs_hire'
   }
   const reopen = app.status === 'rejected' || app.status === 'withdrawn'

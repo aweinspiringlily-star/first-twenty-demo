@@ -23,7 +23,7 @@ import {
   TextInput,
 } from '@/ui'
 import { commit, DateField, EditSheet, Row, RowList } from './kit'
-import { longestWorkday, sickLeaveMinimums, sickPolicyProblem } from './logic'
+import { hintWithCount, longestWorkday, sickLeaveMinimums, sickPolicyProblem, TEXT_MAX_CHARS } from './logic'
 
 const METHOD_LABELS: Record<TimeOffPolicy['method'], string> = {
   accrual: 'Earned each pay period',
@@ -297,9 +297,16 @@ function PoliciesPanel() {
                   onChange={(v) => set({ autoApprove: v })}
                 />
               )}
-              <Field label="Description" hint="What employees see in Me when they request time off.">
+              <Field label="Description" hint={hintWithCount('What employees see in Me when they request time off.', d.description, TEXT_MAX_CHARS)}>
                 {(id, hint) => (
-                  <TextArea id={id} aria-describedby={hint} rows={4} value={d.description} onChange={(e) => set({ description: e.target.value })} />
+                  <TextArea
+                    id={id}
+                    aria-describedby={hint}
+                    rows={4}
+                    maxLength={TEXT_MAX_CHARS}
+                    value={d.description}
+                    onChange={(e) => set({ description: e.target.value })}
+                  />
                 )}
               </Field>
             </>

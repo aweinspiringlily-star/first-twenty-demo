@@ -4,10 +4,10 @@ import { useMemo, useState } from 'react'
 import { outOfBand } from '@/domain/pay'
 import type { Band, FLSA, ID, JobFamily, Level } from '@/domain/types'
 import { today } from '@/lib/dates'
-import { money, moneyShort, pct } from '@/lib/format'
+import { money, moneyShort } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import { Badge, Button, Callout, Field, focusFirstInvalid, FormGrid, MoneyInput, NumberInput, Panel, Private, Segmented, Sheet, toast } from '@/ui'
-import { bandErrors, type BandDraft, bandFieldErrors, equityGuidelineLabel, mlPremium, peopleInBand, sortLevels, variableLabel } from './helpers'
+import { bandErrors, type BandDraft, bandFieldErrors, equityGuidelineLabel, mlPremium, peopleInBand, premiumRangeText, sortLevels, variableLabel } from './helpers'
 
 const TRACK_LABEL: Record<JobFamily['track'], string> = {
   engineering: 'Engineering',
@@ -47,11 +47,8 @@ export function BandsTab() {
           </p>
           {premium && (
             <p>
-              AI premium: machine learning midpoints run{' '}
-              <Private>
-                {pct(premium.min, 0)} to {pct(premium.max, 0)}
-              </Private>{' '}
-              above software engineering at the same level.
+              AI premium: machine learning midpoints run <Private>{premiumRangeText(premium.min, premium.max)}</Private> software engineering
+              at the same level.
             </p>
           )}
           <p>

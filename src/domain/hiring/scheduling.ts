@@ -1,15 +1,16 @@
 // Scheduling without integrations: proposed times in Pacific (DST-correct), shown side by side with
 // the candidate's time zone, a copyable message or mailto link, .ics files for the candidate and the
-// panel, and interviews that create their owed scorecards automatically.
+// panel, and interviews that create their owed scorecards automatically. A cancelled interview hands
+// the next step back to scheduling; a cancelled or moved one gets cancellation .ics files (same UID).
 // Module rule: the store import stays LAST and there are no module-level runtime constants.
 import type { Draft } from 'immer'
 import { getPerson, personNameById } from '@/domain/people'
-import type { DB, ID, Interview } from '@/domain/types'
+import type { Application, DB, ID, Interview } from '@/domain/types'
 import { addBusinessDays, type ISODate, type ISODateTime } from '@/lib/dates'
 import { fillTemplate, mailtoHref } from '@/lib/email'
 import { buildICS, type ICSEvent } from '@/lib/ics'
 import { newId } from '@/lib/id'
-import { debriefNextStep, ownerFor, stageById } from './pipeline'
+import { debriefNextStep, defaultNextStep, ownerFor, stageById } from './pipeline'
 import {
   addHoursISO,
   addMinutesISO,
@@ -176,6 +177,8 @@ export type ScheduleInput = {
   durationMin: number
   interviewerIds: ID[]
   format: Interview['format']
+  /** Meeting link for a video interview (kept only when the format is video). */
+  videoLink?: string
   /** Scorecard attribute names (or attribute objects) for this interview. */
   attributes: Array<string | { name: string }>
 }
@@ -186,35 +189,9 @@ export type ScheduleInput = {
  * the next step becomes 'Debrief and decide' the business day after. Returns the interview id.
  */
 export function scheduleInterview(draft: Draft<DB>, input: ScheduleInput, opts: { date: ISODate }): ID {
-  const id = newId('i')
-  const interviewers = [...new Set(input.interviewerIds)]
-  const attrs = input.attributes.map((a) => (typeof a === 'string' ? a : a.name)).filter(Boolean)
-  const interview: Interview = {
-    id,
-    applicationId: input.applicationId,
-    ...(input.stepId ? { stepId: input.stepId } : {}),
-    stageId: input.stageId,
-    name: input.name,
-    startsAt: input.startsAt,
-    durationMin: input.durationMin,
-    interviewerIds: interviewers,
-    format: input.format,
-    status: 'scheduled',
-    attributes: attrs,
-  }
-  draft.interviews.push(interview)
-  const ends = addMinutesISO(input.startsAt, input.durationMin)
-  const dueAt = addHoursISO(ends, draft.settings.scorecardDueHours)
-  for (const personId of interviewers) {
-    draft.scorecards.push({ id: newId('s'), interviewId: id, applicationId: input.applicationId, interviewerId: personId, dueAt, ratings: {} })
-  }
+  const id = addInterview(draft, input, opts.date)
   const app = draft.applications.find((a) => a.id === input.applicationId)
   if (app) {
-    app.lastContactOn = opts.date
-    const job = draft.jobs.find((j) => j.id === app.jobId)
-    if (app.status === 'active' && app.stageId === input.stageId) {
-      app.nextStep = debriefNextStep(draft, pacificDateOf(input.startsAt), job ? ownerFor(draft, job, opts.date) : ownerFor(draft, null, opts.date, app.nextStep?.ownerId ?? interviewers[0]))
-    }
     logActivity(draft, {
       entityType: 'application',
       entityId: app.id,
@@ -226,18 +203,75 @@ export function scheduleInterview(draft: Draft<DB>, input: ScheduleInput, opts: 
   return id
 }
 
+/** The interview, its owed scorecards, the last contact and the debrief next step (no activity row). */
+function addInterview(draft: Draft<DB>, input: ScheduleInput, date: ISODate): ID {
+  const id = newId('i')
+  const interviewers = [...new Set(input.interviewerIds)]
+  const attrs = input.attributes.map((a) => (typeof a === 'string' ? a : a.name)).filter(Boolean)
+  const videoLink = input.format === 'video' ? input.videoLink?.trim() : undefined
+  const interview: Interview = {
+    id,
+    applicationId: input.applicationId,
+    ...(input.stepId ? { stepId: input.stepId } : {}),
+    stageId: input.stageId,
+    name: input.name,
+    startsAt: input.startsAt,
+    durationMin: input.durationMin,
+    interviewerIds: interviewers,
+    format: input.format,
+    ...(videoLink ? { videoLink } : {}),
+    status: 'scheduled',
+    attributes: attrs,
+  }
+  draft.interviews.push(interview)
+  const ends = addMinutesISO(input.startsAt, input.durationMin)
+  const dueAt = addHoursISO(ends, draft.settings.scorecardDueHours)
+  for (const personId of interviewers) {
+    draft.scorecards.push({ id: newId('s'), interviewId: id, applicationId: input.applicationId, interviewerId: personId, dueAt, ratings: {} })
+  }
+  const app = draft.applications.find((a) => a.id === input.applicationId)
+  if (app) {
+    app.lastContactOn = date
+    const job = draft.jobs.find((j) => j.id === app.jobId)
+    if (app.status === 'active' && app.stageId === input.stageId) {
+      app.nextStep = debriefNextStep(draft, pacificDateOf(input.startsAt), job ? ownerFor(draft, job, date) : ownerFor(draft, null, date, app.nextStep?.ownerId ?? interviewers[0]))
+    }
+  }
+  return id
+}
+
 function removeOwedScorecards(draft: Draft<DB>, interviewId: ID): void {
   draft.scorecards = draft.scorecards.filter((s) => s.interviewId !== interviewId || !!s.submittedAt)
 }
 
-/** Cancels an interview and drops its unsubmitted scorecards. */
-export function cancelInterview(draft: Draft<DB>, interviewId: ID, _opts: { date: ISODate }): boolean {
+/**
+ * After an interview comes off the calendar: when nothing else is scheduled or done for the stage the
+ * candidate is in, the next step goes back to scheduling that stage (what entering the stage sets), due
+ * the next business day since the candidate was expecting a time, with the same owner. A next step
+ * someone wrote by hand after scheduling (anything but the debrief) stays.
+ */
+function restoreSchedulingStep(draft: Draft<DB>, app: Draft<Application>, cancelled: Pick<Interview, 'stageId'>, date: ISODate): void {
+  if (app.status !== 'active' || cancelled.stageId !== app.stageId) return
+  if (app.nextStep && app.nextStep.text !== debriefNextStep(draft, date, '').text) return
+  const live = draft.interviews.some((x) => x.applicationId === app.id && x.stageId === app.stageId && (x.status === 'scheduled' || x.status === 'completed'))
+  if (live) return
+  const job = draft.jobs.find((j) => j.id === app.jobId)
+  const step = job ? defaultNextStep(draft, job, app.stageId, date, app.nextStep?.ownerId) : undefined
+  if (step) app.nextStep = { ...step, dueOn: addBusinessDays(date, 1, dbHolidays(draft)) }
+}
+
+/**
+ * Cancels an interview and drops its unsubmitted scorecards. When it leaves the candidate's stage with
+ * no interview, the next step goes back to 'Schedule <stage>' (restoreSchedulingStep).
+ */
+export function cancelInterview(draft: Draft<DB>, interviewId: ID, opts: { date: ISODate }): boolean {
   const i = draft.interviews.find((x) => x.id === interviewId)
   if (!i || i.status === 'cancelled') return false
   i.status = 'cancelled'
   removeOwedScorecards(draft, interviewId)
   const app = draft.applications.find((a) => a.id === i.applicationId)
   if (app) {
+    restoreSchedulingStep(draft, app, i, opts.date)
     logActivity(draft, {
       entityType: 'application',
       entityId: app.id,
@@ -247,6 +281,33 @@ export function cancelInterview(draft: Draft<DB>, interviewId: ID, _opts: { date
     })
   }
   return true
+}
+
+/**
+ * Moves a scheduled interview to a new time in one change (one Undo): the old one is cancelled with its
+ * unsubmitted scorecards, and `input` is scheduled in its place, with fresh owed scorecards and the
+ * debrief next step. The new interview gets its own calendar UID, so the candidate and the panel need
+ * the old time's cancellation file (interviewCancelICS) as well as the new invite. Returns the new
+ * interview id, or null when the old one is not on the calendar any more.
+ */
+export function rescheduleInterview(draft: Draft<DB>, interviewId: ID, input: ScheduleInput, opts: { date: ISODate }): ID | null {
+  const old = draft.interviews.find((x) => x.id === interviewId)
+  if (!old || old.status !== 'scheduled' || old.applicationId !== input.applicationId) return null
+  const was = old.startsAt
+  old.status = 'cancelled'
+  removeOwedScorecards(draft, interviewId)
+  const id = addInterview(draft, input, opts.date)
+  const app = draft.applications.find((a) => a.id === input.applicationId)
+  if (app) {
+    logActivity(draft, {
+      entityType: 'application',
+      entityId: app.id,
+      relatedId: app.candidateId,
+      kind: 'interview_rescheduled',
+      text: `Moved ${lowerFirst(input.name)} with ${candidateName(draft, app.candidateId)} from ${formatDual(was)} to ${formatDual(input.startsAt)}`,
+    })
+  }
+  return id
 }
 
 /** Marks an interview completed or a no-show (a no-show drops its owed scorecards). */
@@ -279,11 +340,45 @@ export function markIcsIssued(draft: Draft<DB>, interviewId: ID, date: ISODate):
 
 /**
  * .ics for an interview. The candidate's copy lists who they will meet; the panel's copy names the
- * candidate and the scorecard attributes. Times are written in UTC so every calendar shows local time.
+ * candidate and the scorecard attributes, and only the panel are attendees on it (never the candidate).
+ * Times are written in UTC so every calendar shows local time.
+ * A video interview carries its meeting link (LOCATION, URL and the description); without one the
+ * location just says 'Video call' and never claims a link is somewhere else. People with no email
+ * address on file (a founder who has not added one yet) are left off the attendee list by buildICS.
  */
 export function interviewICS(db: DB, interviewId: ID, audience: 'candidate' | 'panel' = 'panel'): string | null {
   const i = db.interviews.find((x) => x.id === interviewId)
   if (!i) return null
+  return buildICS([interviewEvent(db, i, audience)], audience === 'candidate' ? `${db.company.name} interview` : 'First Twenty interviews')
+}
+
+/**
+ * Cancellation .ics for an interview that came off the calendar (cancelled, or moved to a new time): the
+ * invite's own UID one SEQUENCE higher, with METHOD:CANCEL and STATUS:CANCELLED, so a calendar that
+ * added the invite drops it or marks it cancelled. The title starts 'Cancelled:' for calendars that
+ * import it as a plain event, and the meeting link is left out so nobody joins an empty room.
+ */
+export function interviewCancelICS(db: DB, interviewId: ID, audience: 'candidate' | 'panel' = 'panel'): string | null {
+  const i = db.interviews.find((x) => x.id === interviewId)
+  if (!i) return null
+  const { url: _link, ...event } = interviewEvent(db, i, audience)
+  return buildICS(
+    [
+      {
+        ...event,
+        title: `Cancelled: ${event.title}`,
+        description: 'This interview is cancelled.',
+        ...(i.format === 'video' ? { location: 'Video call' } : {}),
+        sequence: (event.sequence ?? 0) + 1,
+        status: 'CANCELLED',
+      },
+    ],
+    audience === 'candidate' ? `${db.company.name} interview` : 'First Twenty interviews',
+    { method: 'CANCEL' },
+  )
+}
+
+function interviewEvent(db: DB, i: Interview, audience: 'candidate' | 'panel'): ICSEvent {
   const app = db.applications.find((a) => a.id === i.applicationId)
   const cand = app ? db.candidates.find((c) => c.id === app.candidateId) : undefined
   const job = app ? db.jobs.find((j) => j.id === app.jobId) : undefined
@@ -291,33 +386,37 @@ export function interviewICS(db: DB, interviewId: ID, audience: 'candidate' | 'p
   const panel = i.interviewerIds.map((id) => getPerson(db, id)).filter((p) => !!p)
   const hq = company.hq
   const address = [hq.street, hq.suite, hq.city, `${hq.state} ${hq.zip}`].filter((x) => x && String(x).trim()).join(', ')
+  const videoLink = i.format === 'video' ? i.videoLink?.trim() || undefined : undefined
   const location =
     i.format === 'onsite'
       ? `${company.name}, ${address}`
       : i.format === 'video'
-        ? 'Video call (link in the invite email)'
+        ? (videoLink ?? 'Video call')
         : audience === 'panel' && cand?.phone
           ? `Phone: ${cand.phone}`
           : 'Phone call'
   const cName = cand ? `${cand.firstName} ${cand.lastName}` : 'Candidate'
   const jobTitle = job?.title ?? 'Interview'
   const meet = panel.map((p) => `${p.preferredName || p.firstName} ${p.lastName} (${p.title})`)
-  const event: ICSEvent = {
+  const join = videoLink ? `\nJoin the video call: ${videoLink}` : ''
+  return {
     uid: `${i.id}-${audience}`,
     title: audience === 'candidate' ? `${company.name}: ${i.name} for ${jobTitle}` : `${i.name}: ${cName} (${jobTitle})`,
     start: i.startsAt,
     end: addMinutesISO(i.startsAt, i.durationMin),
     location,
+    ...(videoLink ? { url: videoLink } : {}),
     description:
       audience === 'candidate'
-        ? `${i.durationMin} minutes. You will meet ${meet.length ? meet.join(', ') : 'the team'}.\nReply to the scheduling email if you need to change the time.`
-        : `${i.durationMin} minutes with ${cName} for ${jobTitle}.${i.attributes.length ? `\nScorecard attributes: ${i.attributes.join(', ')}.` : ''}\nScorecard due within ${db.settings.scorecardDueHours} hours of the end.`,
+        ? `${i.durationMin} minutes. You will meet ${meet.length ? meet.join(', ') : 'the team'}.${join}\nReply to the scheduling email if you need to change the time.`
+        : `${i.durationMin} minutes with ${cName} for ${jobTitle}.${join}${i.attributes.length ? `\nScorecard attributes: ${i.attributes.join(', ')}.` : ''}\nScorecard due within ${db.settings.scorecardDueHours} hours of the end.`,
+    // The panel's copy (internal title, scorecard attributes) lists only the panel, so a calendar that
+    // sends invites can never mail it to the candidate; it names them in the title and description.
     attendees: [
-      ...(cand?.email ? [{ name: cName, email: cand.email }] : []),
+      ...(audience === 'candidate' && cand?.email ? [{ name: cName, email: cand.email }] : []),
       ...panel.map((p) => ({ name: `${p.preferredName || p.firstName} ${p.lastName}`, email: p.workEmail })),
     ],
   }
-  return buildICS([event], audience === 'candidate' ? `${company.name} interview` : 'First Twenty interviews')
 }
 
 export type ProposeOpts = {

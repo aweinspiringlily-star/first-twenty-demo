@@ -9,7 +9,9 @@
 //   push either applies or comes back as a conflict, and the server wins.
 // - A push that left without a definite answer is remembered before it is sent (unconfirmed). If the
 //   server did commit it, the next push sees this device's own write and rebases on it instead of letting
-//   it beat the newer local edit.
+//   it beat the newer local edit. A retry of an attempt that landed, beaten by this same user's newer copy
+//   (writes whose answers a browser that died never saved), takes that copy quietly, and a row the server
+//   already held (applied as existing) is never deleted as part of an edit that lost.
 // - The outbox holds keys; the data is read from the store at push time. The saved store is always at
 //   least as new as the saved server progress (seq, versions, delivered changes): the engine saves the
 //   store first (persistStore) and checks a mark on start.
@@ -29,12 +31,17 @@
 // - While the server has no workspace ('server_empty') edits still queue; they are never pushed into an
 //   empty server. Joining the copy another computer uploads keeps a queued edit on top only where that
 //   copy still has the record the edit was made on (base prints); elsewhere the server wins, as always.
-import type { DB } from '@/domain/types'
+//   The same goes for a server copy from another history of this workspace (a 409 resync after a
+//   re-upload, an Import of a backup, a restore): versions from the old history mean nothing there.
+// - An edit the server's copy replaced leaves no trace: its Undo step and the activity rows it logged
+//   (while still unsynced) go too, so neither Undo nor the activity log claims an edit that never landed.
+//   Documents ($doc) are merged by top-level field when the server changed only other fields.
+import type { Activity, DB } from '@/domain/types'
 import { newId } from '@/lib/id'
 import type { HistoryEntry } from '@/store/db'
 import { type ApiErrorKind, type ApiFailure, type ApiResult, describeFailure, type LoginOptions, type SyncApi } from './api'
 import { applyChanges, isApplicable, localValue, type RemoteChange } from './apply'
-import { RECORD_COLLECTIONS } from './collections'
+import { DOC_COLLECTION, RECORD_COLLECTIONS } from './collections'
 import { deepEqual, diffDB, type LocalChange } from './diff'
 import { fingerprint } from './fingerprint'
 import { isWorkspaceSwap, LOAD_TIME_ACTIVITY_PREFIX, stabilizeLoadTimeIds, withWorkspaceId, workspaceIdOf } from './loadTime'
@@ -76,7 +83,16 @@ import {
   writeLogoutPending,
   writeStoreMark,
 } from './state'
-import { type ReplacedRemotely, type StatusStoreLike, type SyncStatus, useSyncStatus } from './status'
+import {
+  MAX_REFRESHED_KEYS,
+  type RecordRef,
+  type RefreshedRef,
+  type ReplacedRemotely,
+  type RestoredRemotely,
+  type StatusStoreLike,
+  type SyncStatus,
+  useSyncStatus,
+} from './status'
 
 /** What the engine needs from the store: useDB satisfies it. */
 export type StoreLike = {
@@ -136,8 +152,11 @@ export type EngineOptions = {
   wipeLocal?: () => void
   /** What the store shows after forgetting this browser (the app passes the sample company). */
   freshDB?: () => DB
-  /** Reloads the page after forgetting this browser, so nothing stays in memory. */
-  reload?: () => void
+  /**
+   * Reloads the page after forgetting this browser, so nothing stays in memory. notice: what happened, in
+   * plain words, for the page after the reload to show (this page's toast goes with it).
+   */
+  reload?: (notice?: string) => void
   debounceMs?: number
   pullIntervalMs?: number
   minBackoffMs?: number
@@ -156,19 +175,26 @@ export type FlowFailure = {
   /** Plain-language text for the UI. */
   message: string
   retryAfter?: number
+  /** Changes that have not reached the server, counted as a person counts their edits (see pendingEdits). */
   pending?: number
 }
 /** message: set when the flow did something other than asked, in plain words for a toast (see uploadLocal). */
 export type FlowResult = { ok: true; message?: string } | FlowFailure
-export type CheckServerResult = { ok: true; version: string; signedIn: boolean; user: SyncUser | null } | FlowFailure
+/**
+ * empty: asked only for a browser that is signed in and not connected (the sample banner and Start fresh
+ * point an empty server's founder at putting a workspace on it): true when the server holds no workspace
+ * yet. Absent when it could not tell, such as on a server from before GET /api/workspace/status.
+ */
+export type CheckServerResult = { ok: true; version: string; signedIn: boolean; user: SyncUser | null; empty?: boolean } | FlowFailure
 export type SignInResult = { ok: true; user: SyncUser } | FlowFailure
 /**
  * confirmed: the server ended the session. When it did not (offline, a server error), this browser
  * still treats itself as signed out and ends the session as soon as the server answers (logoutPending in
- * the status). forgotten: this browser's copy was removed (the page reloads). message: what happened, in
- * plain words, for a toast.
+ * the status). forgotten: this browser's copy was removed (the page reloads). waiting: changes that could
+ * not be sent first (a plain sign-out tries for a few seconds); they sync after the next sign-in in this
+ * browser. message: what happened, in plain words, for a toast (it mentions waiting changes).
  */
-export type SignOutResult = { ok: true; confirmed: boolean; forgotten?: true; message: string } | FlowFailure
+export type SignOutResult = { ok: true; confirmed: boolean; forgotten?: true; waiting: number; message: string } | FlowFailure
 export type SignOutOptions = {
   /**
    * Also remove the workspace, the sync state and the queued changes from this browser (shared
@@ -198,6 +224,8 @@ export type InspectResult =
       companyName: string
       counts: { people: number; candidates: number; jobs: number }
       seq: number
+      /** The server's workspace (filled in like a snapshot), so the connect step can compare it in detail. */
+      db: DB
     }
   | FlowFailure
 
@@ -251,8 +279,15 @@ export type SyncEngine = {
   /** Stops syncing and forgets the server. The workspace stays in this browser. */
   disconnect(opts?: { discardPending?: boolean }): Promise<DisconnectResult>
   clearRefreshed(): void
-  /** Puts changes the server refused back in the outbox. */
+  /** Puts changes the server refused back in the outbox (not the ones too large to sync: see discardRejected). */
   retryRejected(): void
+  /**
+   * Drops changes the server refused (or this browser set aside as too large), all of them or the ones
+   * named, and puts the server's copy of each record back in the store, or removes the record when the
+   * server never had it. Applied like a pull (no Undo step); the Undo step that made the change goes when
+   * nothing else is left of it. Fails, changing nothing, when the server's copy cannot be fetched.
+   */
+  discardRejected(refs?: RecordRef[]): Promise<FlowResult>
   getConnection(): Readonly<ConnectionState>
   /**
    * Another tab removed this browser's data (Sign out and remove data): stop syncing, show the fresh
@@ -265,6 +300,8 @@ export type SyncEngine = {
   getReplacedBackup(): DB | null
   /** The user saw (or dismissed) the replaced-from-another-computer notice: forget it and the copy. */
   clearReplacedRemotely(): void
+  /** The user saw (or dismissed) the notice that the server's copy was replaced by another copy of this workspace. */
+  clearRestoredRemotely(): void
   /**
    * Asks the server again to end a session a sign-out could not end. Resolves true when there is none
    * left to end. Runs on its own on start, on focus and when the browser comes back online.
@@ -276,6 +313,8 @@ export const DEBOUNCE_MS = 800
 export const PULL_INTERVAL_MS = 30_000
 export const MIN_BACKOFF_MS = 2_000
 export const MAX_BACKOFF_MS = 60_000
+/** How long a plain sign-out keeps starting batches of queued changes before it ends the session. */
+export const SIGN_OUT_PUSH_MS = 5_000
 /** Bytes of change data per POST (under Fastify's default 1 MiB body limit). */
 export const MAX_BATCH_BYTES = 900_000
 /** Browsers cap all in-flight keepalive bodies at 64 KiB. */
@@ -325,8 +364,8 @@ export const SIGNED_OUT_MESSAGE = 'Signed out. This browser keeps an offline cop
 export const DISCONNECTED_MESSAGE = 'Disconnected. This browser is local only now; your server keeps its copy.'
 export const DISCONNECTED_PENDING_MESSAGE =
   'Disconnected. This browser is local only now. Your server could not be reached, so its session stays open until this browser reconnects and ends it.'
-const FORGOTTEN_MESSAGE = 'Signed out and removed this browser\'s data.'
-const FORGOTTEN_OPEN_MESSAGE =
+export const FORGOTTEN_MESSAGE = "Signed out and removed this browser's data. Your server keeps everything that reached it."
+export const FORGOTTEN_OPEN_MESSAGE =
   'Removed this browser\'s data. Your server could not be reached, so this browser stays signed in to it until this browser reconnects and ends the session.'
 
 const systemClock: SyncClock = {
@@ -376,8 +415,24 @@ function mayHaveCommitted(kind: ApiErrorKind): boolean {
   return kind === 'offline' || kind === 'server' || kind === 'bad_response'
 }
 
+/** What an unanswered attempt remembers of a change (see Unconfirmed): its data's fingerprint, or DELETE_PRINT. */
+function sentPrint(change: ClientChange): string {
+  return change.op === 'upsert' ? fingerprint(change.data) : DELETE_PRINT
+}
+
 type Ok = { ok: true }
 const OK: Ok = { ok: true }
+
+/**
+ * The document an activity row is about, by its entityType, where the row names a part of it (a
+ * compliance item's id, a funding round) rather than the document itself (see countEdits).
+ */
+const ROW_DOC: Record<string, string> = {
+  compliance: 'complianceStatus',
+  company: 'company',
+  settings: 'settings',
+  equity: 'equity',
+}
 
 /** One outbox entry as it goes out: the entry, its key and the change built from the store. */
 type Sent = { key: string; entry: OutboxEntry; change: ClientChange }
@@ -385,6 +440,62 @@ type Sent = { key: string; entry: OutboxEntry; change: ClientChange }
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`
 }
+
+/** Said after a sign-out that could not send every queued change first. */
+function notSentText(n: number): string {
+  return `${plural(n, 'change was', 'changes were')} not sent yet; ${n === 1 ? 'it syncs' : 'they sync'} after you sign in again in this browser.`
+}
+
+/** A record's protocol name from its key ("collection:id": collections never hold a colon, ids may). */
+function refOf(key: string): RecordRef {
+  const i = key.indexOf(':')
+  return { collection: key.slice(0, i), id: key.slice(i + 1) }
+}
+
+const fieldsOf = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {})
+
+/** Top-level fields whose values differ between two copies of a document. */
+function changedFields(a: unknown, b: unknown): string[] {
+  const x = fieldsOf(a)
+  const y = fieldsOf(b)
+  const out: string[] = []
+  for (const k of new Set([...Object.keys(x), ...Object.keys(y)])) if (!deepEqual(x[k], y[k])) out.push(k)
+  return out
+}
+
+/** basePrint of `base`'s value for each field where `local` differs from it (see ConnectionState.fieldBases). */
+function fieldPrints(base: unknown, local: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const f of changedFields(base, local)) out[f] = basePrint(fieldsOf(base)[f])
+  return out
+}
+
+/** The server's copy of a document with this device's values of `fields` on top. */
+function mergeFields(server: unknown, local: unknown, fields: readonly string[]): unknown {
+  const out: Record<string, unknown> = { ...fieldsOf(server) }
+  const mine = fieldsOf(local)
+  for (const f of fields) {
+    if (mine[f] === undefined) delete out[f]
+    else out[f] = mine[f]
+  }
+  return out
+}
+
+/**
+ * True when every field this device changed (`prints`: field -> base print) is, on the server, still the
+ * value the edit was made on, or already this device's value: the server changed only other fields.
+ */
+function fieldsHold(prints: Record<string, string>, server: unknown, local: unknown): boolean {
+  const theirs = fieldsOf(server)
+  const mine = fieldsOf(local)
+  return Object.entries(prints).every(([f, p]) => basePrint(theirs[f]) === p || deepEqual(theirs[f], mine[f]))
+}
+
+/** A document whose queued edit goes on top of the server's copy, field by field (see fieldsHold). */
+type DocMerge = { id: string; server: unknown; fields: string[] }
+
+/** The local edits a server copy threw away: Undo steps (by history id) and the activity rows they logged. */
+type Discard = { entries: Set<number>; rows: Set<string> }
 
 export function createSyncEngine(opts: EngineOptions): SyncEngine {
   const { store, api } = opts
@@ -416,9 +527,18 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   let nextRetryAt: number | null = null
   let catchingUp = false
   let refreshed = 0
+  /** The records counted in `refreshed`, newest last (see noteRefreshed). */
+  let refreshedKeys: RefreshedRef[] = []
   let inspected: { snap: WorkspaceSnapshot; at: number } | null = null
   /** Keys of the batch being pushed -> the rev sent. */
   const inFlight = new Map<string, number>()
+  /**
+   * Records this device deleted -> the delete's version, until a pull passes it. `versions` forgets a
+   * deleted record (so a re-create goes out as new), so this is how the delete's own echo in the next pull
+   * is told apart from another device's delete: applying the echo would also remove the record from every
+   * Undo snapshot, and Undo of the delete would bring nothing back. Memory only: a reload has no Undo history.
+   */
+  const ownDeletes = new Map<string, number>()
   let pushTimer: unknown = null
   let pullTimer: unknown = null
   let retryTimer: unknown = null
@@ -440,10 +560,13 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   /** This browser's data was removed (here or in another tab): nothing is saved any more. */
   let dropped = false
   let replaced: ReplacedRemotely | null = null
+  let restored: RestoredRemotely | null = null
   /** What this browser showed before another computer replaced the server's workspace (memory only). */
   let replacedBackup: DB | null = null
   /** A look at the server during the server_empty hold (recheckEmpty), while it runs. */
   let recheck: Promise<void> | null = null
+  /** On start: asking whether the saved user's session still holds (confirmSession), while it runs. */
+  let confirming: Promise<void> | null = null
   /**
    * The demo clock copy this tab started from on a pretend date (memory only), so it can save it again if
    * another tab went back to the real date and used it up while this one still shows pretend data.
@@ -457,21 +580,24 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   /** Saves the connection (outbox keys, holds, the user...). Never records server progress on its own. */
   function setConn(patch: Partial<ConnectionState>): void {
     conn = { ...conn, ...patch }
-    // A base print is kept only while its key is queued or refused.
-    if (patch.outbox || patch.rejected || patch.bases) conn.bases = pendingBases(conn)
+    // Base prints (whole records and document fields) are kept only while their key is queued or refused.
+    if (patch.outbox || patch.rejected || patch.bases || patch.fieldBases) {
+      conn.bases = keepPending(conn, conn.bases)
+      conn.fieldBases = keepPending(conn, conn.fieldBases)
+    }
     if (dropped) return
     connSaveFailed = storage !== null && !saveConnection(storage, conn)
   }
 
-  function pendingBases(c: ConnectionState): Record<string, string> {
-    const keys = Object.keys(c.bases)
-    if (keys.length === 0) return c.bases
+  function keepPending<T>(c: ConnectionState, map: Record<string, T>): Record<string, T> {
+    const keys = Object.keys(map)
+    if (keys.length === 0) return map
     const pending = new Set<string>()
     for (const e of c.outbox) pending.add(recordKey(e.collection, e.id))
     for (const e of c.rejected) pending.add(recordKey(e.collection, e.id))
-    if (keys.every((k) => pending.has(k))) return c.bases
-    const kept: Record<string, string> = {}
-    for (const k of keys) if (pending.has(k)) kept[k] = c.bases[k]
+    if (keys.every((k) => pending.has(k))) return map
+    const kept: Record<string, T> = {}
+    for (const k of keys) if (pending.has(k)) kept[k] = map[k]
     return kept
   }
 
@@ -519,6 +645,82 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   const storageFull = (): boolean => connSaveFailed || storeSaveFailed
   const hasPending = (): boolean => conn.outbox.length > 0 || conn.rejected.length > 0
 
+  /**
+   * How many changes a person would count among queued entries: each edit also writes an activity row,
+   * so a row is left out when the record it is about waits too, and counted when nothing else of its
+   * own waits (a note, or a row an Undo removed). A row about a document's part (a compliance item, the
+   * company) is about that document: ticking a kit item writes complianceStatus and one row about the
+   * item, and counts once. Never 0 while something waits.
+   */
+  function countEdits(entries: readonly OutboxEntry[], db: DB): number {
+    let n = 0
+    const ids = new Set<string>()
+    const docs = new Set<string>()
+    const rows: OutboxEntry[] = []
+    for (const e of entries) {
+      if (e.collection === 'activity') rows.push(e)
+      else {
+        n++
+        ids.add(e.id)
+        if (e.collection === DOC_COLLECTION) docs.add(e.id)
+      }
+    }
+    if (rows.length === 0) return n
+    const wanted = new Set(rows.filter((r) => !r.fixed).map((r) => r.id))
+    const about = new Map<string, Partial<Activity>>()
+    if (wanted.size > 0) for (const a of Array.isArray(db.activity) ? db.activity : []) if (wanted.has(a?.id)) about.set(a.id, a)
+    for (const r of rows) {
+      const row = r.fixed ? (r.data as Partial<Activity> | undefined) : about.get(r.id)
+      const entity = row?.entityId
+      const doc = typeof row?.entityType === 'string' ? ROW_DOC[row.entityType] : undefined
+      if (doc !== undefined && docs.has(doc)) continue
+      if (entity === undefined ? ids.size === 0 : !ids.has(entity)) n++
+    }
+    return n
+  }
+
+  /** Changes that have not reached the server, as shown to people (status pendingEdits plus rejected). */
+  function waitingEdits(c: Pick<ConnectionState, 'outbox' | 'rejected'> = conn): number {
+    return countEdits(c.outbox, store.getState().db) + c.rejected.length
+  }
+
+  let rejectedFor: RejectedEntry[] | null = null
+  let rejectedRefsCache: Array<RecordRef & { tooLarge: boolean }> = []
+  /** The refused changes for the status (the same array until they change, so the UI does not churn). */
+  function rejectedRefs(): Array<RecordRef & { tooLarge: boolean }> {
+    if (rejectedFor !== conn.rejected) {
+      rejectedFor = conn.rejected
+      rejectedRefsCache = conn.rejected.map((r) => ({ collection: r.collection, id: r.id, tooLarge: r.reason === 'too_large' }))
+    }
+    return rejectedRefsCache
+  }
+
+  /** Counts a record the server's copy replaced (once per record while the UI shows the list). */
+  function noteRefreshed(refs: readonly RefreshedRef[]): void {
+    if (refs.length === 0) return
+    let keys = refreshedKeys
+    for (const r of refs) {
+      const known = keys.some((k) => k.collection === r.collection && k.id === r.id)
+      if (!known) refreshed += 1
+      const ref: RefreshedRef = r.removed ? { collection: r.collection, id: r.id, removed: true, copy: r.copy } : { collection: r.collection, id: r.id }
+      keys = [...keys.filter((k) => k.collection !== r.collection || k.id !== r.id), ref]
+    }
+    refreshedKeys = keys.slice(-MAX_REFRESHED_KEYS)
+  }
+
+  /**
+   * How a refreshed record is noted: one the server no longer has keeps what this browser had, since the
+   * notice is read after the local copy is removed too.
+   */
+  function refreshedRef(collection: string, id: string, local: unknown, theirs: unknown): RefreshedRef {
+    return local !== undefined && (theirs === null || theirs === undefined) ? { collection, id, removed: true, copy: local } : { collection, id }
+  }
+
+  function resetRefreshed(): void {
+    refreshed = 0
+    refreshedKeys = []
+  }
+
   /** The demo clock is on: nothing syncs (see the 'demo_clock' hold). */
   function clockOn(): boolean {
     try {
@@ -559,18 +761,22 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       status: computeStatus(),
       mode: conn.mode,
       pending: conn.outbox.length,
-      // Each edit also writes an activity row; count only the edits themselves for display.
-      pendingEdits: conn.outbox.filter((c) => c.collection !== 'activity').length,
+      // Each edit also writes an activity row; count the edits themselves for display.
+      pendingEdits: countEdits(conn.outbox, store.getState().db),
       rejected: conn.rejected.length,
+      rejectedKeys: rejectedRefs(),
       lastSyncAt: conn.lastSyncAt,
       lastError: lastError(),
       nextRetryAt,
       user: conn.user,
       hold: shownHold(),
       refreshed,
+      refreshedKeys,
       storageFull: full,
       logoutPending: logoutPending(),
+      signedOutByUser: conn.mode === 'server' && conn.signedOutByUser,
       replacedRemotely: replaced,
+      restoredRemotely: restored,
     })
     const warn = active && full && hasPending()
     if (warn !== leaveWarning) {
@@ -580,7 +786,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   }
 
   const canSync = (): boolean =>
-    active && conn.mode === 'server' && !clockOn() && (!conn.hold || leavingClock()) && !signedOut && exclusive === 0
+    active && conn.mode === 'server' && !clockOn() && (!conn.hold || leavingClock()) && !signedOut && exclusive === 0 && !confirming
   /** The server may hold this record: a version is known, or a push carrying it may have reached it. */
   const isKnown = (key: string): boolean => conn.versions[key] !== undefined || inFlight.has(key) || conn.unconfirmed[key] !== undefined
   const nowISO = (): string => new Date(clock.now()).toISOString()
@@ -661,18 +867,33 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     }
   }
 
-  /** Server changes into the store and into every Undo snapshot, without creating an Undo step. */
-  function applyRemote(changes: RemoteChange[]): void {
-    if (changes.length === 0 || conn.hold) return
+  /**
+   * Server changes into the store and into every Undo snapshot, without creating an Undo step. A document
+   * in `merges` becomes the server's copy with each snapshot's own values of this device's fields on top.
+   * `drop`: Undo steps to remove (an edit the server's copy threw away; see planDiscard).
+   */
+  function applyRemote(changes: RemoteChange[], merges: readonly DocMerge[] = [], drop: ReadonlySet<number> = new Set()): void {
+    if ((changes.length === 0 && merges.length === 0 && drop.size === 0) || conn.hold) return
     const state = store.getState()
-    const db = applyChanges(state.db, changes)
+    const apply = (db: DB): DB => {
+      if (merges.length === 0) return applyChanges(db, changes)
+      const own = merges.map(
+        (m): RemoteChange => ({ collection: DOC_COLLECTION, id: m.id, op: 'upsert', data: mergeFields(m.server, localValue(db, DOC_COLLECTION, m.id), m.fields) }),
+      )
+      return applyChanges(db, [...changes, ...own])
+    }
+    const db = apply(state.db)
     let pastChanged = false
-    const past = state.past.map((entry) => {
-      const next = applyChanges(entry.db, changes)
-      if (next === entry.db) return entry
-      pastChanged = true
-      return { ...entry, db: next }
-    })
+    const past: HistoryEntry[] = []
+    for (const entry of state.past) {
+      if (drop.has(entry.id)) {
+        pastChanged = true
+        continue
+      }
+      const next = apply(entry.db)
+      if (next !== entry.db) pastChanged = true
+      past.push(next === entry.db ? entry : { ...entry, db: next })
+    }
     if (db === state.db && !pastChanged) return
     setStoreQuietly(db, pastChanged ? past : state.past)
     // The server's copy is the sample only when someone uploaded it on purpose.
@@ -786,13 +1007,23 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     if (changes.length === 0) return
     const pending = pendingKeys()
     let bases = conn.bases
+    let fieldBases = conn.fieldBases
     for (const c of changes) {
       const key = recordKey(c.collection, c.id)
+      // A document also records the fields changed, each with its value in the copy the edit was made
+      // on: from the moment it is queued, or never (a key queued without it stays whole-record).
+      if (c.collection === DOC_COLLECTION && c.op === 'upsert' && (!pending.has(key) || fieldBases[key])) {
+        const prev = localValue(before, c.collection, c.id)
+        const fields = { ...(pending.has(key) ? fieldBases[key] : {}) }
+        for (const f of changedFields(prev, c.data)) if (!(f in fields)) fields[f] = basePrint(fieldsOf(prev)[f])
+        if (fieldBases === conn.fieldBases) fieldBases = { ...fieldBases }
+        fieldBases[key] = fields
+      }
       if (pending.has(key)) continue
       if (bases === conn.bases) bases = { ...bases }
       bases[key] = basePrint(localValue(before, c.collection, c.id))
     }
-    setConn({ outbox: enqueueChanges(conn.outbox, changes, { isKnown, nextRev: () => ++rev, now: clock.now() }), bases })
+    setConn({ outbox: enqueueChanges(conn.outbox, changes, { isKnown, nextRev: () => ++rev, now: clock.now() }), bases, fieldBases })
     publish()
     schedulePush()
   }
@@ -875,7 +1106,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   function noteSending(batch: Sent[]): void {
     const next: Record<string, Unconfirmed> = { ...conn.unconfirmed }
     for (const s of batch) {
-      const print = s.change.op === 'upsert' ? fingerprint(s.change.data) : DELETE_PRINT
+      const print = sentPrint(s.change)
       const u = next[s.key]
       next[s.key] =
         u && u.baseVersion === s.change.baseVersion
@@ -909,10 +1140,15 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     return u.prints.includes(fingerprint(c.serverData))
   }
 
-  async function pushAll(keepalive: boolean): Promise<Ok | ApiFailure> {
+  /**
+   * deadline: no new batch starts at or after this clock time (a plain sign-out sends what it can in a few
+   * seconds); a batch on its way still gets its answer (or the request times out).
+   */
+  async function pushAll(keepalive: boolean, deadline?: number): Promise<Ok | ApiFailure> {
     let limit = MAX_PUSH_CHANGES
     let useKeepalive = keepalive
     for (let guard = 0; guard < 100_000 && conn.outbox.length > 0; guard++) {
+      if (deadline !== undefined && clock.now() >= deadline) break
       const { batch, oversized, empty } = takeBatch(useKeepalive ? KEEPALIVE_BYTES : MAX_BATCH_BYTES, limit)
       dropEntries(empty)
       reject(oversized, 'too_large')
@@ -958,34 +1194,54 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
         return res
       }
       refusals = 0
-      const unresolved = handlePushResult(batch, res.data)
+      const unresolved = handlePushResult(batch, res.data, before)
       if (unresolved > 0) return { ok: false, kind: 'bad_response', status: res.status, error: 'unresolved_changes' }
     }
     return OK
   }
 
-  /** Records applied versions and server-wins copies. Returns how many sent changes got no answer. */
-  function handlePushResult(batch: Sent[], data: PostChangesResponse): number {
+  /**
+   * Records applied versions and server-wins copies. Returns how many sent changes got no answer.
+   * A document whose server copy changed only fields this device left alone is merged instead of lost:
+   * this device's fields go on top of the server's copy and out again on its version. An edit that lost
+   * takes its Undo step and the activity rows it logged with it (planDiscard), so nothing claims it.
+   * `before`: the unanswered attempts as they were before this push (a delete that landed unanswered).
+   * A conflict whose server copy is exactly what was sent counts as applied, and a retry of an attempt
+   * that landed (the conflict says `landed`), beaten by this same user's newer copy, takes it quietly: a
+   * browser that died before saving its last answers, or even that it sent them, retries from an older
+   * copy, and nothing it lost was anyone else's.
+   */
+  function handlePushResult(batch: Sent[], data: PostChangesResponse, before: Record<string, Unconfirmed>): number {
     const sent = new Map(batch.map((s) => [s.key, s]))
     const resolved = new Set<string>()
     const versions = { ...conn.versions }
     const unconfirmed = { ...conn.unconfirmed }
     const bases = { ...conn.bases }
+    const fieldBases = { ...conn.fieldBases }
     const applied = new Set<string>()
+    /** Applied because the server already held this exact data: an earlier push of it landed. */
+    const existing = new Set<string>()
     const lost = new Set<string>()
+    /** Merged documents whose fields all equal the server's already: nothing left to send. */
+    const settled = new Set<string>()
+    const merges: DocMerge[] = []
     for (const a of data.applied) {
       const key = recordKey(a.collection, a.id)
       const s = sent.get(key)
       if (!s || resolved.has(key)) continue
       resolved.add(key)
       delete unconfirmed[key]
-      if (s.change.op === 'delete') delete versions[key]
-      else versions[key] = a.version
+      if (s.change.op === 'delete') {
+        delete versions[key]
+        ownDeletes.set(key, a.version)
+      } else versions[key] = a.version
       applied.add(key)
+      if (a.existing) existing.add(key)
     }
     const remote: RemoteChange[] = []
     const db = store.getState().db
-    let differs = 0
+    /** Records whose local copy the server's replaced (it differed): counted, named, and their edits discarded. */
+    const changed: RefreshedRef[] = []
     for (const c of data.conflicts) {
       const key = recordKey(c.collection, c.id)
       const s = sent.get(key)
@@ -993,45 +1249,165 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       resolved.add(key)
       const u = unconfirmed[key]
       delete unconfirmed[key]
+      const local = localValue(db, c.collection, c.id)
       if (isOwnEarlierWrite(u, s.change, c)) {
         // The server has this device's earlier push (its answer was lost): send the newer edit on top.
         versions[key] = c.serverVersion as number
         bases[key] = basePrint(c.serverData)
+        if (c.collection === DOC_COLLECTION) fieldBases[key] = fieldPrints(c.serverData, local)
+        continue
+      }
+      const gone = c.serverData === null || c.serverData === undefined
+      if (!gone && c.serverVersion !== null && s.change.op === 'upsert' && deepEqual(s.change.data, c.serverData)) {
+        // The server already holds exactly what was sent (where newer servers answer applied, existing):
+        // nothing was lost, so it counts as applied. An edit made since goes out on top, as after any push.
+        versions[key] = c.serverVersion
+        applied.add(key)
+        existing.add(key)
+        continue
+      }
+      const earlier = before[key]
+      if (gone && s.change.op === 'upsert' && earlier?.baseVersion === s.change.baseVersion && earlier.prints.includes(DELETE_PRINT)) {
+        // This device's delete reached the server (its answer was lost) and the record was brought back
+        // since (Undo): it goes out again as a new record, on no base.
+        delete versions[key]
+        bases[key] = ABSENT_PRINT
+        continue
+      }
+      const editedSince = conn.outbox.some((e) => e.collection === c.collection && e.id === c.id && e.rev !== s.entry.rev)
+      if (c.byYou && c.landed && !gone && c.serverVersion !== null && !editedSince) {
+        // A retry of an attempt that did land (the server's log holds this exact upsert), since replaced by
+        // a newer copy this same user wrote: this browser's own later writes whose answers it never saved
+        // (it died before writing them, or before writing down that it had sent this one at all), or the
+        // same person on another computer. Nothing was lost to anyone else, so their copy is taken quietly:
+        // no notice, and the Undo step and activity rows stay. (An edit made while the retry was on its
+        // way is news: it loses with a notice, below.)
+        lost.add(key)
+        versions[key] = c.serverVersion
+        remote.push({ collection: c.collection, id: c.id, op: 'upsert', data: c.serverData })
+        continue
+      }
+      const prints = conn.fieldBases[key]
+      if (c.collection === DOC_COLLECTION && !gone && c.serverVersion !== null && prints && fieldsHold(prints, c.serverData, local)) {
+        // Another device changed other fields of this document: this device's fields stay on top.
+        const fields = Object.keys(prints)
+        const merged = mergeFields(c.serverData, local, fields)
+        versions[key] = c.serverVersion
+        bases[key] = basePrint(c.serverData)
+        if (deepEqual(merged, c.serverData)) {
+          settled.add(key)
+          remote.push({ collection: c.collection, id: c.id, op: 'upsert', data: c.serverData })
+        } else {
+          merges.push({ id: c.id, server: c.serverData, fields })
+          fieldBases[key] = fieldPrints(c.serverData, merged)
+        }
         continue
       }
       lost.add(key)
-      const gone = c.serverData === null || c.serverData === undefined
       if (gone || c.serverVersion === null) delete versions[key]
       else versions[key] = c.serverVersion
       remote.push(gone ? { collection: c.collection, id: c.id, op: 'delete' } : { collection: c.collection, id: c.id, op: 'upsert', data: c.serverData })
       // Load-time activity rows share ids across devices on purpose; taking the server's copy is no news.
       const autoRow = c.collection === 'activity' && c.id.startsWith(LOAD_TIME_ACTIVITY_PREFIX)
-      if (!autoRow && !deepEqual(localValue(db, c.collection, c.id), gone ? undefined : c.serverData)) differs++
+      if (!autoRow && !deepEqual(local, gone ? undefined : c.serverData)) changed.push(refreshedRef(c.collection, c.id, local, c.serverData))
+    }
+    // The lost edits' Undo steps and the rows they logged go too, found before the server's copies change
+    // the history. Rows still queued (or refused) were never sent; rows this batch delivered get a delete.
+    // A row the server already held (applied as existing) shows that an earlier push of its step landed:
+    // it is history, so it stays, and so does its step.
+    const unsynced = new Set([...pendingKeys(), ...sent.keys()].filter((k) => !existing.has(k)))
+    const discard = planDiscard(new Set(changed.map((r) => recordKey(r.collection, r.id))), unsynced)
+    const droppedRows = new Set<string>()
+    const deletes: LocalChange[] = []
+    for (const id of discard.rows) {
+      const key = recordKey('activity', id)
+      droppedRows.add(key)
+      remote.push({ collection: 'activity', id, op: 'delete' })
+      if (applied.has(key)) deletes.push({ collection: 'activity', id, op: 'delete' })
     }
     // An applied entry leaves the outbox only if it was not edited again while in flight (then it goes
     // next time, on top of the new version). A conflict drops it either way: the server wins. A rebased
-    // entry stays and goes out again on the version the server gave this device's earlier push.
-    const outbox = conn.outbox.filter((e) => {
+    // or merged entry stays and goes out again on the version the server gave.
+    let outbox = conn.outbox.filter((e) => {
       const key = recordKey(e.collection, e.id)
-      if (lost.has(key)) return false
+      if (lost.has(key) || settled.has(key) || droppedRows.has(key)) return false
       return !(applied.has(key) && sent.get(key)?.entry.rev === e.rev)
     })
     // An applied entry edited again in flight stays queued, now on top of the copy it just sent.
     for (const e of outbox) {
       const key = recordKey(e.collection, e.id)
       const s = applied.has(key) ? sent.get(key) : undefined
-      if (s) bases[key] = s.change.op === 'upsert' ? basePrint(s.change.data) : ABSENT_PRINT
+      if (!s) continue
+      bases[key] = s.change.op === 'upsert' ? basePrint(s.change.data) : ABSENT_PRINT
+      if (e.collection === DOC_COLLECTION) fieldBases[key] = fieldPrints(s.change.data, localValue(db, e.collection, e.id))
+    }
+    if (deletes.length > 0) {
+      outbox = enqueueChanges(outbox, deletes, { isKnown: (k) => versions[k] !== undefined, nextRev: () => ++rev, now: clock.now() })
+      for (const d of deletes) {
+        const key = recordKey(d.collection, d.id)
+        bases[key] = basePrint(sent.get(key)?.change.data)
+      }
     }
     // A refused copy is stale once a newer change for the record has settled.
     const rejected = conn.rejected.filter((r) => {
       const key = recordKey(r.collection, r.id)
-      return !(applied.has(key) || lost.has(key))
+      return !(applied.has(key) || lost.has(key) || settled.has(key) || droppedRows.has(key))
     })
-    applyRemote(remote)
-    commit({ versions, outbox, rejected, unconfirmed, bases })
-    refreshed += differs
+    applyRemote(remote, merges, discard.entries)
+    commit({ versions, outbox, rejected, unconfirmed, bases, fieldBases })
+    noteRefreshed(changed)
     publish()
     return batch.length - resolved.size
+  }
+
+  /**
+   * The local edits that server copies are about to replace (`lost`), found in the Undo history before
+   * those copies are applied to it: each step whose record changes all lost, with the activity rows it
+   * added, provided those rows never reached the server before (`unsynced`: queued, or sent in the batch
+   * that lost). Such a step leaves nothing to undo once the server's copies are in, and its rows would
+   * claim an edit that never happened. A step that also changed something that stays keeps its place and
+   * its rows: part of it happened. A lost record no step covers (the page was reloaded since the edit)
+   * takes the unsynced rows about it (activity entityId).
+   * `delivered`: the step's rows that already reached the server count too (the caller deletes them
+   * there). Discarding a refused change uses it: the record change never reached the server, whatever
+   * happened to the rows logged with it. A lost record no step covers still takes unsynced rows only.
+   */
+  function planDiscard(lost: ReadonlySet<string>, unsynced: ReadonlySet<string>, delivered = false): Discard {
+    const out: Discard = { entries: new Set(), rows: new Set() }
+    if (lost.size === 0) return out
+    const { db, past } = store.getState()
+    const lostRefs = [...lost].map(refOf)
+    const covered = new Set<string>()
+    for (let i = past.length - 1; i >= 0; i--) {
+      const before = past[i].db
+      const after = i + 1 < past.length ? past[i + 1].db : db
+      // Unchanged records keep their identity (Immer, applyChanges): only a step that touched one is diffed.
+      if (!lostRefs.some((r) => localValue(before, r.collection, r.id) !== localValue(after, r.collection, r.id))) continue
+      let touched = false
+      let discardable = true
+      const rows: string[] = []
+      for (const c of diffDB(before, after)) {
+        const key = recordKey(c.collection, c.id)
+        if (lost.has(key)) {
+          touched = true
+          covered.add(key)
+        } else if (c.collection === 'activity' && c.op === 'upsert' && localValue(before, c.collection, c.id) === undefined && (delivered || unsynced.has(key))) {
+          rows.push(c.id)
+        } else discardable = false
+      }
+      if (!touched || !discardable) continue
+      out.entries.add(past[i].id)
+      for (const id of rows) out.rows.add(id)
+    }
+    const uncovered = new Set(lostRefs.filter((r) => r.collection !== 'activity' && !covered.has(recordKey(r.collection, r.id))).map((r) => r.id))
+    if (uncovered.size === 0) return out
+    for (const key of unsynced) {
+      const ref = refOf(key)
+      if (ref.collection !== 'activity' || lost.has(key) || out.rows.has(ref.id)) continue
+      const row = localValue(db, ref.collection, ref.id) as Partial<Activity> | undefined
+      if (typeof row?.entityId === 'string' && uncovered.has(row.entityId)) out.rows.add(ref.id)
+    }
+    return out
   }
 
   // ------------------------------------------------------------------------------------------
@@ -1073,6 +1449,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       // This device's own push coming back, or something older than what we have.
       const known = versions[key]
       if (known !== undefined && ch.version <= known) continue
+      // This device's own delete (or anything before it) coming back.
+      const deletedAt = ownDeletes.get(key)
+      if (deletedAt !== undefined && ch.version <= deletedAt) continue
       const rc: RemoteChange =
         ch.op === 'delete' ? { collection: ch.collection, id: ch.id, op: 'delete' } : { collection: ch.collection, id: ch.id, op: 'upsert', data: ch.data }
       // A collection this build does not know: a newer build resyncs on start (see SYNC_SCHEMA).
@@ -1081,8 +1460,24 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       else versions[key] = ch.version
       remote.push(rc)
     }
+    // Pulls arrive in seq order: an echo at or below this page's seq has come by (or never will).
+    for (const [key, v] of ownDeletes) if (v <= seq) ownDeletes.delete(key)
     applyRemote(remote)
     commit({ versions, seq: Math.max(conn.seq, seq), historyId: conn.historyId ?? historyId ?? null })
+  }
+
+  /**
+   * The server's workspace for the "is it empty?" looks (the connect step, the server_empty hold): asks
+   * GET /api/workspace/status first, so an empty server answers kind 'empty' without the 404 of GET
+   * /api/workspace, which browsers log as an error; the workspace is downloaded only when there is one.
+   */
+  async function serverSnapshot(): Promise<ApiResult<WorkspaceSnapshot>> {
+    const st = await api.workspaceStatus()
+    if (!st.ok) return st
+    if (st.data.empty) return { ok: false, kind: 'empty', status: st.status, error: 'empty' }
+    // A server from before the status route: the answer already carries the workspace.
+    if (st.data.snapshot) return { ok: true, status: st.status, data: st.data.snapshot }
+    return api.getWorkspace()
   }
 
   /** The change log no longer reaches back to our seq: rebase on a full snapshot, keeping queued edits. */
@@ -1110,6 +1505,15 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     const sameHistory = conn.historyId !== null && snap.historyId !== undefined && snap.historyId === conn.historyId
     if (!sameHistory && isWorkspaceSwap(local, serverDb)) {
       takeRemoteSwap(local, serverDb, snap)
+      return
+    }
+    if (conn.historyId !== null && snap.historyId !== undefined && !sameHistory) {
+      // This workspace, from another history: another computer imported a backup of it or re-uploaded it
+      // (after the server lost it, or over it), or the server was restored. The versions queued edits were
+      // made on belong to the old history, so they are compared by content. This device's own replace or
+      // upload learned the new history id from its answer and never gets here.
+      rebaseByContent(snap, serverDb)
+      restored = { at: nowISO() }
       return
     }
     const pending = pendingKeys()
@@ -1148,7 +1552,8 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     setStoreQuietly(db, [])
     holdBaseline = null
     needsRebase = false
-    refreshed = 0
+    resetRefreshed()
+    restored = null
     commit({ ...freshConnection(snap.seq, snap.versions, db, snap.workspaceId, snap.historyId) })
     replaced = {
       companyName: typeof db.company?.name === 'string' ? db.company.name : '',
@@ -1315,31 +1720,56 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     return 'joined'
   }
 
-  /**
-   * Joins the copy of this workspace another computer uploaded to the emptied server. Everything without
-   * a queued or refused edit becomes the server's. The versions of the copy the server lost mean nothing
-   * now, so each queued key is compared by content instead: where the uploaded record is still the one
-   * the edit was made on (its base print), the edit goes on top, on the server's current version. Where it
-   * differs (another computer changed the record, before the reset or during the hold), the server wins,
-   * as in any conflict: the edit is dropped and the record counts as refreshed. A key with no base print
-   * (queued by an older build) goes on top, as before.
-   */
+  /** Joins the copy of this workspace another computer uploaded to the emptied server (see rebaseByContent). */
   function joinAfterEmpty(snap: WorkspaceSnapshot, serverDb: DB): void {
+    rebaseByContent(snap, serverDb, { hold: null })
+    catchingUp = true
+    publish()
+  }
+
+  /**
+   * Rebuilds this browser on a server copy of its workspace whose versions say nothing about the copy the
+   * queued and refused edits were made on: another computer uploaded it to the emptied server, or it comes
+   * from another history (a re-upload, an Import of a backup, a restore). Everything without a queued or
+   * refused edit becomes the server's. Each queued key is compared by content instead of by version:
+   * where the server's record is still the one the edit was made on (its base print), the edit goes on
+   * top, on the server's current version, and so does a document whose server copy changed only fields
+   * this device left alone (this device's fields on top of the server's copy). Where it differs (another
+   * computer changed the record), the server wins, as in any conflict: the edit is dropped, with its Undo
+   * step and unsynced activity rows (planDiscard), and the record counts as refreshed. A key with no base
+   * print (queued by an older build) goes on top, as before. `patch` is saved with the new connection.
+   */
+  function rebaseByContent(snap: WorkspaceSnapshot, serverDb: DB, patch: Partial<ConnectionState> = {}): void {
     const db = store.getState().db
     const lost = new Set<string>()
-    let differs = 0
-    for (const e of [...conn.outbox, ...conn.rejected]) {
-      const key = recordKey(e.collection, e.id)
+    const changed: RefreshedRef[] = []
+    const merges: DocMerge[] = []
+    const bases = { ...conn.bases }
+    const fieldBases = { ...conn.fieldBases }
+    const queued = new Set(conn.outbox.map((e) => recordKey(e.collection, e.id)))
+    for (const key of pendingKeys()) {
       const base = conn.bases[key]
-      if (base === undefined || lost.has(key)) continue
-      const uploaded = localValue(serverDb, e.collection, e.id)
-      if (basePrint(uploaded) === base) continue
+      if (base === undefined) continue
+      const { collection, id } = refOf(key)
+      const theirs = localValue(serverDb, collection, id)
+      if (basePrint(theirs) === base) continue
+      const local = localValue(db, collection, id)
+      const prints = conn.fieldBases[key]
+      if (collection === DOC_COLLECTION && theirs !== undefined && prints && queued.has(key) && fieldsHold(prints, theirs, local)) {
+        const fields = Object.keys(prints)
+        merges.push({ id, server: theirs, fields })
+        bases[key] = basePrint(theirs)
+        fieldBases[key] = fieldPrints(theirs, mergeFields(theirs, local, fields))
+        continue
+      }
       lost.add(key)
       // Load-time activity rows share ids across devices on purpose; taking the server's copy is no news.
-      const autoRow = e.collection === 'activity' && e.id.startsWith(LOAD_TIME_ACTIVITY_PREFIX)
-      if (!autoRow && !deepEqual(localValue(db, e.collection, e.id), uploaded)) differs++
+      const autoRow = collection === 'activity' && id.startsWith(LOAD_TIME_ACTIVITY_PREFIX)
+      if (!autoRow && !deepEqual(local, theirs)) changed.push(refreshedRef(collection, id, local, theirs))
     }
     const pending = pendingKeys()
+    const discard = planDiscard(new Set(changed.map((r) => recordKey(r.collection, r.id))), pending)
+    for (const id of discard.rows) lost.add(recordKey('activity', id))
     const changes = diffDB(db, serverDb).filter((c) => {
       const key = recordKey(c.collection, c.id)
       return !pending.has(key) || lost.has(key)
@@ -1347,8 +1777,8 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     holdBaseline = null
     needsRebase = false
     const kept = (e: OutboxEntry) => !lost.has(recordKey(e.collection, e.id))
-    setConn({ hold: null, outbox: conn.outbox.filter(kept), rejected: conn.rejected.filter(kept) })
-    applyRemote(changes)
+    setConn({ ...patch, outbox: conn.outbox.filter(kept), rejected: conn.rejected.filter(kept), bases, fieldBases })
+    applyRemote(changes, merges, discard.entries)
     commit({
       versions: { ...snap.versions },
       unconfirmed: {},
@@ -1358,9 +1788,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       schema: SYNC_SCHEMA,
       historyId: snap.historyId ?? null,
     })
-    refreshed += differs
-    catchingUp = true
-    publish()
+    noteRefreshed(changed)
   }
 
   /**
@@ -1374,7 +1802,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       return Promise.resolve()
     }
     recheck = exclusiveOp(async () => {
-      const res = await api.getWorkspace()
+      const res = await serverSnapshot()
       if (!res.ok) {
         if (res.kind !== 'empty') noteAuth(res)
         return
@@ -1554,8 +1982,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     }
     probing = true
     try {
-      const me = await api.me()
-      if (me.ok && signedOut && conn.mode === 'server' && active && !logoutPending()) resume(me.data.user)
+      // GET /api/auth/session: nobody signed in is an answer, not a 401 in the console.
+      const me = await api.session()
+      if (me.ok && me.data.user && signedOut && conn.mode === 'server' && active && !logoutPending()) resume(me.data.user)
     } finally {
       probing = false
     }
@@ -1608,7 +2037,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
 
   /** A valid session again: start syncing whatever queued up meanwhile. */
   function resume(user: SyncUser): void {
-    setConn({ user })
+    setConn({ user, signedOutByUser: false })
     authEpoch++
     signedOut = false
     failure = null
@@ -1711,8 +2140,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
         /* an unreadable save only means nothing extra to queue */
       }
     }
-    if (ending) {
-      // Changes keep queueing; syncing starts again with the next sign-in.
+    if (ending || conn.signedOutByUser) {
+      // Changes keep queueing; syncing starts again with the next sign-in. After a sign-out the user chose
+      // there is no session to try (every request would be a 401), so none is sent.
       signedOut = true
       catchingUp = false
       publish()
@@ -1720,9 +2150,46 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     }
     catchingUp = !shownHold()
     publish()
+    if (conn.user) {
+      // The session may have ended while the browser was closed (a cookie that ends with the browser, the
+      // 12-hour limit): ask first, so a page load never meets a 401.
+      confirmSession()
+      return
+    }
+    afterStart()
+  }
+
+  /** What start does once the session is known to hold (or was not asked about). */
+  function afterStart(): void {
     // Another computer may have uploaded since the server was found empty: look again.
     if (conn.hold === 'server_empty') void recheckEmpty()
     else void requestSync()
+  }
+
+  /**
+   * On start with a saved user: GET /api/auth/session (nobody signed in is an answer there, not a 401)
+   * before any route that needs a session. Nobody: signed out, as after a 401, and nothing else is sent
+   * until a sign-in (or another tab's, seen on focus). Offline or a server error: start as usual, and the
+   * cycle reports it. Nothing syncs while it runs (canSync).
+   */
+  function confirmSession(): void {
+    const epoch = authEpoch
+    confirming = (async () => {
+      const me = await api.session()
+      // A sign-in meanwhile has a new session: an answer about the old one says nothing.
+      if (!me.ok || me.data.user || !active || conn.mode !== 'server' || epoch !== authEpoch) return
+      signedOut = true
+      catchingUp = false
+      clearAllTimers()
+    })()
+      .catch(() => {
+        /* nothing learned: start as usual */
+      })
+      .finally(() => {
+        confirming = null
+        publish()
+        if (active && conn.mode === 'server' && !signedOut) afterStart()
+      })
   }
 
   /** The copy saved before this load (opts.baseline) when it is this workspace, else null. */
@@ -1770,17 +2237,24 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     if (logoutPending() && !(await endPendingSession())) {
       return { ok: true, version: health.data.version, signedIn: false, user: null }
     }
-    const me = await api.me()
-    if (me.ok) {
-      if (signedOut && conn.mode === 'server') resume(me.data.user)
-      else {
-        setConn({ user: me.data.user })
-        publish()
-      }
-      return { ok: true, version: health.data.version, signedIn: true, user: me.data.user }
+    // Asked on every page load of a browser that is not connected: a signed-out answer must not be a 401,
+    // which the browser would log as an error (api.session falls back to /api/auth/me on older servers).
+    const me = await api.session()
+    if (!me.ok) return fail(me)
+    const user = me.data.user
+    if (!user) return { ok: true, version: health.data.version, signedIn: false, user: null }
+    if (signedOut && conn.mode === 'server') resume(user)
+    else {
+      setConn({ user })
+      publish()
     }
-    if (me.kind === 'signed_out') return { ok: true, version: health.data.version, signedIn: false, user: null }
-    return fail(me)
+    if (conn.mode === 'server') return { ok: true, version: health.data.version, signedIn: true, user }
+    // Not connected: is there a workspace to take, or is this server waiting for its first one? Never the
+    // old servers' fallback here (it would download the whole workspace on every page load).
+    const st = await api.workspaceStatus({ fallback: false })
+    return st.ok
+      ? { ok: true, version: health.data.version, signedIn: true, user, empty: st.data.empty }
+      : { ok: true, version: health.data.version, signedIn: true, user }
   }
 
   async function signIn(email: string, password: string, o: LoginOptions = {}): Promise<SignInResult> {
@@ -1798,7 +2272,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     if (logoutPending()) setLogoutPending(false)
     if (conn.mode === 'server') resume(res.data.user)
     else {
-      setConn({ user: res.data.user })
+      setConn({ user: res.data.user, signedOutByUser: false })
       authEpoch++
       publish()
     }
@@ -1818,14 +2292,17 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     // Another tab of this browser may have queued changes this one never saw (they share the saved
     // connection, last writer wins): count them too.
     const saved = storage ? loadConnection(storage) : null
-    const n = Math.max(conn.outbox.length + conn.rejected.length, saved && saved.mode === 'server' ? saved.outbox.length + saved.rejected.length : 0)
+    const n = Math.max(waitingEdits(), saved && saved.mode === 'server' ? waitingEdits(saved) : 0)
     if (n > 0) {
+      const them = n === 1 ? 'it' : 'them'
+      // Signed out, nothing can be sent: the way to keep them is to sign in, not Sync now.
+      const how = signedOut || logoutPending() ? `Sign in to send ${them} first, or remove ${them} anyway.` : `Sync first, or confirm to remove ${them} anyway.`
       return {
         ok: false,
         kind: 'pending',
         status: null,
         pending: n,
-        message: `${plural(n, 'change has', 'changes have')} not reached the server. Removing this browser's data now loses ${n === 1 ? 'it' : 'them'}. Sync first, or confirm to remove ${n === 1 ? 'it' : 'them'} anyway.`,
+        message: `${plural(n, 'change has', 'changes have')} not reached the server. Removing this browser's data now loses ${them}. ${how}`,
       }
     }
     if (conn.hold === 'replaced') {
@@ -1849,6 +2326,11 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
         }
         const blocked = unsyncedWork()
         if (blocked) return blocked
+      } else if (!o.forgetThisBrowser && conn.mode === 'server' && !conn.hold && !signedOut && !logoutPending() && conn.outbox.length > 0) {
+        // Send what is queued while the session still works, for a few seconds at most: what is left
+        // waits here until the next sign-in in this browser (the result says how many).
+        const pushed = await pushAll(false, clock.now() + SIGN_OUT_PUSH_MS)
+        if (!pushed.ok) noteAuth(pushed)
       }
       // Is there a session this browser may hold? A browser that never signed in has none to end.
       const mayHoldSession = conn.mode === 'server' || conn.user !== null || logoutPending()
@@ -1878,18 +2360,22 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
         connSaveFailed = false
         storeSaveFailed = false
         lastPersistedDb = null
-        refreshed = 0
+        resetRefreshed()
         replaced = null
+        restored = null
         replacedBackup = null
         catchingUp = false
         rev = 0
         // Written after the wipe: the next load treats this browser as signed out and ends the session.
         setLogoutPending(!confirmed && mayHoldSession)
         publish()
-        opts.reload?.()
-        return { ok: true, confirmed, forgotten: true, message: confirmed || !mayHoldSession ? FORGOTTEN_MESSAGE : FORGOTTEN_OPEN_MESSAGE }
+        const message = confirmed || !mayHoldSession ? FORGOTTEN_MESSAGE : FORGOTTEN_OPEN_MESSAGE
+        // The page that would show the message is about to go: the reload carries it to the next one.
+        opts.reload?.(message)
+        return { ok: true, confirmed, forgotten: true, waiting: 0, message }
       }
-      setConn({ user: null })
+      // On purpose: Settings keeps saying so (not that the session ended) until the next sign-in.
+      setConn({ user: null, signedOutByUser: conn.mode === 'server' })
       if (conn.mode === 'server') {
         signedOut = true
         catchingUp = false
@@ -1897,14 +2383,17 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       // Not confirmed: never resume from that session (focus, start, Settings), and end it once the
       // server answers.
       setLogoutPending(!confirmed && mayHoldSession)
-      return { ok: true, confirmed, message: confirmed || !mayHoldSession ? SIGNED_OUT_MESSAGE : LOGOUT_PENDING_MESSAGE }
+      // Refused changes are not counted: they need Retry (or Discard), not a sign-in.
+      const waiting = conn.mode === 'server' ? countEdits(conn.outbox, store.getState().db) : 0
+      const said = confirmed || !mayHoldSession ? SIGNED_OUT_MESSAGE : LOGOUT_PENDING_MESSAGE
+      return { ok: true, confirmed, waiting, message: waiting > 0 ? `${said} ${notSentText(waiting)}` : said }
     })
   }
 
   async function inspectServer(): Promise<InspectResult> {
     const ended = sessionEndedHere()
     if (ended) return ended
-    const res = await api.getWorkspace()
+    const res = await serverSnapshot()
     if (!res.ok) {
       inspected = null
       if (res.kind === 'empty') return { ok: true, empty: true }
@@ -1922,6 +2411,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       companyName: typeof db.company?.name === 'string' ? db.company.name : '',
       counts: { people: count(db.people), candidates: count(db.candidates), jobs: count(db.jobs) },
       seq: res.data.seq,
+      db: prepare({ ...res.data.db, schemaVersion: 1 }),
     }
   }
 
@@ -1941,7 +2431,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       rejected: [],
       unconfirmed: {},
       bases: {},
+      fieldBases: {},
       hold: null,
+      signedOutByUser: false,
       sampleAllowed: isSampleDB(db),
       workspaceId,
       lastSyncAt: nowISO(),
@@ -2006,7 +2498,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       if (!o.discardPending && conn.mode === 'server' && conn.hold === 'server_empty') {
         // The server lost its workspace, so queued edits could not be sent first. If it holds this same
         // workspace again (another computer uploaded it), join that copy with the edits on top.
-        const res = await api.getWorkspace()
+        const res = await serverSnapshot()
         if (!res.ok) {
           noteAuth(res)
           return fail(res)
@@ -2016,7 +2508,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
           joinAfterEmpty(res.data, serverDb)
           return OK
         }
-        const n = conn.outbox.length + conn.rejected.length
+        const n = conn.outbox.length + conn.rejected.length > 0 ? waitingEdits() : 0
         if (n > 0) {
           return {
             ok: false,
@@ -2034,7 +2526,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
           const pushed = await pushAll(false)
           if (!pushed.ok && pushed.kind === 'resync') {
             // The server's workspace was replaced or restored since: these edits have nowhere to go.
-            const n = conn.outbox.length
+            const n = countEdits(conn.outbox, store.getState().db)
             return {
               ok: false,
               kind: 'pending',
@@ -2121,14 +2613,71 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       setStoreQuietly(db, [])
       commit(freshConnection(res.data.seq, res.data.versions, db, conn.workspaceId ?? 'default', res.data.historyId))
       resetFlags()
-      refreshed = 0
+      resetRefreshed()
+      restored = null
       activate()
       return OK
     })
   }
 
+  function discardRejected(refs?: RecordRef[]): Promise<FlowResult> {
+    const wanted = refs ? new Set(refs.map((r) => recordKey(r.collection, r.id))) : null
+    const keys = new Set(conn.rejected.map((r) => recordKey(r.collection, r.id)).filter((k) => !wanted || wanted.has(k)))
+    if (keys.size === 0) return Promise.resolve(OK)
+    return exclusiveOp(async (): Promise<FlowResult> => {
+      if (conn.hold) {
+        return { ok: false, kind: 'pending', status: null, message: 'Syncing is paused. Resume it in Settings, Server first, then discard the change.' }
+      }
+      // A record the server may hold gets its copy back; one it never had (a new note) is removed here.
+      let snap: WorkspaceSnapshot | null = null
+      if ([...keys].some(isKnown)) {
+        const ended = sessionEndedHere()
+        if (ended) return ended
+        const res = await api.getWorkspace()
+        if (!res.ok) {
+          noteAuth(res)
+          return fail(res)
+        }
+        snap = res.data
+      }
+      const serverDb = snap ? prepare({ ...snap.db, schemaVersion: 1 }) : null
+      const versions = { ...conn.versions }
+      const remote: RemoteChange[] = []
+      for (const key of keys) {
+        const { collection, id } = refOf(key)
+        const theirs = serverDb ? localValue(serverDb, collection, id) : undefined
+        if (theirs === undefined) {
+          remote.push({ collection, id, op: 'delete' })
+          delete versions[key]
+        } else {
+          remote.push({ collection, id, op: 'upsert', data: theirs })
+          if (snap?.versions[key] !== undefined) versions[key] = snap.versions[key]
+        }
+      }
+      // The Undo step that made the change goes when nothing else is left of it, and so do the activity
+      // rows it logged, even ones an earlier batch delivered (the change itself never reached the server):
+      // queued ones leave the outbox, and the ones the server has get a delete. After a reload (no Undo
+      // history) only rows still queued about the record go: see planDiscard.
+      const discard = planDiscard(keys, pendingKeys(), true)
+      const rowDeletes: LocalChange[] = []
+      for (const id of discard.rows) {
+        remote.push({ collection: 'activity', id, op: 'delete' })
+        rowDeletes.push({ collection: 'activity', id, op: 'delete' })
+      }
+      const rows = new Set(rowDeletes.map((d) => recordKey(d.collection, d.id)))
+      const kept = (e: OutboxEntry) => !keys.has(recordKey(e.collection, e.id))
+      const before = store.getState().db
+      setConn({ outbox: conn.outbox.filter(kept), rejected: conn.rejected.filter((e) => kept(e) && !rows.has(recordKey(e.collection, e.id))) })
+      applyRemote(remote, [], discard.entries)
+      commit({ versions })
+      // A delete of a row the server never had just drops its queued entry (enqueueChanges).
+      enqueueLocal(rowDeletes, before)
+      return OK
+    })
+  }
+
   async function disconnect(o: { discardPending?: boolean } = {}): Promise<DisconnectResult> {
-    const pending = conn.outbox.length
+    const pending = conn.outbox.length > 0 ? countEdits(conn.outbox, store.getState().db) : 0
     if (conn.mode === 'server' && pending > 0 && !o.discardPending) {
       return {
         ok: false,
@@ -2151,8 +2700,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       resetFlags()
       connSaveFailed = false
       storeSaveFailed = false
-      refreshed = 0
+      resetRefreshed()
       replaced = null
+      restored = null
       replacedBackup = null
       catchingUp = false
       // The flag outlives the connection: the next check or start ends the session instead of using it.
@@ -2176,8 +2726,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       await requestSync()
     },
     whenIdle: async () => {
-      // A look at the emptied server (recheckEmpty) can start a cycle when it ends: wait for both.
-      for (let p = recheck ?? running; p; p = recheck ?? running) await p
+      // The session check on start and a look at the emptied server (recheckEmpty) can start a cycle when
+      // they end: wait for all of them.
+      for (let p = confirming ?? recheck ?? running; p; p = confirming ?? recheck ?? running) await p
     },
     flush,
     checkServer,
@@ -2189,18 +2740,21 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     replaceWorkspace,
     disconnect,
     clearRefreshed: () => {
-      refreshed = 0
+      resetRefreshed()
       publish()
     },
+    discardRejected,
     retryRejected: () => {
-      if (conn.rejected.length === 0) return
+      // A change too large to sync would only be set aside again: it waits for a shorter edit or Discard.
+      const retry = conn.rejected.filter((r) => r.reason !== 'too_large')
+      if (retry.length === 0) return
       const queued = new Set(conn.outbox.map((e) => recordKey(e.collection, e.id)))
       // Read from the store again (it kept the record), unless the store shows something else right now.
-      const back = conn.rejected
+      const back = retry
         .filter((r) => !queued.has(recordKey(r.collection, r.id)))
         .map(({ reason: _reason, ...e }): OutboxEntry => (conn.hold ? e : { collection: e.collection, id: e.id, op: e.op, rev: e.rev, at: e.at }))
       refusals = 0
-      setConn({ outbox: [...conn.outbox, ...back], rejected: [] })
+      setConn({ outbox: [...conn.outbox, ...back], rejected: conn.rejected.filter((r) => r.reason === 'too_large') })
       publish()
       schedulePush()
     },
@@ -2215,8 +2769,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       connSaveFailed = false
       storeSaveFailed = false
       lastPersistedDb = null
-      refreshed = 0
+      resetRefreshed()
       replaced = null
+      restored = null
       replacedBackup = null
       catchingUp = false
       rev = 0
@@ -2232,8 +2787,9 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       resetFlags()
       connSaveFailed = false
       storeSaveFailed = false
-      refreshed = 0
+      resetRefreshed()
       replaced = null
+      restored = null
       replacedBackup = null
       catchingUp = false
       publish()
@@ -2242,6 +2798,10 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     clearReplacedRemotely: () => {
       replaced = null
       replacedBackup = null
+      publish()
+    },
+    clearRestoredRemotely: () => {
+      restored = null
       publish()
     },
     endPendingSession,

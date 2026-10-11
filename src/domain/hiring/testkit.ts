@@ -70,6 +70,7 @@ export function fixtureDB(): DB {
   db.company.phone = '(408) 555-0100'
   db.company.soc2Enabled = true
   db.equity.fullyDilutedShares = 12_000_000
+  db.equity.capTableConfirmedOn = '2026-02-24'
   db.equity.valuations = [
     { id: 'v-1', effectiveOn: '2025-05-01', fmvPerShare: 0.25, provider: 'Meridian Valuation Group', expiresOn: '2026-05-01' },
     { id: 'v-2', effectiveOn: '2026-03-20', fmvPerShare: 1.15, provider: 'Meridian Valuation Group', expiresOn: '2027-03-20' },

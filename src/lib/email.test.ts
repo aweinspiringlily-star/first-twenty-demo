@@ -25,6 +25,12 @@ describe('mailtoHref', () => {
     expect(href).toBe('mailto:a@x.com,b%2Btag@y.com?bcc=c@z.com,d@z.com&subject=S&body=B')
     expect(mailtoHref('', 'S', 'B')).toBe('mailto:?subject=S&body=B')
   })
+
+  it('leaves the To line empty for a BCC-only note when there is no sender address', () => {
+    expect(mailtoHref('', 'S', 'B', { bcc: ['c@z.com'] })).toBe('mailto:?bcc=c@z.com&subject=S&body=B')
+    expect(mailtoHref('   ', 'S', 'B', { bcc: ['c@z.com'] })).toBe('mailto:?bcc=c@z.com&subject=S&body=B')
+    expect(mailtoHref(['', 'a@x.com'], 'S', 'B')).toBe('mailto:a@x.com?subject=S&body=B')
+  })
 })
 
 describe('pickRejectionTemplate', () => {

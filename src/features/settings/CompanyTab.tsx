@@ -1,12 +1,14 @@
 // Settings > Company and funding: names, entity, HQ, pay schedule, funding rounds, cash and the
 // inputs for runway, loaded-cost assumptions, SOC 2, and payroll registration and insurance.
+// Each Save writes only the fields the user changed (SaveInfo from ./kit), so a field another computer
+// saved while the form was open is never written back with the value the form opened with.
 import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { CCPA_REVENUE_THRESHOLD } from '@/domain/compliance'
 import { runway, STALE_CASH_DAYS } from '@/domain/pay'
 import type { Company, FundingRound } from '@/domain/types'
 import { daysBetween, fmtDate, today } from '@/lib/dates'
-import { money2, moneyShort, pct } from '@/lib/format'
+import { money, money2, moneyShort, pct } from '@/lib/format'
 import { newId } from '@/lib/id'
 import { useDB } from '@/store/db'
 import {
@@ -26,8 +28,8 @@ import {
   TextInput,
   TextLink,
 } from '@/ui'
-import { Blurrable, commit, DateField, EditablePanel, EditSheet, pastPresets, Row, RowList } from './kit'
-import { type HealthPlanChoice, healthPlanChoice, healthPlanProblem, maskDigits, setHealthPlan, urlProblem } from './logic'
+import { Blurrable, commit, DateField, EditablePanel, EditSheet, type FieldLabels, type FieldValues, pastPresets, Row, RowList } from './kit'
+import { type HealthPlanChoice, healthPlanChoice, healthPlanProblem, linkProblem, maskDigits, normalizeWebsite, setHealthPlan } from './logic'
 
 const ENTITY_TYPES = ['C corporation', 'Public benefit corporation', 'LLC', 'S corporation']
 const INCORPORATED = ['Delaware', 'California']
@@ -42,6 +44,9 @@ const ROUND_NAMES = ['Pre-seed', 'Seed', 'Series A', 'Series B', 'Bridge']
 function scheduleLabel(s: Company['paySchedule']) {
   return PAY_SCHEDULES.find((p) => p.value === s)?.label ?? s
 }
+
+/** An amount as the conflict notice says it ('$1,200,000', or 'blank'). */
+const sayMoney = (v: number | null | undefined) => (v == null ? 'blank' : money(v))
 
 /** Chip picker plus a free-text box for values that are usually one of a few (entity, workweek). */
 function ChipsOrText({
@@ -95,6 +100,17 @@ type Identity = Pick<Company, 'name' | 'legalName' | 'entityType' | 'incorporate
   website: string
 }
 
+const IDENTITY_LABELS: FieldLabels<Identity> = {
+  name: 'Display name',
+  legalName: 'Legal name',
+  entityType: 'Entity type',
+  incorporatedIn: 'Incorporated in',
+  foundedOn: 'Founded on',
+  stage: 'Stage',
+  tagline: 'One-line description',
+  website: 'Website',
+}
+
 function IdentityPanel({ company }: { company: Company }) {
   const value: Identity = {
     name: company.name,
@@ -118,22 +134,27 @@ function IdentityPanel({ company }: { company: Company }) {
           ? 'Add a display name.'
           : !d.legalName.trim()
             ? 'Add the legal name as it appears on your formation documents.'
-            : urlProblem(d.website)
+            : linkProblem(d.website)
       }
-      onSave={(d) =>
+      fieldLabels={IDENTITY_LABELS}
+      onSave={(d, { changed }) =>
         commit(
           'Updated company details',
           (draft) => {
             const c = draft.company
-            c.name = d.name.trim()
-            c.legalName = d.legalName.trim()
-            c.entityType = d.entityType.trim()
-            c.incorporatedIn = d.incorporatedIn.trim()
-            c.foundedOn = d.foundedOn
-            c.stage = d.stage.trim()
-            c.tagline = d.tagline.trim()
-            if (d.website.trim()) c.website = d.website.trim()
-            else delete c.website
+            const has = (k: keyof Identity) => changed.includes(k)
+            if (has('name')) c.name = d.name.trim()
+            if (has('legalName')) c.legalName = d.legalName.trim()
+            if (has('entityType')) c.entityType = d.entityType.trim()
+            if (has('incorporatedIn')) c.incorporatedIn = d.incorporatedIn.trim()
+            if (has('foundedOn')) c.foundedOn = d.foundedOn
+            if (has('stage')) c.stage = d.stage.trim()
+            if (has('tagline')) c.tagline = d.tagline.trim()
+            if (has('website')) {
+              // 'ledgerlark.ai' is saved as https://ledgerlark.ai, as Start fresh saves it.
+              if (d.website.trim()) c.website = normalizeWebsite(d.website)
+              else delete c.website
+            }
           },
           { entityType: 'company', entityId: 'company' },
         )
@@ -168,7 +189,7 @@ function IdentityPanel({ company }: { company: Company }) {
           <DateField label="Founded on" value={d.foundedOn} onChange={(v) => set({ foundedOn: v })} presets={pastPresets()} />
           <FormGrid>
             <ChipsOrText label="Stage" value={d.stage} onChange={(v) => set({ stage: v })} options={['Pre-seed', 'Seed', 'Series A']} />
-            <Field label="Website" error={urlProblem(d.website)}>
+            <Field label="Website" error={linkProblem(d.website)}>
               {(id, hint) => (
                 <TextInput
                   id={id}
@@ -204,6 +225,18 @@ type Hq = {
   phone: string
 }
 
+const HQ_LABELS: FieldLabels<Hq> = {
+  street: 'Street',
+  suite: 'Suite',
+  city: 'City',
+  state: 'State',
+  zip: 'ZIP',
+  workweek: 'Workweek',
+  paySchedule: 'Pay schedule',
+  regularPayday: 'Regular payday',
+  phone: 'Main phone',
+}
+
 function HqPanel({ company }: { company: Company }) {
   const value: Hq = {
     street: company.hq.street,
@@ -235,19 +268,32 @@ function HqPanel({ company }: { company: Company }) {
               ? 'Use a 5-digit ZIP code.'
               : null
       }
-      onSave={(d) =>
+      fieldLabels={HQ_LABELS}
+      fieldValues={{ paySchedule: scheduleLabel }}
+      onSave={(d, { changed }) =>
         commit(
           'Updated HQ and pay schedule',
           (draft) => {
             const c = draft.company
-            c.hq = { street: d.street.trim(), city: d.city.trim(), state: d.state.trim().toUpperCase(), zip: d.zip.trim() }
-            if (d.suite.trim()) c.hq.suite = d.suite.trim()
-            c.workweek = d.workweek.trim()
-            c.paySchedule = d.paySchedule
-            if (d.regularPayday.trim()) c.regularPayday = d.regularPayday.trim()
-            else delete c.regularPayday
-            if (d.phone.trim()) c.phone = d.phone.trim()
-            else delete c.phone
+            const has = (k: keyof Hq) => changed.includes(k)
+            if (has('street')) c.hq.street = d.street.trim()
+            if (has('suite')) {
+              if (d.suite.trim()) c.hq.suite = d.suite.trim()
+              else delete c.hq.suite
+            }
+            if (has('city')) c.hq.city = d.city.trim()
+            if (has('state')) c.hq.state = d.state.trim().toUpperCase()
+            if (has('zip')) c.hq.zip = d.zip.trim()
+            if (has('workweek')) c.workweek = d.workweek.trim()
+            if (has('paySchedule')) c.paySchedule = d.paySchedule
+            if (has('regularPayday')) {
+              if (d.regularPayday.trim()) c.regularPayday = d.regularPayday.trim()
+              else delete c.regularPayday
+            }
+            if (has('phone')) {
+              if (d.phone.trim()) c.phone = d.phone.trim()
+              else delete c.phone
+            }
           },
           { entityType: 'company', entityId: 'company' },
         )
@@ -316,6 +362,23 @@ function HqPanel({ company }: { company: Company }) {
 }
 
 // ---------------------------------------------------------------------------------------------
+
+const ROUND_VALUES: FieldValues<FundingRound> = {
+  instrument: (v) => (v === 'SAFE' ? 'SAFE' : 'Priced round'),
+  amount: sayMoney,
+  postMoney: sayMoney,
+  pricePerShare: (v) => (v == null ? 'blank' : money2(v)),
+}
+
+const ROUND_LABELS: FieldLabels<FundingRound> = {
+  name: 'Round',
+  instrument: 'Instrument',
+  closedOn: 'Closed on',
+  amount: 'Amount raised',
+  postMoney: 'Post-money valuation',
+  leadInvestor: 'Lead investor',
+  pricePerShare: 'Preferred price per share',
+}
 
 function blankRound(): FundingRound {
   return { id: newId('fr'), name: 'Seed', closedOn: today(), amount: 0, instrument: 'Priced' }
@@ -402,10 +465,13 @@ function FundingPanel({ rounds }: { rounds: FundingRound[] }) {
           open
           title={isNew ? 'Add a funding round' : `Edit ${editing.name}`}
           initial={editing}
+          current={rounds.find((r) => r.id === editing.id)}
+          fieldLabels={ROUND_LABELS}
+          fieldValues={ROUND_VALUES}
           onClose={() => setEditing(null)}
           saveLabel={isNew ? 'Add round' : 'Save round'}
           validate={(d) => (!d.name.trim() ? 'Name the round.' : !(d.amount > 0) ? 'Add the amount raised.' : null)}
-          onSave={(d) =>
+          onSave={(d, { changed }) =>
             commit(isNew ? `Added the ${d.name.trim()} round` : `Updated the ${d.name.trim()} round`, (draft) => {
               const clean: FundingRound = { ...d, name: d.name.trim() }
               if (!clean.leadInvestor?.trim()) delete clean.leadInvestor
@@ -413,8 +479,17 @@ function FundingPanel({ rounds }: { rounds: FundingRound[] }) {
               if (clean.instrument !== 'Priced' || !clean.pricePerShare) delete clean.pricePerShare
               const list = draft.company.fundingRounds
               const i = list.findIndex((x) => x.id === d.id)
-              if (i >= 0) list[i] = clean
-              else list.push(clean)
+              if (i < 0) {
+                list.push(clean)
+                return
+              }
+              // Only the fields changed here; the rest keep what is stored (another computer may have saved them).
+              const stored = list[i]
+              for (const k of changed) {
+                if (clean[k] === undefined) delete (stored as Partial<FundingRound>)[k]
+                else Object.assign(stored, { [k]: clean[k] })
+              }
+              if (stored.instrument !== 'Priced') delete stored.pricePerShare
             }, { entityType: 'company', entityId: 'company' })
           }
         >
@@ -501,6 +576,14 @@ type Cash = {
   annualRevenue: number | null
 }
 
+const CASH_LABELS: FieldLabels<Cash> = {
+  cashOnHand: 'Cash on hand',
+  cashAsOf: 'Cash as of',
+  otherMonthlySpend: 'Other monthly spend',
+  monthlyRevenue: 'Monthly revenue',
+  annualRevenue: 'Trailing 12-month revenue',
+}
+
 function CashPanel({ company }: { company: Company }) {
   const db = useDB((s) => s.db)
   const rw = useMemo(() => runway(db, today()), [db])
@@ -520,17 +603,21 @@ function CashPanel({ company }: { company: Company }) {
       value={value}
       editLabel="Update cash"
       saveLabel="Save cash and spend"
-      onSave={(d) =>
+      fieldLabels={CASH_LABELS}
+      fieldValues={{ cashOnHand: sayMoney, otherMonthlySpend: sayMoney, monthlyRevenue: sayMoney, annualRevenue: sayMoney }}
+      onSave={(d, { changed }) =>
         commit(
           'Updated cash, spend and revenue',
           (draft) => {
             const c = draft.company
             const setNum = (k: 'cashOnHand' | 'otherMonthlySpend' | 'monthlyRevenue' | 'annualRevenue', v: number | null) => {
+              if (!changed.includes(k)) return
               if (v == null) delete c[k]
               else c[k] = v
             }
             setNum('cashOnHand', d.cashOnHand)
-            c.cashAsOf = d.cashAsOf
+            // A cash figure always gets its date (the form shows today until one is picked).
+            if (changed.includes('cashAsOf') || (changed.includes('cashOnHand') && !c.cashAsOf)) c.cashAsOf = d.cashAsOf
             setNum('otherMonthlySpend', d.otherMonthlySpend)
             setNum('monthlyRevenue', d.monthlyRevenue)
             setNum('annualRevenue', d.annualRevenue)
@@ -634,12 +721,14 @@ function CostPanel({ company }: { company: Company }) {
       validate={(d) =>
         d.wcPct != null && (d.wcPct < 0 || d.wcPct > 20) ? "Workers' comp is usually well under 5% of wages for office work." : null
       }
-      onSave={(d) =>
+      fieldLabels={{ benefits: 'Benefits per person', peoTools: 'PEO and tools per person', wcPct: "Workers' comp" }}
+      fieldValues={{ benefits: sayMoney, peoTools: sayMoney, wcPct: (v) => (v == null ? 'blank' : `${v}% of wages`) }}
+      onSave={(d, { changed }) =>
         commit('Updated loaded-cost assumptions', (draft) => {
           const cm = draft.company.costModel
-          cm.benefitsPerHeadMonthly = d.benefits ?? 0
-          cm.peoToolsPerHeadMonthly = d.peoTools ?? 0
-          cm.workersCompPct = (d.wcPct ?? 0) / 100
+          if (changed.includes('benefits')) cm.benefitsPerHeadMonthly = d.benefits ?? 0
+          if (changed.includes('peoTools')) cm.peoToolsPerHeadMonthly = d.peoTools ?? 0
+          if (changed.includes('wcPct')) cm.workersCompPct = (d.wcPct ?? 0) / 100
         }, { entityType: 'company', entityId: 'company' })
       }
       view={
@@ -708,12 +797,16 @@ function HealthPlanPanel({ company }: { company: Company }) {
       editLabel="Edit health plan"
       saveLabel="Save health plan"
       validate={(d) => healthPlanProblem(d.offered, d.startedOn)}
-      onSave={(d) =>
-        commit(
-          d.offered === 'yes' ? 'Recorded the group health plan start date' : d.offered === 'no' ? 'Recorded no group health plan' : 'Cleared the group health plan',
-          (draft) => setHealthPlan(draft.company, d.offered, d.startedOn),
-          { entityType: 'company', entityId: 'company' },
-        )
+      fieldLabels={{ offered: 'Group health plan', startedOn: 'Plan started on' }}
+      onSave={(d, { changed }) =>
+        // One stored field: the choice and its date are written together, and only when either changed.
+        changed.length
+          ? commit(
+              d.offered === 'yes' ? 'Recorded the group health plan start date' : d.offered === 'no' ? 'Recorded no group health plan' : 'Cleared the group health plan',
+              (draft) => setHealthPlan(draft.company, d.offered, d.startedOn),
+              { entityType: 'company', entityId: 'company' },
+            )
+          : commit('Nothing changed', () => {})
       }
       view={
         <div className="flex flex-col gap-3">
@@ -772,13 +865,21 @@ function Soc2Panel({ company }: { company: Company }) {
       editLabel="Edit SOC 2"
       saveLabel="Save SOC 2"
       validate={(d) => (d.from && d.to && d.to <= d.from ? 'The Type II window must end after it starts.' : null)}
-      onSave={(d) =>
-        commit(d.on === company.soc2Enabled ? 'Updated SOC 2 dates' : d.on ? 'Turned on SOC 2 evidence' : 'Turned off SOC 2 evidence', (draft) => {
+      fieldLabels={{ on: 'SOC 2 evidence', typeIReportOn: 'Type I report date', from: 'Type II window start', to: 'Type II window end' }}
+      onSave={(d, { changed }) =>
+        commit(!changed.includes('on') ? 'Updated SOC 2 dates' : d.on ? 'Turned on SOC 2 evidence' : 'Turned off SOC 2 evidence', (draft) => {
           const c = draft.company
-          c.soc2Enabled = d.on
-          const soc2: NonNullable<Company['soc2']> = {}
-          if (d.typeIReportOn) soc2.typeIReportOn = d.typeIReportOn
-          if (d.from && d.to) soc2.typeIIWindow = { from: d.from, to: d.to }
+          if (changed.includes('on')) c.soc2Enabled = d.on
+          const soc2: NonNullable<Company['soc2']> = { ...c.soc2 }
+          if (changed.includes('typeIReportOn')) {
+            if (d.typeIReportOn) soc2.typeIReportOn = d.typeIReportOn
+            else delete soc2.typeIReportOn
+          }
+          // The window's two ends are saved as a pair.
+          if (changed.includes('from') || changed.includes('to')) {
+            if (d.from && d.to) soc2.typeIIWindow = { from: d.from, to: d.to }
+            else delete soc2.typeIIWindow
+          }
           if (Object.keys(soc2).length) c.soc2 = soc2
           else delete c.soc2
         }, { entityType: 'company', entityId: 'company' })
@@ -881,19 +982,44 @@ function RegistrationPanel({ company }: { company: Company }) {
       value={value}
       editLabel="Edit registration"
       saveLabel="Save registration"
-      onSave={(d) =>
+      fieldLabels={{
+        edd: 'EDD employer account number',
+        firstPayrollOn: 'First W-2 payroll',
+        carrier: "Workers' comp carrier",
+        carrierPhone: 'Carrier phone',
+        policyNumber: 'Policy number',
+        carrierAddress: 'Carrier address',
+      }}
+      // The EDD number stays masked: a conflict on it is only named.
+      fieldValues={{ edd: false, policyNumber: 'private' }}
+      onSave={(d, { changed }) =>
         commit('Updated payroll registration and insurance', (draft) => {
           const c = draft.company
-          if (d.edd.trim()) c.eddAccountNumber = d.edd.trim()
-          else delete c.eddAccountNumber
-          if (d.firstPayrollOn) c.firstPayrollOn = d.firstPayrollOn
-          else delete c.firstPayrollOn
-          if (d.carrier.trim()) {
-            c.workersCompCarrier = { name: d.carrier.trim() }
-            if (d.carrierPhone.trim()) c.workersCompCarrier.phone = d.carrierPhone.trim()
-            if (d.policyNumber.trim()) c.workersCompCarrier.policyNumber = d.policyNumber.trim()
-            if (d.carrierAddress.trim()) c.workersCompCarrier.address = d.carrierAddress.trim()
-          } else delete c.workersCompCarrier
+          const has = (k: keyof Registration) => changed.includes(k)
+          if (has('edd')) {
+            if (d.edd.trim()) c.eddAccountNumber = d.edd.trim()
+            else delete c.eddAccountNumber
+          }
+          if (has('firstPayrollOn')) {
+            if (d.firstPayrollOn) c.firstPayrollOn = d.firstPayrollOn
+            else delete c.firstPayrollOn
+          }
+          if (!has('carrier') && !has('carrierPhone') && !has('policyNumber') && !has('carrierAddress')) return
+          // No carrier name means no carrier record; otherwise each changed detail is written on its own.
+          if (!d.carrier.trim()) {
+            delete c.workersCompCarrier
+            return
+          }
+          const wc = (c.workersCompCarrier ??= { name: d.carrier.trim() })
+          const detail = (k: 'carrierPhone' | 'policyNumber' | 'carrierAddress', field: 'phone' | 'policyNumber' | 'address') => {
+            if (!has(k)) return
+            if (d[k].trim()) wc[field] = d[k].trim()
+            else delete wc[field]
+          }
+          if (has('carrier')) wc.name = d.carrier.trim()
+          detail('carrierPhone', 'phone')
+          detail('policyNumber', 'policyNumber')
+          detail('carrierAddress', 'address')
         }, { entityType: 'company', entityId: 'company', log: 'Updated payroll registration and insurance details' })
       }
       view={

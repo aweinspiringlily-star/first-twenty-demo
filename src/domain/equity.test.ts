@@ -2,25 +2,37 @@ import { produce } from 'immer'
 import { describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
 import {
+  addValuation,
   approveGrants,
   boardConsentQueue,
+  capTableErrors,
+  capTableIsPlaceholder,
   cliffDate,
+  confirmCapTable,
   consentTableText,
+  current409A,
+  defaultSafeHarborEnd,
   exerciseDeadline,
+  grantNeeds409A,
   grantSummary,
   monthsVested,
   nextVestDate,
   poolSummary,
+  removeValuation,
   scheduleText,
   sharesHeld,
+  updateCapTable,
+  updateValuation,
   upcomingCliffs,
   upcomingVests,
+  valuationErrors,
   valuationWarnings,
   vestedHeld,
   vestedShares,
   vestingPoints,
+  vestingStop,
 } from '@/domain/equity'
-import type { DB, EquityGrant, Offer, Person } from '@/domain/types'
+import type { Checklist, ChecklistTask, DB, EquityGrant, Offer, Person } from '@/domain/types'
 
 const D = '2026-10-09'
 
@@ -65,6 +77,14 @@ function mkGrant(id: string, personId: string, shares: number, vestingStart: str
     postTerminationExerciseDays: 90,
     ...over,
   }
+}
+
+function mkTask(id: string, templateTaskId: string, title: string, dueOn: string): ChecklistTask {
+  return { id, templateTaskId, title, ownerRole: 'admin', assigneeId: null, dueOn, status: 'open', category: 'equity', statutory: false }
+}
+
+function checklist(id: string, personId: string, kind: Checklist['kind'], anchorDate: string, tasks: ChecklistTask[], createdOn = anchorDate): Checklist {
+  return { id, personId, kind, templateId: `tpl-${kind}`, anchorDate, createdOn, tasks }
 }
 
 function equityDB(): DB {
@@ -411,8 +431,135 @@ describe('board consent', () => {
     })
     expect(result?.approved).toEqual(['g-aisha'])
     expect(result?.skipped).toEqual(['g-zero'])
-    expect(result?.warnings.some((w) => w.includes('Add a 409A first'))).toBe(true)
+    expect(result?.noStrike).toEqual(['g-zero'])
+    expect(result?.warnings.some((w) => w.includes('Record a 409A first'))).toBe(true)
     expect(next.grants.find((g) => g.id === 'g-zero')?.status).toBe('promised')
+  })
+
+  it('says first, and only once, that grants wait for a 409A when it approves none', () => {
+    // A fresh company: one accepted offer with options, no 409A on file.
+    const db = equityDB()
+    db.equity.valuations = []
+    db.grants = [mkGrant('g-dana', 'p-kofi', 35_000, '2026-10-12', { status: 'promised', boardApprovedOn: undefined, strikePrice: 0 })]
+    expect(grantNeeds409A(db, db.grants[0], D)).toBe(true)
+    expect(grantNeeds409A(db, { ...db.grants[0], type: 'RSA' }, D)).toBe(false)
+    expect(grantNeeds409A(db, { ...db.grants[0], strikePrice: 0.5 }, D)).toBe(false)
+    let result: ReturnType<typeof approveGrants> | undefined
+    const next = produce(db, (d) => {
+      result = approveGrants(d, ['g-dana'], D, { date: D })
+    })
+    expect(result).toMatchObject({ approved: [], skipped: ['g-dana'], noStrike: ['g-dana'], firstIssuance: false })
+    expect(result?.warnings[0]).toBe(
+      '1 option grant was not approved: no 409A valuation is in effect on Oct 9, 2026, so there is no strike price. Record a 409A first.',
+    )
+    // The generic "no 409A on file" warning would repeat it.
+    expect(result?.warnings.filter((w) => w.includes('409A'))).toHaveLength(1)
+    // Nothing changed, so the store records no Undo step for it.
+    expect(next).toBe(db)
+
+    // Once a 409A is recorded, the same grant is approved at its price.
+    const priced = produce(db, (d) => {
+      addValuation(d, { effectiveOn: '2026-10-01', fmvPerShare: 0.42, provider: 'Carta', expiresOn: '2027-10-01' })
+      result = approveGrants(d, ['g-dana'], D, { date: D })
+    })
+    expect(grantNeeds409A(priced, db.grants[0], D)).toBe(false)
+    expect(result).toMatchObject({ approved: ['g-dana'], skipped: [], noStrike: [], firstIssuance: true })
+    expect(priced.grants[0]).toMatchObject({ status: 'approved', strikePrice: 0.42, boardApprovedOn: D })
+    // A board date before the 409A took effect still has no price.
+    expect(grantNeeds409A(priced, db.grants[0], '2026-09-30')).toBe(true)
+  })
+
+  it("closes the onboarding task 'Grant added to the next board consent' when the board approves the hire grant", () => {
+    const withChecklist = (checkinStatus: ChecklistTask['status']) => {
+      const db = equityDB()
+      db.checklists.push(
+        checklist('ck-aisha', 'p-aisha', 'onboarding', '2026-09-08', [
+          mkTask('t-board', 'on-equity-board', 'Grant added to the next board consent', '2026-10-08'),
+          { ...mkTask('t-checkin', 'on-checkin-90', '90-day check-in', '2026-12-07'), status: checkinStatus },
+        ]),
+      )
+      return db
+    }
+    const db = withChecklist('open')
+    let result: ReturnType<typeof approveGrants> | undefined
+    const next = produce(db, (d) => {
+      result = approveGrants(d, ['g-aisha'], '2026-10-08', { date: D })
+    })
+    expect(result?.tasksClosed).toBe(1)
+    const tasks = next.checklists[0].tasks
+    expect(tasks.find((t) => t.id === 't-board')).toMatchObject({ status: 'done', doneOn: '2026-10-08' })
+    expect(tasks.find((t) => t.id === 't-checkin')?.status).toBe('open')
+    expect(next.checklists[0].completedOn).toBeUndefined()
+    expect(next.activity.map((a) => a.text)).toContain('Marked done: Grant added to the next board consent for Aisha Test')
+    // Undo restores the state before the change: the task is open again there.
+    expect(db.checklists[0].tasks[0].status).toBe('open')
+
+    // The last open task: the checklist completes. A board date still ahead dates the task today.
+    const ahead = produce(withChecklist('done'), (d) => {
+      result = approveGrants(d, ['g-aisha'], '2026-10-20', { date: D })
+    })
+    expect(ahead.checklists[0].tasks[0]).toMatchObject({ status: 'done', doneOn: D })
+    expect(ahead.checklists[0].completedOn).toBe(D)
+  })
+
+  it('leaves the onboarding task open while another hire grant still waits, or the grant could not be approved', () => {
+    const db = equityDB()
+    db.grants.push(mkGrant('g-aisha-2', 'p-aisha', 3_000, '2026-09-08', { status: 'promised', boardApprovedOn: undefined, strikePrice: 1.15 }))
+    db.checklists.push(checklist('ck-aisha', 'p-aisha', 'onboarding', '2026-09-08', [mkTask('t-board', 'on-equity-board', 'Grant added to the next board consent', '2026-10-08')]))
+    let result: ReturnType<typeof approveGrants> | undefined
+    const one = produce(db, (d) => {
+      result = approveGrants(d, ['g-aisha'], D, { date: D })
+    })
+    expect(result?.tasksClosed).toBe(0)
+    expect(one.checklists[0].tasks[0].status).toBe('open')
+    const both = produce(one, (d) => {
+      result = approveGrants(d, ['g-aisha-2'], D, { date: D })
+    })
+    expect(result?.tasksClosed).toBe(1)
+    expect(both.checklists[0].tasks[0].status).toBe('done')
+
+    // No 409A on the board date: nothing is approved, so nothing closes.
+    const unpriced = equityDB()
+    unpriced.equity.valuations = []
+    unpriced.grants = [mkGrant('g-dana', 'p-aisha', 35_000, '2026-10-12', { status: 'promised', boardApprovedOn: undefined, strikePrice: 0 })]
+    unpriced.checklists.push(checklist('ck-aisha', 'p-aisha', 'onboarding', '2026-09-08', [mkTask('t-board', 'on-equity-board', 'Grant added to the next board consent', '2026-10-08')]))
+    const after = produce(unpriced, (d) => {
+      result = approveGrants(d, ['g-dana'], D, { date: D })
+    })
+    expect(result?.tasksClosed).toBe(0)
+    expect(after).toBe(unpriced)
+  })
+
+  it("closes a refresh grant's task on the change checklist that queued it", () => {
+    const db = equityDB()
+    db.grants.push(
+      mkGrant('g-kofi-refresh', 'p-kofi', 8_000, '2026-11-01', { status: 'promised', boardApprovedOn: undefined, cliffMonths: 0, note: 'Refresh grant (promotion)', strikePrice: 1.15 }),
+    )
+    db.checklists.push(
+      // A stale onboarding task from Kofi's hire, and an older change still waiting on its own refresh grant.
+      checklist('ck-kofi-on', 'p-kofi', 'onboarding', '2025-10-06', [mkTask('t-on-board', 'on-equity-board', 'Grant added to the next board consent', '2025-11-05')]),
+      checklist('ck-kofi-old', 'p-kofi', 'change', '2026-06-01', [mkTask('t-old', 'ch-refresh-grant', 'Refresh grant added to the next board consent', '2026-07-01')], '2026-05-20'),
+      checklist('ck-kofi-new', 'p-kofi', 'change', '2026-11-01', [mkTask('t-new', 'ch-refresh-grant', 'Refresh grant added to the next board consent', '2026-11-08')], '2026-10-09'),
+    )
+    let result: ReturnType<typeof approveGrants> | undefined
+    const next = produce(db, (d) => {
+      result = approveGrants(d, ['g-kofi-refresh'], D, { date: D })
+    })
+    expect(result?.tasksClosed).toBe(1)
+    const status = (checklistId: string) => next.checklists.find((c) => c.id === checklistId)?.tasks[0].status
+    expect(status('ck-kofi-new')).toBe('done')
+    expect(status('ck-kofi-old')).toBe('open')
+    expect(status('ck-kofi-on')).toBe('open')
+    expect(next.checklists.find((c) => c.id === 'ck-kofi-new')?.completedOn).toBe(D)
+
+    // With no change checklist dated on the vesting start, the oldest open refresh task closes.
+    const moved = produce(db, (d) => {
+      const g = d.grants.find((x) => x.id === 'g-kofi-refresh')
+      if (g) g.vestingStart = '2026-12-01'
+      approveGrants(d, ['g-kofi-refresh'], D, { date: D })
+    })
+    expect(moved.checklists.find((c) => c.id === 'ck-kofi-old')?.tasks[0].status).toBe('done')
+    expect(moved.checklists.find((c) => c.id === 'ck-kofi-new')?.tasks[0].status).toBe('open')
   })
 
   it('gives 90 days to exercise after the last day', () => {
@@ -442,5 +589,186 @@ describe('grant summary', () => {
     expect(ben).toMatchObject({ status: 'ended', totalShares: 16_250, vested: 16_250, nextVest: null })
     expect(vestedHeld(equityDB(), equityDB().grants.find((g) => g.id === 'g-ben') as EquityGrant, '2027-06-01')).toBe(16_250)
     expect(grantSummary(equityDB(), 'p-founder', D).status).toBe('none')
+  })
+
+  /** Offboarding as lifecycle.ts records it: end date, separation, and the unvested shares cancelled on the last day. */
+  function offboard(db: DB, personId: string, lastDay: string, type: 'terminated' | 'resigned_notice') {
+    const p = db.people.find((x) => x.id === personId) as Person
+    p.endDate = lastDay
+    p.separation = { type, reason: 'Test', lastDay }
+    for (const g of db.grants.filter((x) => x.personId === personId && x.status === 'approved')) {
+      g.cancelledShares = g.shares - vestedShares(g, lastDay)
+      g.cancelledOn = lastDay
+    }
+    p.separation.exerciseDeadline = exerciseDeadline({ postTerminationExerciseDays: 90 }, lastDay)
+  }
+
+  it('stops vesting on the last day of someone terminated today', () => {
+    const db = equityDB()
+    offboard(db, 'p-kofi', D, 'terminated')
+    const s = grantSummary(db, 'p-kofi', D)
+    expect(s).toMatchObject({ status: 'leaving', totalShares: 13_000, vested: 13_000, nextVest: null, fullyVestedOn: null })
+    expect(s.exit).toEqual({ lastDay: D, vestedAtExit: 13_000, returnsToPool: 39_000, exerciseBy: '2027-01-07' })
+    expect(s.text).toBe('Vesting stops Oct 9, 2026: 13,000 vested, 39,000 return to the pool')
+    // The next day it reads as kept after leaving.
+    expect(grantSummary(db, 'p-kofi', '2026-10-10')).toMatchObject({ status: 'ended', vested: 13_000, nextVest: null })
+  })
+
+  it('keeps vests before a future last day and none after it', () => {
+    const db = equityDB()
+    db.people.push(mkPerson('p-elena', 'Elena', '2025-08-18'))
+    db.grants.push(mkGrant('g-elena', 'p-elena', 60_000, '2025-08-18'))
+    offboard(db, 'p-elena', '2026-10-30', 'resigned_notice')
+    const s = grantSummary(db, 'p-elena', D)
+    expect(s).toMatchObject({ status: 'leaving', vested: 16_250, nextVest: { date: '2026-10-18', shares: 1_250 }, fullyVestedOn: null })
+    expect(s.exit).toMatchObject({ lastDay: '2026-10-30', vestedAtExit: 17_500, returnsToPool: 42_500, exerciseBy: '2027-01-28' })
+    expect(s.text).toBe('Vesting stops Oct 30, 2026: 17,500 vested, 42,500 return to the pool')
+    expect(grantSummary(db, 'p-elena', '2026-10-19').nextVest).toBeNull()
+
+    // A separation with no end date or cancellation recorded yet stops vesting all the same.
+    const bare = equityDB()
+    bare.people.push(mkPerson('p-elena', 'Elena', '2025-08-18', { separation: { type: 'resigned_notice', reason: 'Test', lastDay: '2026-10-30' } }))
+    bare.grants.push(mkGrant('g-elena', 'p-elena', 60_000, '2025-08-18'))
+    const g = bare.grants.find((x) => x.id === 'g-elena') as EquityGrant
+    expect(vestingStop(bare, g)).toBe('2026-10-30')
+    expect(vestedHeld(bare, g, '2027-06-01')).toBe(17_500)
+    expect(grantSummary(bare, 'p-elena', D)).toMatchObject({ status: 'leaving', nextVest: { date: '2026-10-18', shares: 1_250 }, fullyVestedOn: null })
+    expect(grantSummary(bare, 'p-elena', D).exit).toMatchObject({ vestedAtExit: 17_500, returnsToPool: 42_500, exerciseBy: '2027-01-28' })
+    // The vesting chart line goes flat after the last day.
+    const points = vestingPoints(g, vestingStop(bare, g))
+    expect(points.find((p) => p.date === '2026-10-18')?.vested).toBe(17_500)
+    expect(points.at(-1)).toEqual({ date: '2029-08-18', vested: 17_500 })
+  })
+
+  it('does not count a cliff after the last day', () => {
+    const db = equityDB()
+    // Aisha starts Sep 8, 2026 and leaves before her Sep 8, 2027 cliff, with no cancellation recorded.
+    const g = db.grants.find((x) => x.id === 'g-aisha') as EquityGrant
+    g.status = 'approved'
+    g.boardApprovedOn = '2026-10-01'
+    const p = db.people.find((x) => x.id === 'p-aisha') as Person
+    p.endDate = '2027-03-01'
+    const s = grantSummary(db, 'p-aisha', D)
+    expect(s.cliff).toBeNull()
+    expect(s.nextVest).toBeNull()
+    expect(s.exit).toMatchObject({ vestedAtExit: 0, returnsToPool: 12_000, exerciseBy: null })
+  })
+})
+
+describe('409A valuations and cap table', () => {
+  it('records, corrects and removes a 409A, logging no price', () => {
+    const db = equityDB()
+    db.equity.valuations = []
+    let id = ''
+    const added = produce(db, (d) => {
+      id = addValuation(d, { effectiveOn: '2026-10-01', fmvPerShare: 0.4249999, provider: '  Carta ', expiresOn: defaultSafeHarborEnd('2026-10-01'), note: ' ' })
+    })
+    expect(added.equity.valuations).toEqual([{ id, effectiveOn: '2026-10-01', fmvPerShare: 0.425, provider: 'Carta', expiresOn: '2027-10-01' }])
+    expect(current409A(added, D)?.id).toBe(id)
+    expect(added.activity.at(-1)).toMatchObject({ entityType: 'equity', kind: 'valuation_recorded' })
+    expect(added.activity.at(-1)?.text).toBe('Recorded a 409A valuation effective Oct 1, 2026 from Carta, safe harbor until Oct 1, 2027')
+    // In safe harbor; only Aisha's promised strike ($1.15) differs from the new price.
+    expect(valuationWarnings(added, D).map((w) => w.kind)).toEqual(['strike'])
+
+    let changed = true
+    const same = produce(added, (d) => {
+      changed = updateValuation(d, id, { effectiveOn: '2026-10-01', fmvPerShare: 0.425, provider: 'Carta', expiresOn: '2027-10-01' })
+    })
+    expect(changed).toBe(false)
+    expect(same).toBe(added)
+    const fixed = produce(added, (d) => {
+      changed = updateValuation(d, id, { effectiveOn: '2026-10-01', fmvPerShare: 0.45, provider: 'Carta', expiresOn: '2027-09-30', note: 'Corrected' })
+    })
+    expect(changed).toBe(true)
+    expect(fixed.equity.valuations[0]).toMatchObject({ fmvPerShare: 0.45, expiresOn: '2027-09-30', note: 'Corrected' })
+    expect(fixed.activity.at(-1)?.text).toBe('Updated the 409A valuation effective Oct 1, 2026')
+
+    const removed = produce(fixed, (d) => {
+      removeValuation(d, id)
+    })
+    expect(removed.equity.valuations).toEqual([])
+    expect(removed.activity.at(-1)).toMatchObject({ kind: 'valuation_removed', text: 'Removed the 409A valuation effective Oct 1, 2026' })
+    expect(removed.activity.every((a) => !a.text.includes('$'))).toBe(true)
+  })
+
+  it('checks a 409A entry field by field', () => {
+    expect(defaultSafeHarborEnd('2026-02-28')).toBe('2027-02-28')
+    expect(valuationErrors({ effectiveOn: '2026-10-01', fmvPerShare: 0.42, provider: 'Carta', expiresOn: '2027-10-01' })).toEqual({})
+    expect(valuationErrors({ effectiveOn: null, fmvPerShare: null, provider: ' ', expiresOn: null })).toEqual({
+      effectiveOn: 'Pick the effective date from the valuation report.',
+      fmvPerShare: 'Enter the fair market value a share, more than $0.',
+      provider: 'Name the firm that did the valuation.',
+      expiresOn: 'Pick the date safe harbor ends.',
+    })
+    expect(valuationErrors({ effectiveOn: '2026-10-01', fmvPerShare: 0, provider: 'Carta', expiresOn: '2026-10-01' })).toMatchObject({
+      fmvPerShare: 'Enter the fair market value a share, more than $0.',
+      expiresOn: 'Safe harbor has to end after the effective date.',
+    })
+    expect(valuationErrors({ effectiveOn: '2026-03-20', fmvPerShare: 1, provider: 'Carta', expiresOn: '2027-03-20' }, equityDB().equity.valuations).effectiveOn).toBe(
+      'A 409A with this effective date is already on file. Edit that one instead.',
+    )
+  })
+
+  it('checks and writes the cap table, keeping pool increases', () => {
+    const ok = { authorizedShares: 12_000_000, fullyDilutedShares: 10_000_000, founderShares: 8_000_000, poolShares: 1_500_000 }
+    expect(capTableErrors(ok)).toEqual({})
+    expect(capTableErrors({ ...ok, poolShares: null, founderShares: 1.5 })).toEqual({
+      poolShares: 'Enter the option pool.',
+      founderShares: 'Use a whole number of shares, 0 or more.',
+    })
+    expect(capTableErrors({ ...ok, fullyDilutedShares: 0 }).fullyDilutedShares).toBe('Fully diluted shares must be more than 0.')
+    expect(capTableErrors(ok, 600_000).fullyDilutedShares).toBe(
+      'Fully diluted has to cover the founder shares plus the whole option pool (10,100,000, with 600,000 added to the pool later).',
+    )
+    expect(capTableErrors({ ...ok, authorizedShares: 9_000_000 }).authorizedShares).toBe(
+      'Authorized shares have to be at least the fully diluted count. The charter sets how many the company may issue.',
+    )
+
+    const db = equityDB()
+    let changed = false
+    const next = produce(db, (d) => {
+      changed = updateCapTable(d, { ...ok, poolShares: 1_400_000 }, D)
+    })
+    expect(changed).toBe(true)
+    expect(next.equity).toMatchObject({ ...ok, poolShares: 1_400_000, poolIncreases: db.equity.poolIncreases, capTableConfirmedOn: D })
+    expect(poolSummary(next, D).poolShares).toBe(1_900_000)
+    expect(next.activity.at(-1)).toMatchObject({ kind: 'cap_table_updated', text: 'Updated the cap table: authorized, fully diluted, founder and option pool shares' })
+    const again = produce(next, (d) => {
+      changed = updateCapTable(d, { ...ok, poolShares: 1_400_000 }, '2026-10-12')
+    })
+    expect(changed).toBe(false)
+    expect(again).toBe(next)
+  })
+
+  it('treats the Start fresh cap table as placeholder numbers until they are entered or confirmed', () => {
+    const fresh = blankDB({ companyName: 'Testco', founderFirstName: 'Maya', founderLastName: 'Raman' })
+    expect(fresh.equity.capTableConfirmedOn).toBeUndefined()
+    expect(capTableIsPlaceholder(fresh)).toBe(true)
+    const numbers = {
+      authorizedShares: fresh.equity.authorizedShares,
+      fullyDilutedShares: fresh.equity.fullyDilutedShares,
+      founderShares: fresh.equity.founderShares,
+      poolShares: fresh.equity.poolShares,
+    }
+    // Saving the placeholder numbers unchanged confirms them.
+    let changed = false
+    const saved = produce(fresh, (d) => {
+      changed = updateCapTable(d, numbers, D)
+    })
+    expect(changed).toBe(true)
+    expect(capTableIsPlaceholder(saved)).toBe(false)
+    expect(saved.equity).toMatchObject({ ...numbers, capTableConfirmedOn: D })
+    expect(saved.activity.at(-1)).toMatchObject({ kind: 'cap_table_confirmed', text: 'Confirmed the cap table numbers' })
+    // 'These numbers are right' confirms once and keeps the first date.
+    const confirmed = produce(fresh, (d) => {
+      changed = confirmCapTable(d, D)
+    })
+    expect(changed).toBe(true)
+    expect(confirmed.equity.capTableConfirmedOn).toBe(D)
+    const twice = produce(confirmed, (d) => {
+      changed = confirmCapTable(d, '2026-10-12')
+    })
+    expect(changed).toBe(false)
+    expect(twice).toBe(confirmed)
   })
 })

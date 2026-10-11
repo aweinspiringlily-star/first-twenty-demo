@@ -2,10 +2,11 @@
 // button and a key: Advance (A), Move to…, Reject (R), Snooze 3 days (S), next (J), arrow keys to
 // move the selection and Enter to open. Cards show days in stage against the SLA (word + color).
 // The single keys act only while focus is inside the pipeline, so a stray key press elsewhere never
-// changes a candidate the user is not looking at. Landing in a stage with an interview step offers
-// Schedule on the card (copy the scheduling message and download the .ics).
+// changes a candidate the user is not looking at; the ? sheet still lists them while the pipeline is on
+// screen. Landing in a stage with an interview step offers Schedule on the card (copy the scheduling
+// message and download the .ics). Focus moving into a card scrolls the board so the whole card shows.
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { links, navigate } from '@/app/router'
+import { links, navigate, navigateTo } from '@/app/router'
 import { useShortcut } from '@/app/shortcuts'
 import { useViewer } from '@/app/useViewer'
 import { attentionReasonLabel, attentionReasons, dbHolidays, jobStages, openOffer, outcomeReasonLabel, slaDetail } from '@/domain/hiring'
@@ -130,7 +131,8 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
   }
 
   const inMenu = (e: KeyboardEvent) => !!(e.target as Element | null)?.closest?.('[role=menu],[role=radiogroup],[role=tablist]')
-  const arrows = { group: 'Pipeline', enabled: focusInside }
+  // listed: the ? sheet takes focus out of the board, and these keys should still show there.
+  const arrows = { group: 'Pipeline', enabled: focusInside, listed: true }
   useShortcut('arrowleft', (e) => !inMenu(e) && step('left'), { ...arrows, description: 'Select the card to the left' })
   useShortcut('arrowright', (e) => !inMenu(e) && step('right'), { ...arrows, description: 'Select the card to the right' })
   useShortcut('arrowup', (e) => !inMenu(e) && step('up'), { ...arrows, description: 'Select the card above' })
@@ -139,7 +141,7 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
     if (!flat.length) return
     const i = sel ? flat.indexOf(sel) : -1
     focusCard(flat[(i + 1) % flat.length])
-  }, { group: 'Pipeline', description: 'Select the next candidate' })
+  }, { group: 'Pipeline', description: 'Select the next candidate', listed: true })
 
   /** After a move: keep the card selected and focused in its new column, and offer Schedule there. */
   const afterMove = (id: ID) => {
@@ -152,7 +154,7 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
     const app = db.applications.find((a) => a.id === id)
     if (!app || app.status !== 'active') return
     const outcome = advance(id, viewer.personId)
-    if (outcome === 'needs_hire') navigate('candidate', app.candidateId)
+    if (outcome === 'needs_hire') navigateTo(links.candidateOffer(app.candidateId, app.id))
     if (outcome === 'moved') afterMove(id)
   }
   const doSnooze = (id: ID) => {
@@ -162,21 +164,39 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
 
   // Like the arrows, the single keys need focus inside the pipeline (not just a remembered selection).
   const keysOn = !!sel && focusInside
-  useShortcut('a', () => sel && doAdvance(sel), { group: 'Pipeline', description: 'Advance the selected candidate', enabled: keysOn })
+  useShortcut('a', () => sel && doAdvance(sel), { group: 'Pipeline', description: 'Advance the selected candidate', enabled: keysOn, listed: true })
   const openReject = (id: ID) => {
     afterReject.current = neighbor(id)
     setRejecting(id)
   }
-  useShortcut('r', () => sel && openReject(sel), { group: 'Pipeline', description: 'Reject the selected candidate', enabled: keysOn })
-  useShortcut('s', () => sel && doSnooze(sel), { group: 'Pipeline', description: 'Snooze the selected candidate 3 days', enabled: keysOn })
+  useShortcut('r', () => sel && openReject(sel), { group: 'Pipeline', description: 'Reject the selected candidate', enabled: keysOn, listed: true })
+  useShortcut('s', () => sel && doSnooze(sel), { group: 'Pipeline', description: 'Snooze the selected candidate 3 days', enabled: keysOn, listed: true })
   useShortcut(
     'enter',
     () => {
       const app = sel && db.applications.find((a) => a.id === sel)
       if (app) navigate('candidate', app.candidateId)
     },
-    { group: 'Pipeline', description: 'Open the selected candidate', enabled: cardFocused && keysOn },
+    { group: 'Pipeline', description: 'Open the selected candidate', enabled: cardFocused && keysOn, listed: true },
   )
+
+  /**
+   * Tab into a card, or on to its buttons, in a column the board strip cuts off: scroll the strip
+   * sideways so the whole card shows (the browser leaves a control half hidden at the strip's edge).
+   * Only the strip moves; the page's own scrolling to the focused control is left to the browser. The
+   * List has no side scroller, so it needs none of this. Menus render in a portal, so focus in an open
+   * Move to menu finds no card in the strip and scrolls nothing.
+   */
+  const revealFocusedCard = (e: React.FocusEvent<HTMLElement>) => {
+    const strip = e.currentTarget
+    const card = e.target instanceof Element ? e.target.closest<HTMLElement>('.ft-boardcard') : null
+    if (!card || !strip.contains(card)) return
+    const s = strip.getBoundingClientRect()
+    const c = card.getBoundingClientRect()
+    const gap = 8 // room for the focus ring
+    if (c.left < s.left + gap) strip.scrollLeft -= s.left + gap - c.left
+    else if (c.right > s.right - gap) strip.scrollLeft += Math.min(c.right - (s.right - gap), c.left - (s.left + gap))
+  }
 
   const active = db.applications.filter((a) => a.jobId === job.id && a.status === 'active')
   const closed = db.applications.filter((a) => a.jobId === job.id && (a.status === 'rejected' || a.status === 'withdrawn')).sort((a, b) => (b.closedOn ?? '').localeCompare(a.closedOn ?? ''))
@@ -208,7 +228,7 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
       onAdvance={() => doAdvance(app.id)}
       onMove={(stageId) => {
         const outcome = moveTo(app.id, stageId, viewer.personId)
-        if (outcome === 'needs_hire') navigate('candidate', app.candidateId)
+        if (outcome === 'needs_hire') navigateTo(links.candidateOffer(app.candidateId, app.id))
         // The card remounts in another column: move focus with it so keyboard users are not dropped.
         if (outcome === 'moved') afterMove(app.id)
       }}
@@ -244,7 +264,7 @@ export function Pipeline({ job, layout }: { job: Job; layout: 'board' | 'list' }
           />
         )
       ) : layout === 'board' ? (
-        <div className="ft-board scroll-thin relative -mx-1 overflow-x-auto px-1 pb-2" role="region" aria-label="Pipeline board" tabIndex={-1}>
+        <div className="ft-board scroll-thin relative -mx-1 overflow-x-auto px-1 pb-2" role="region" aria-label="Pipeline board" tabIndex={-1} onFocusCapture={revealFocusedCard}>
           <div className="flex min-w-max gap-3">
             {columns.map((col) => (
               <section key={col.stage.id} aria-label={`${col.stage.name}: ${plural(col.apps.length, 'candidate')}`} className="ft-board__col flex w-[272px] shrink-0 flex-col rounded-2xl bg-surface-2/70 p-2">
@@ -419,8 +439,13 @@ function PipelineCard({
           <Avatar name={name} size={30} className="mt-0.5" />
           <div className="min-w-0 flex-1">
             {/* The name leads the accessible name (label in name); the stage and job say which card it is. */}
-            <a href={links.candidate(app.candidateId)} aria-label={`${name}, ${stage.name}, ${job.title}`} className="block truncate font-bold text-ink hover:text-accent">
-              {name}
+            {/* A 40px-tall target (the card itself only selects); the negative margin keeps the card compact. */}
+            <a
+              href={links.candidate(app.candidateId)}
+              aria-label={`${name}, ${stage.name}, ${job.title}`}
+              className="-my-2 flex min-h-10 min-w-0 items-center font-bold text-ink hover:text-accent"
+            >
+              <span className="truncate">{name}</span>
             </a>
             {(c?.currentTitle || c?.currentCompany) && (
               <p className="truncate text-[13px] text-ink-3">{[c?.currentTitle, c?.currentCompany].filter(Boolean).join(' at ')}</p>
@@ -489,7 +514,7 @@ function PipelineCard({
             onClick={onAdvance}
             className="col-span-2"
             aria-keyshortcuts="A"
-            title={stage.kind === 'offer' ? 'Opens the profile, where the offer and Hire live (A)' : 'Advance to the next stage (A)'}
+            title={stage.kind === 'offer' ? 'Opens their offer on the profile, where Hire lives too (A)' : 'Advance to the next stage (A)'}
           >
             {stage.kind === 'offer' ? (app.conditionalOfferOn ? 'Hire' : 'Open offer') : 'Advance'}
             <KeyHint k="A" />

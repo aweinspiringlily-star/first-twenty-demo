@@ -5,13 +5,15 @@ import { canSeePerson, isInReportingLine } from '@/domain/access'
 import {
   checklistProgress,
   type ChecklistProgress,
+  dueDate,
   dueRuleText,
-  fileBy,
   findTemplate,
   holidayDates,
   mootAfterExit,
   taskDueOn,
+  taskFileBy,
 } from '@/domain/checklists/generate'
+import { TASK_IDS } from '@/domain/checklists/templates'
 import { estimatePaidInYear, form1099ThresholdFor, nextBusinessDay } from '@/domain/compliance'
 import { exerciseDeadline, vestedShares } from '@/domain/equity'
 import { currentJob } from '@/domain/lifecycle'
@@ -44,6 +46,7 @@ import type {
 import { addDays, addMonths, daysBetween, type ISODate, parseDate, quarterOf, today } from '@/lib/dates'
 import { listJoin } from '@/lib/format'
 import { newId } from '@/lib/id'
+import { MAX_RECORD_BYTES } from '@/sync/protocol'
 import { format } from 'date-fns'
 
 // ---------------------------------------------------------------------------------------------
@@ -380,6 +383,19 @@ export const OWNER_LABEL: Record<ChecklistTask['ownerRole'], string> = {
   it: 'IT',
 }
 
+/**
+ * Who a task is with, in words. An assigned admin task belongs to that person while Admin tracks it (supervisor
+ * training: "Owner: Aisha Bello (Admin tracks it)", so it never reads as if they were an admin). A manager task
+ * with no assignee belongs to whoever manages the person now (taskOwnerId in the inbox does the same).
+ */
+export function taskOwnerText(db: DB, checklist: Pick<Checklist, 'personId'>, task: Pick<ChecklistTask, 'ownerRole' | 'assigneeId'>): string {
+  const assignee = task.assigneeId ? db.people.find((p) => p.id === task.assigneeId) : undefined
+  if (assignee && task.ownerRole === 'admin') return `Owner: ${fullName(assignee)} (Admin tracks it)`
+  const managerId = !task.assigneeId && task.ownerRole === 'manager' ? db.people.find((p) => p.id === checklist.personId)?.managerId : undefined
+  const owner = assignee ?? (managerId ? db.people.find((p) => p.id === managerId) : undefined)
+  return `Owner: ${OWNER_LABEL[task.ownerRole]}${owner ? `, ${fullName(owner)}` : ''}`
+}
+
 export type Phase = { key: string; label: string; order: number }
 
 /** Which phase a task belongs to: by day offset from the checklist's anchor, with labels per kind. */
@@ -454,10 +470,16 @@ function unitWord(rule: DueRule): string {
 
 /**
  * Plain explanation of where a due date comes from: '3 business days after Mon Oct 19',
- * 'on the last day, Fri Aug 28', '5 business days after the request on Tue Oct 6'. Falls back to
- * the task's own rule text when the lifecycle set a computed deadline (final pay, return date).
+ * 'on the last day, Fri Aug 28', '5 business days after the request on Tue Oct 6', and for a company
+ * target that fell on a weekend or holiday '90 days after Mon Nov 2, moved to the next business day'.
+ * Falls back to the task's own rule text when the lifecycle set a computed deadline (final pay, return date).
  */
 export function dueExplanation(db: DB, checklist: Checklist, task: ChecklistTask): string {
+  // The sign-on bonus task is added at hire, outside the template: paid with the first paycheck, due on the start date.
+  if (task.templateTaskId === TASK_IDS.signOnBonus) {
+    const start = anchorDateFor(db, checklist, 'start')
+    return task.dueOn === start ? `on the start date, ${dayLabel(start)}` : (task.dueRuleText ?? '')
+  }
   const template = findTemplate(db, checklist.templateId)
   const tt = template?.tasks.find((t) => t.id === task.templateTaskId)
   const fallback = task.dueRuleText ?? ''
@@ -487,23 +509,29 @@ export function dueExplanation(db: DB, checklist: Checklist, task: ChecklistTask
     }
   }
   const amount = `${n} ${unitWord(rule)} ${dir}`
+  // taskDueOn moves a company target off a weekend or holiday (a legal deadline keeps its date): say so, or
+  // '90 days after Mon Nov 2' would explain a date 91 days later.
+  const moved = !task.statutory && dueDate(rule, anchor, holidays) !== computed ? ', moved to the next business day' : ''
   switch (rule.anchor) {
     case 'start':
-      return `${amount} ${d}`
+      return `${amount} ${d}${moved}`
     case 'last_day':
-      return `${amount} the last day, ${d}`
+      return `${amount} the last day, ${d}${moved}`
     case 'leave_start':
-      return `${amount} the leave starts on ${d}`
+      return `${amount} the leave starts on ${d}${moved}`
     case 'created':
-      return `${amount} ${created} on ${d}`
+      return `${amount} ${created} on ${d}${moved}`
     case 'offer_accepted':
-      return `${amount} acceptance on ${d}`
+      return `${amount} acceptance on ${d}${moved}`
   }
 }
 
-/** 'Due Thu Oct 22' or 'Due Sun Nov 15, file by Fri Nov 13', plus the explanation. */
+/**
+ * 'Due Thu Oct 22', or for an agency filing due on a weekend 'Due Sun Nov 8, file by Fri Nov 6'
+ * (taskFileBy: never for final pay or other last-day tasks), plus the explanation.
+ */
 export function dueLine(db: DB, checklist: Checklist, task: ChecklistTask): { label: string; explain: string; full: string } {
-  const by = fileBy(task.dueOn, holidayDates(db))
+  const by = taskFileBy(task, checklist, holidayDates(db))
   const label = by ? `Due ${dayLabel(task.dueOn)}, file by ${dayLabel(by)}` : `Due ${dayLabel(task.dueOn)}`
   const explain = dueExplanation(db, checklist, task)
   return { label, explain, full: explain ? `${task.title} ${label.toLowerCase()} (${explain})` : `${task.title} ${label.toLowerCase()}` }
@@ -518,6 +546,9 @@ const SHORT_TASK: Record<string, string> = {
   'on-welcome': 'welcome email',
   'on-new-state': 'new-state setup',
   'on-i9-section1': 'I-9 section 1',
+  'on-w4-de4': 'W-4 and DE 4',
+  'on-w4-state': 'W-4',
+  'on-sign-on-bonus': 'sign-on bonus',
   'on-i9-section2': 'I-9 section 2',
   'on-de34': 'DE 34',
   'on-state-new-hire-report': 'new hire report',
@@ -861,6 +892,48 @@ export function titleFromScope(scope: string): string {
 /** The employee a contractor was converted to, when that record still exists. */
 export function convertedPerson(db: Pick<DB, 'people'>, c: Pick<Contractor, 'convertedToPersonId'>): Person | undefined {
   return c.convertedToPersonId ? db.people.find((p) => p.id === c.convertedToPersonId) : undefined
+}
+
+// ---------------------------------------------------------------------------------------------
+// Field limits (sync takes at most MAX_RECORD_BYTES per record)
+// ---------------------------------------------------------------------------------------------
+
+/** The longest one-line field the People forms take (names, a reason, a task note); pasted text is cut there. */
+export const LINE_MAX_CHARS = 300
+
+/** The longest link (evidence, document links). */
+export const LINK_MAX_CHARS = 2_000
+
+/** The longest scope of work a contractor or advisor takes (maxLength). It is meant to be a line or two. */
+export const SCOPE_MAX_CHARS = 2_000
+
+/** '1,850 of 2,000 characters' once a scope gets near the limit, else null. */
+export function scopeCountText(scope: string): string | null {
+  return scope.length >= SCOPE_MAX_CHARS * 0.9 ? `${scope.length.toLocaleString('en-US')} of ${SCOPE_MAX_CHARS.toLocaleString('en-US')} characters` : null
+}
+
+/** True when a contractor record is over what the server takes for one record, so it can never sync. */
+export function contractorTooLarge(c: Contractor): boolean {
+  return new TextEncoder().encode(JSON.stringify(c)).length > MAX_RECORD_BYTES
+}
+
+/**
+ * Why a contractor cannot be saved for its size: a scope over SCOPE_MAX_CHARS, or a record too large to sync.
+ * Pass `scopeChanged: false` when the scope was not edited, so an older long one does not block other edits
+ * (the record check still applies).
+ */
+export function contractorSizeError(c: Contractor, opts: { scopeChanged?: boolean } = {}): string | undefined {
+  if (opts.scopeChanged !== false && c.scope.length > SCOPE_MAX_CHARS) {
+    return `A scope of work can be up to ${SCOPE_MAX_CHARS.toLocaleString('en-US')} characters. Shorten this one.`
+  }
+  if (contractorTooLarge(c)) return 'This contractor is too large to sync. Shorten the scope of work.'
+  return undefined
+}
+
+/** A scope as a one-line summary for a page subtitle or a hint: the first line, cut to `max` characters. */
+export function scopeSummary(scope: string, max = 160): string {
+  const line = scope.trim().split(/\r?\n/)[0].replace(/\s+/g, ' ')
+  return line.length <= max ? line : `${line.slice(0, max - 3).trimEnd()}...`
 }
 
 // ---------------------------------------------------------------------------------------------

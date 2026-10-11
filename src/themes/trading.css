@@ -2950,13 +2950,20 @@
     color: var(--ink);
   }
 
+  /* Section links carry no keycap (no key opens them), so they get even padding. */
+  &.ft-tr-fkey:not(:has(> .ft-tr-fkey__key)) {
+    padding-left: 12px;
+  }
+
+  /* The current section is marked by an amber frame and a lit edge, so the bar still reads as a
+     position indicator and solid amber stays scarce. */
   &.ft-tr-fkey[aria-current="page"] {
     border-color: var(--tr-amber);
+    box-shadow: inset 3px 0 0 var(--tr-amber);
     color: var(--ink);
   }
 
-  /* Unlit caps: amber legends on dark keys. Only the current section's cap is lit, so the bar reads
-     as a position indicator and solid amber stays scarce. */
+  /* An unlit cap: an amber legend on a dark key, only for a key that really works (Search: Ctrl K). */
   &.ft-tr-fkey__key {
     min-width: 26px;
     padding: 2px 4px;
@@ -2966,12 +2973,6 @@
     border-radius: 1px;
     text-align: center;
     letter-spacing: 0;
-  }
-
-  [aria-current="page"] > &.ft-tr-fkey__key {
-    background: var(--tr-amber);
-    color: var(--tr-amber-ink);
-    box-shadow: none;
   }
 }
 

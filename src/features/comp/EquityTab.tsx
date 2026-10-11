@@ -1,15 +1,17 @@
 // Equity planning view (docs/SPEC.md, EQUITY PLANNING VIEW and OFFER TO BOARD-APPROVED GRANT): pool
-// summary, upcoming cliffs, the board consent queue (Copy consent table, Mark approved with the board date),
-// grants with vesting, 409A history with warnings, and the 25102(o) note. The cap table tool stays the
-// source of truth.
+// summary with the cap table numbers (Edit cap table), upcoming cliffs, the board consent queue (Copy
+// consent table, Mark approved with the board date), grants with vesting, 409A history with warnings
+// (Record 409A, edit or remove), and the 25102(o) note. The cap table tool stays the source of truth.
 import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import {
   approveGrants,
   boardConsentQueue,
   cancellationPending,
+  capTableIsPlaceholder,
   consentTableText,
   current409A,
+  grantNeeds409A,
   holderName,
   pctOfFullyDiluted,
   poolSummary,
@@ -18,13 +20,14 @@ import {
   valuationWarnings,
   vestedHeld,
 } from '@/domain/equity'
-import type { EquityGrant, ID } from '@/domain/types'
-import { addDays, daysBetween, fmtDate, today } from '@/lib/dates'
+import type { EquityGrant, ID, Valuation409A } from '@/domain/types'
+import { addDays, daysBetween, fmtDate, fmtShort, type ISODate, today } from '@/lib/dates'
 import { copyText } from '@/lib/files'
-import { money2, num, pct } from '@/lib/format'
+import { listJoin, money2, num, pct } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
-import { Avatar, Badge, Button, Callout, Checkbox, CitationChip, DataTable, DateChips, EmptyState, Panel, Private, Segmented, toast, type Column } from '@/ui'
+import { Avatar, Badge, Button, Callout, Checkbox, CitationChip, DataTable, DateChips, EmptyState, IconButton, Panel, Private, Segmented, toast, type Column } from '@/ui'
+import { CapTableSheet, ValuationSheet } from './EquitySetup'
 import { cliffCards } from './helpers'
 
 const SOURCES = {
@@ -94,6 +97,11 @@ export function EquityTab() {
   const cliffs = useMemo(() => cliffCards(db, date, 365), [db, date])
   const v = current409A(db, date)
   const [show, setShow] = useState<'active' | 'all'>('active')
+  // The 409A sheet: a new valuation (optionally starting on a board date) or one on file to correct.
+  const [valuationSheet, setValuationSheet] = useState<{ valuation?: Valuation409A; effectiveOn?: ISODate } | null>(null)
+  const [capOpen, setCapOpen] = useState(false)
+  const placeholder = capTableIsPlaceholder(db)
+  const record409A = (effectiveOn?: ISODate) => setValuationSheet(effectiveOn ? { effectiveOn } : {})
   // A leaver's grant still holds its shares until the cancellation date (their last day), so it stays listed.
   const grants = db.grants
     .filter((g) => show === 'all' || g.status !== 'cancelled' || cancellationPending(g, date))
@@ -180,11 +188,35 @@ export function EquityTab() {
             , <Private>{pct(pool.poolShares / Math.max(1, db.equity.fullyDilutedShares))}</Private> of fully diluted
           </>
         }
+        actions={
+          // While the numbers are placeholders, the button sits in the callout that says so.
+          placeholder ? undefined : (
+            <Button icon="edit" onClick={() => setCapOpen(true)}>
+              Edit cap table
+            </Button>
+          )
+        }
       >
+        {placeholder && (
+          <Callout tone="warn" className="mb-3" title="Placeholder numbers: check these against your cap table tool">
+            Start fresh filled in an example cap table. Percentages of fully diluted shares are estimates, and offer letters give the share
+            count only until you enter or confirm the real numbers.
+            {/* Below the text, not beside it: at phone width a side button would squeeze the text into a sliver. */}
+            <span className="mt-2 flex">
+              <Button size="sm" icon="edit" onClick={() => setCapOpen(true)}>
+                Edit cap table
+              </Button>
+            </span>
+          </Callout>
+        )}
         <PoolBar segments={segments} total={pool.poolShares} />
-        <p className="mt-3 text-[13px] text-ink-3">
-          <Private>{num(pool.returned)}</Private> options came back to the pool from people who left before vesting. The cap table tool is the
-          source of truth for issued options.
+        <p className="mt-3 text-[13px] text-ink-2">
+          Cap table: <Private>{num(db.equity.fullyDilutedShares)}</Private> fully diluted, <Private>{num(db.equity.founderShares)}</Private> founder
+          shares, <Private>{num(db.equity.authorizedShares)}</Private> authorized.
+        </p>
+        <p className="mt-1 text-[13px] text-ink-3">
+          <Private>{num(pool.returned)}</Private> unvested options came back to the pool from people who left. The cap table tool is the source
+          of truth for issued options.
         </p>
         {pool.available < 0 && (
           <Callout tone="bad" className="mt-3" title="The pool is overcommitted">
@@ -199,7 +231,7 @@ export function EquityTab() {
         )}
       </Panel>
 
-      <BoardQueue queue={queue} />
+      <BoardQueue queue={queue} onRecord409A={record409A} />
 
       <Panel title="Upcoming cliffs" icon="calendar" subtitle="Next 12 months">
         {cliffs.length === 0 ? (
@@ -262,13 +294,22 @@ export function EquityTab() {
       </Panel>
 
       <div className="grid grid-cols-1 gap-5 @[640px]:grid-cols-2">
-        <Panel title="409A valuations" icon="scale" padded={false}>
+        <Panel
+          title="409A valuations"
+          icon="scale"
+          padded={false}
+          actions={
+            <Button icon="plus" onClick={() => record409A()}>
+              Record 409A
+            </Button>
+          }
+        >
           <DataTable
             rows={[...db.equity.valuations].sort((a, b) => b.effectiveOn.localeCompare(a.effectiveOn))}
             rowKey={(r) => r.id}
             dense
             caption="409A valuation history"
-            empty={<EmptyState compact title="No 409A on file" body="Get a valuation before the board grants options." />}
+            empty={<EmptyState compact title="No 409A on file" body="Record the valuation report here before the board grants options." />}
             columns={[
               { key: 'eff', header: 'Effective', cell: (r) => <span className="whitespace-nowrap">{fmtDate(r.effectiveOn)}</span> },
               { key: 'fmv', header: 'Price a share', align: 'right', cell: (r) => <Private>{money2(r.fmvPerShare)}</Private> },
@@ -284,6 +325,12 @@ export function EquityTab() {
                   ),
               },
               { key: 'prov', header: 'Provider', hideBelow: 'md', cell: (r) => r.provider },
+              {
+                key: 'edit',
+                header: <span className="sr-only">Edit</span>,
+                align: 'right',
+                cell: (r) => <IconButton icon="edit" size="sm" label={`Edit the 409A from ${fmtDate(r.effectiveOn)}`} onClick={() => setValuationSheet({ valuation: r })} />,
+              },
             ]}
           />
           <div className="flex flex-col gap-2 px-5 py-4">
@@ -306,39 +353,59 @@ export function EquityTab() {
         </Panel>
         <Notice25102o />
       </div>
+      <ValuationSheet
+        open={!!valuationSheet}
+        onClose={() => setValuationSheet(null)}
+        valuation={valuationSheet?.valuation}
+        effectiveOn={valuationSheet?.effectiveOn}
+      />
+      <CapTableSheet open={capOpen} onClose={() => setCapOpen(false)} />
     </div>
   )
 }
 
-function BoardQueue({ queue }: { queue: EquityGrant[] }) {
+function BoardQueue({ queue, onRecord409A }: { queue: EquityGrant[]; onRecord409A: (effectiveOn?: ISODate) => void }) {
   const db = useDB((s) => s.db)
   const date = today()
   // Every waiting grant is included unless unticked, so new arrivals join the next consent.
   const [excluded, setExcluded] = useState<ID[]>([])
   const [boardDate, setBoardDate] = useState(date)
   const ids = queue.map((g) => g.id).filter((id) => !excluded.includes(id))
+  const selected = queue.filter((g) => ids.includes(g.id))
   const fmv = current409A(db, boardDate)?.fmvPerShare
-  const warnings = valuationWarnings(db, boardDate).filter((w) => w.kind !== 'strike')
-  const totalShares = queue.filter((g) => ids.includes(g.id)).reduce((t, g) => t + g.shares, 0)
+  // Option grants with no strike wait for a 409A in effect on the board date (approveGrants skips them).
+  const needs409A = selected.filter((g) => grantNeeds409A(db, g, boardDate))
+  const allNeed409A = selected.length > 0 && needs409A.length === selected.length
+  const warnings = valuationWarnings(db, boardDate).filter((w) => w.kind !== 'strike' && !(w.kind === 'missing' && needs409A.length))
+  const totalShares = selected.reduce((t, g) => t + g.shares, 0)
+  const first = (g: EquityGrant) => holderName(db, g).split(' ')[0]
 
   const copy = async () => {
     const ok = await copyText(consentTableText(db, ids, boardDate))
     toast(ok ? `Consent table copied (${ids.length} ${ids.length === 1 ? 'grant' : 'grants'})` : { text: 'Copying is blocked here', tone: 'bad' })
   }
   const approve = () => {
-    if (!ids.length) return
-    const names = queue.filter((g) => ids.includes(g.id)).map((g) => holderName(db, g).split(' ')[0])
-    const label = `Marked ${ids.length === 1 ? `${names[0]}'s grant` : `${ids.length} grants`} board approved (${fmtDate(boardDate)})`
+    const ready = selected.filter((g) => !grantNeeds409A(db, g, boardDate))
+    if (!ready.length) return
+    const label = `Marked ${ready.length === 1 ? `${first(ready[0])}'s grant` : `${ready.length} grants`} board approved (${fmtDate(boardDate)})`
     let result: ReturnType<typeof approveGrants> | null = null
     useDB.getState().mutate(label, (draft) => {
       result = approveGrants(draft, ids, boardDate, { date })
     })
-    toast({ text: label, action: { label: 'Undo', onClick: () => useDB.getState().undo() } })
     const r = result as ReturnType<typeof approveGrants> | null
-    if (r?.firstIssuance && r.notice25102oDueOn) {
+    if (!r) return
+    // Success (with Undo) only for what was approved; the rest says why it was left.
+    if (r.approved.length) toast({ text: label, action: { label: 'Undo', onClick: () => useDB.getState().undo() } })
+    if (r.noStrike.length) {
+      const names = r.noStrike.map((id) => queue.find((g) => g.id === id)).filter((g): g is EquityGrant => !!g).map(first)
+      const what = names.length === 1 ? `${names[0]}'s option grant was` : `${names.length} option grants (${listJoin(names)}) were`
+      toast({ text: `${what} not approved: no 409A is in effect on ${fmtShort(boardDate)}. Record a 409A first.`, tone: 'bad' })
+    }
+    const more = r.noStrike.length ? r.warnings.slice(1) : r.warnings
+    if (r.firstIssuance && r.notice25102oDueOn) {
       toast({ text: `First option grant: file the 25102(o) notice by ${fmtDate(r.notice25102oDueOn)}`, tone: 'neutral' })
-    } else if (r?.warnings.length) {
-      toast({ text: r.warnings[0], tone: 'neutral' })
+    } else if (more.length) {
+      toast({ text: more[0], tone: 'neutral' })
     }
   }
 
@@ -392,6 +459,22 @@ function BoardQueue({ queue }: { queue: EquityGrant[] }) {
               ]}
             />
           </div>
+          {needs409A.length > 0 && (
+            <Callout
+              tone={allNeed409A ? 'bad' : 'warn'}
+              title="Record a 409A first: options are priced at fair market value on the grant date"
+              action={
+                <Button size="sm" icon="plus" onClick={() => onRecord409A(boardDate)}>
+                  Record 409A
+                </Button>
+              }
+            >
+              No 409A is in effect on {fmtDate(boardDate)}, so{' '}
+              {needs409A.length === 1 ? `${first(needs409A[0])}'s option grant has` : `${needs409A.length} option grants (${listJoin(needs409A.map(first))}) have`} no
+              strike price yet.
+              {allNeed409A ? ' Mark approved works once a valuation is on file.' : ' Mark approved approves the others and leaves these waiting.'}
+            </Callout>
+          )}
           {warnings.map((w) => (
             <Callout key={`${w.kind}-${w.roundId ?? w.valuationId ?? ''}`} tone="warn">
               {w.text}
@@ -402,7 +485,7 @@ function BoardQueue({ queue }: { queue: EquityGrant[] }) {
             <Button icon="copy" onClick={copy} disabled={!ids.length}>
               Copy consent table
             </Button>
-            <Button variant="primary" size="lg" icon="check" onClick={approve} disabled={!ids.length}>
+            <Button variant="primary" size="lg" icon="check" onClick={approve} disabled={!ids.length || allNeed409A}>
               Mark approved
             </Button>
             <span className="text-[13px] text-ink-3">

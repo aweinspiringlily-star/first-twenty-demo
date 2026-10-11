@@ -13,6 +13,7 @@ import type {
   PutWorkspaceResponse,
   SyncUser,
   WorkspaceSnapshot,
+  WorkspaceStatus,
 } from './protocol'
 
 export type ApiErrorKind =
@@ -20,7 +21,7 @@ export type ApiErrorKind =
   | 'signed_out' // 401 on anything but login
   | 'invalid_credentials' // 401 on login
   | 'rate_limited' // 429
-  | 'empty' // GET /api/workspace before the first upload
+  | 'empty' // GET /api/workspace before the first upload (GET /api/workspace/status says so without an error)
   | 'not_empty' // PUT /api/workspace without confirmReplace on a server that has data
   | 'resync' // 409 {error: 'resync'} on POST /api/changes: the server's history changed (replace or restore)
   | 'too_large' // 413
@@ -55,12 +56,36 @@ export type PushOptions = {
  */
 export type LoginOptions = { remember?: boolean }
 
+/**
+ * What workspaceStatus() learned. snapshot: the whole workspace, when a server from before the status
+ * route had to be asked for it (GET /api/workspace), so the caller need not fetch it again.
+ */
+export type WorkspaceStatusResult = Extract<WorkspaceStatus, { empty: true }> | (Extract<WorkspaceStatus, { empty: false }> & { snapshot?: WorkspaceSnapshot })
+
+/** fallback: on a server from before the status route, ask GET /api/workspace instead (default true). */
+export type WorkspaceStatusOptions = { fallback?: boolean }
+
 export type SyncApi = {
   health(): Promise<ApiResult<HealthResponse>>
   login(email: string, password: string, opts?: LoginOptions): Promise<ApiResult<{ user: SyncUser }>>
   logout(): Promise<ApiResult<null>>
+  /** GET /api/auth/me: 401 (kind 'signed_out') when there is no session. */
   me(): Promise<ApiResult<{ user: SyncUser }>>
+  /**
+   * Who is signed in, without an error when nobody is: GET /api/auth/session answers {user: null} instead
+   * of a 401 (which browsers log as a console error on every page load). A server from before that route
+   * answers 404: then /api/auth/me is asked instead, and its 401 becomes {user: null}.
+   */
+  session(): Promise<ApiResult<{ user: SyncUser | null }>>
   getWorkspace(): Promise<ApiResult<WorkspaceSnapshot>>
+  /**
+   * Whether the server holds a workspace, without an error when it does not: GET /api/workspace/status
+   * answers {empty: true} where GET /api/workspace answers 404 (a console error on every look at an empty
+   * server). A server from before that route answers 404: from then on GET /api/workspace is asked
+   * instead (its 'empty' becomes {empty: true}, and a workspace comes along as `snapshot`), or, with
+   * fallback false, the answer is kind 'not_found' without asking.
+   */
+  workspaceStatus(opts?: WorkspaceStatusOptions): Promise<ApiResult<WorkspaceStatusResult>>
   putWorkspace(db: DB, confirmReplace?: boolean): Promise<ApiResult<PutWorkspaceResponse>>
   /** historyId: the one this client last saw; a different current history answers {resync: true}. */
   getChanges(since: number, historyId?: string | null): Promise<ApiResult<ChangesResponse>>
@@ -147,6 +172,13 @@ export function createApi(options: ApiOptions = {}): SyncApi {
     return errorFor(res, isJSON ? json : null, spec.login === true)
   }
 
+  const me = () => request<{ user: SyncUser }>({ method: 'GET', path: '/api/auth/me', timeoutMs, parse: parseUserBody })
+  /** False once the server answered 404 to /api/auth/session (it predates the route). */
+  let sessionRoute = true
+  const getWorkspace = () => request<WorkspaceSnapshot>({ method: 'GET', path: '/api/workspace', timeoutMs: longTimeoutMs, parse: parseSnapshot })
+  /** False once the server answered 404 to /api/workspace/status (it predates the route). */
+  let statusRoute = true
+
   return {
     health: () =>
       request<HealthResponse>({
@@ -169,8 +201,36 @@ export function createApi(options: ApiOptions = {}): SyncApi {
       request<true>({ method: 'POST', path: '/api/auth/logout', timeoutMs, parse: () => true }).then((r): ApiResult<null> =>
         r.ok ? { ok: true, status: r.status, data: null } : r,
       ),
-    me: () => request<{ user: SyncUser }>({ method: 'GET', path: '/api/auth/me', timeoutMs, parse: parseUserBody }),
-    getWorkspace: () => request<WorkspaceSnapshot>({ method: 'GET', path: '/api/workspace', timeoutMs: longTimeoutMs, parse: parseSnapshot }),
+    me,
+    session: async () => {
+      if (sessionRoute) {
+        const r = await request<{ user: SyncUser | null }>({ method: 'GET', path: '/api/auth/session', timeoutMs, parse: parseSessionBody })
+        if (r.ok) return r
+        if (r.kind === 'signed_out') return { ok: true, status: r.status ?? 401, data: { user: null } }
+        if (r.kind !== 'not_found') return r
+        // A server from before /api/auth/session: ask it the old way from now on.
+        sessionRoute = false
+      }
+      const r = await me()
+      if (r.ok) return r
+      return r.kind === 'signed_out' ? { ok: true, status: r.status ?? 401, data: { user: null } } : r
+    },
+    getWorkspace,
+    workspaceStatus: async (opts) => {
+      if (statusRoute) {
+        const r = await request<WorkspaceStatusResult>({ method: 'GET', path: '/api/workspace/status', timeoutMs, parse: parseWorkspaceStatus })
+        if (r.ok || r.kind !== 'not_found') return r
+        // A server from before /api/workspace/status: ask it the old way from now on.
+        statusRoute = false
+      }
+      if (opts?.fallback === false) return failure('not_found', 404, 'not_found')
+      const snap = await getWorkspace()
+      if (snap.ok) {
+        const { workspaceId, historyId, seq } = snap.data
+        return { ok: true, status: snap.status, data: { empty: false, workspaceId, ...(historyId ? { historyId } : {}), seq, snapshot: snap.data } }
+      }
+      return snap.kind === 'empty' ? { ok: true, status: snap.status ?? 404, data: { empty: true } } : snap
+    },
     putWorkspace: (db, confirmReplace) =>
       request<PutWorkspaceResponse>({
         method: 'PUT',
@@ -255,6 +315,14 @@ function parseUserBody(j: unknown): { user: SyncUser } | null {
   return user ? { user } : null
 }
 
+/** {user: SyncUser | null} from GET /api/auth/session. */
+function parseSessionBody(j: unknown): { user: SyncUser | null } | null {
+  if (!isObj(j) || !('user' in j)) return null
+  if (j.user === null) return { user: null }
+  const user = parseUser(j.user)
+  return user ? { user } : null
+}
+
 function parseVersions(v: unknown): Record<string, number> | null {
   if (!isObj(v)) return null
   const out: Record<string, number> = {}
@@ -274,6 +342,18 @@ function parseSnapshot(j: unknown): WorkspaceSnapshot | null {
   const historyId = str(j.historyId)
   if (historyId) snap.historyId = historyId
   return snap
+}
+
+/** {empty: true}, or {empty: false, workspaceId, historyId?, seq} from GET /api/workspace/status. */
+function parseWorkspaceStatus(j: unknown): WorkspaceStatusResult | null {
+  if (!isObj(j)) return null
+  if (j.empty === true) return { empty: true }
+  if (j.empty !== false) return null
+  const seq = num(j.seq)
+  if (seq === null) return null
+  const historyId = str(j.historyId)
+  const workspaceId = typeof j.workspaceId === 'string' ? j.workspaceId : 'default'
+  return historyId ? { empty: false, workspaceId, historyId, seq } : { empty: false, workspaceId, seq }
 }
 
 function parseChange(c: unknown): Change | null {
@@ -311,12 +391,15 @@ function parsePostChanges(j: unknown): PostChangesResponse | null {
   for (const a of j.applied) {
     const version = isObj(a) ? num(a.version) : null
     if (!isObj(a) || typeof a.collection !== 'string' || typeof a.id !== 'string' || version === null) return null
-    applied.push({ collection: a.collection, id: a.id, version })
+    applied.push(a.existing === true ? { collection: a.collection, id: a.id, version, existing: true } : { collection: a.collection, id: a.id, version })
   }
   const conflicts: Conflict[] = []
   for (const c of j.conflicts) {
     if (!isObj(c) || typeof c.collection !== 'string' || typeof c.id !== 'string') return null
-    conflicts.push({ collection: c.collection, id: c.id, serverVersion: num(c.serverVersion), serverData: c.serverData ?? null })
+    const conflict: Conflict = { collection: c.collection, id: c.id, serverVersion: num(c.serverVersion), serverData: c.serverData ?? null }
+    if (c.byYou === true) conflict.byYou = true
+    if (c.landed === true) conflict.landed = true
+    conflicts.push(conflict)
   }
   const historyId = str(j.historyId)
   return historyId ? { historyId, seq, applied, conflicts } : { seq, applied, conflicts }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { generateChecklist } from '@/domain/checklists/generate'
 import { calendarICS, complianceCalendar, contractors1099, estimatePaidInYear, nextBusinessDay } from './calendar'
 import { addContractor, addMany, addPerson, ledgerlarkLite, makeDB } from './testkit'
 
@@ -158,17 +159,73 @@ describe('fixes from review', () => {
     expect(de542[0].detail).toContain('$600 or more in a calendar year')
   })
 
+  it('an estimated DE 1 date is a guide, not a legal deadline, and a saved EDD account number closes it', () => {
+    const db = makeDB('2026-01-01')
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    const est = complianceCalendar(db, '2026-11-01', '2026-11-30').find((i) => i.ruleId === 'edd-registration')
+    expect(est).toMatchObject({ date: '2026-11-17', title: 'EDD employer registration (DE 1): estimated due date', statutory: false, done: false })
+    db.company.firstPayrollOn = '2026-11-13'
+    const exact = complianceCalendar(db, '2026-11-01', '2026-11-30').find((i) => i.ruleId === 'edd-registration')
+    expect(exact).toMatchObject({ date: '2026-11-28', title: 'EDD employer registration (DE 1): due', statutory: true, done: false })
+    // Sat Nov 28 after the Thanksgiving holidays (Nov 26 and 27): file by Wed Nov 25, as the DE 34 task does.
+    expect(exact?.fileBy).toBe('2026-11-25')
+    expect(est?.fileBy).toBeUndefined()
+    expect(calendarICS([exact as NonNullable<typeof exact>])).toContain('File by Nov 25\\, 2026.')
+    db.company.eddAccountNumber = '123-4567-8'
+    expect(complianceCalendar(db, '2026-11-01', '2026-11-30').find((i) => i.ruleId === 'edd-registration')?.done).toBe(true)
+  })
+
+  it("dates a hire's DE 34 with its file-by day and names whose it is", () => {
+    const db = makeDB('2026-01-01')
+    const maria = addPerson(db, { id: 'p-maria', firstName: 'Maria', lastName: 'Gonzalez', startDate: '2026-11-02' })
+    db.checklists.push(generateChecklist(db, { id: 'ck-maria', person: maria, templateId: 'tpl-onboarding', anchorDate: '2026-11-02', createdOn: '2026-10-11' }))
+    const items = complianceCalendar(db, '2026-11-01', '2026-11-30')
+    // Due Sun Nov 22, file by Fri Nov 20, as the checklist task says.
+    expect(items.find((i) => i.ruleId === 'new-hire-reporting')).toMatchObject({
+      date: '2026-11-22',
+      title: 'New hire reporting (DE 34): due for Maria Gonzalez',
+      statutory: true,
+      fileBy: '2026-11-20',
+    })
+    expect(items.find((i) => i.ruleId === 'form-i9')).toMatchObject({ date: '2026-11-02', title: 'Form I-9 for every employee: due for Maria Gonzalez' })
+    expect(items.find((i) => i.ruleId === 'form-i9')?.fileBy).toBeUndefined()
+  })
+
+  it('says what the 25102(o) deadline is for, not that a grant is due', () => {
+    const db = makeDB('2026-01-01')
+    db.equity.firstIssuanceOn = '2026-10-11'
+    const item = complianceCalendar(db, '2026-10-11', '2026-12-31').find((i) => i.ruleId === 'first-option-grant' && i.kind === 'rule_deadline')
+    expect(item).toMatchObject({ date: '2026-11-10', title: 'First stock option grant: file the 25102(o) notice with the DFPI', statutory: true })
+  })
+
   it('the SB 294 calendar item is done when both yearly actions were ticked on the rule card', () => {
     const db = makeDB('2025-01-06')
+    addMany(db, 1, '2025-03-03')
     db.complianceStatus['sb294-annual-notice'] = { actionsDone: { 'send-annual@2027': '2027-01-20', 'record-dates@2027': '2027-01-20' } }
     const item = complianceCalendar(db, '2027-01-01', '2027-02-28').find((i) => i.kind === 'sb294_notice')
     expect(item).toMatchObject({ id: 'sb294-2027', done: true })
   })
 })
 
+describe('yearly employee notices', () => {
+  it('starts with the first employee who is not an unpaid owner', () => {
+    const db = makeDB('2026-01-01')
+    const notices = (from: string, to: string) => complianceCalendar(db, from, to).filter((i) => i.kind === 'sb294_notice' || i.kind === 'victims_notice')
+    // A solo founder with no pay owed nothing on Feb 1, 2026, and nothing is listed for Feb 1, 2027 yet.
+    expect(notices('2026-01-01', '2027-03-31')).toEqual([])
+    // A hire starting Nov 2, 2026 gets the notice at hire; the first yearly one is Feb 1, 2027.
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    expect(notices('2026-01-01', '2027-03-31').map((i) => [i.kind, i.date])).toEqual([
+      ['sb294_notice', '2027-02-01'],
+      ['victims_notice', '2027-02-01'],
+    ])
+  })
+})
+
 describe('ics export', () => {
   it('writes all-day events', () => {
     const db = makeDB('2026-10-05')
+    db.company.firstPayrollOn = '2026-10-05'
     const items = complianceCalendar(db, '2026-10-05', '2026-10-31')
     const ics = calendarICS(items)
     expect(ics).toContain('BEGIN:VCALENDAR')

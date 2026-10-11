@@ -5,7 +5,7 @@
 // next workspace-wide seq as its version, so a record's next version is rarely its old one plus 1.
 // Test-only: nothing in the app imports it.
 import type { DB } from '@/domain/types'
-import type { ApiFailure, ApiResult, PushOptions, SyncApi } from '../api'
+import type { ApiFailure, ApiResult, PushOptions, SyncApi, WorkspaceStatusOptions, WorkspaceStatusResult } from '../api'
 import { DOC_COLLECTION, DOC_KEYS, isDocKey, isRecordCollection, RECORD_COLLECTIONS } from '../collections'
 import {
   type Applied,
@@ -21,13 +21,16 @@ import {
   type WorkspaceSnapshot,
 } from '../protocol'
 
-type Row = { collection: string; id: string; version: number; data: unknown }
+/** by: the user who wrote it (null: unknown, like a row from before users). */
+type Row = { collection: string; id: string; version: number; data: unknown; by: string | null }
 
 const wire = <T>(v: T): T => (v === undefined ? v : (JSON.parse(JSON.stringify(v)) as T))
 
 export const TEST_ADMIN_EMAIL = 'admin@example.test'
 /** A test-only value; the fake server has no real accounts. */
 export const TEST_ADMIN_PASSWORD = 'test-only-not-a-secret'
+/** The user serverUpsert and serverDelete write as unless told otherwise: someone other than the admin. */
+export const OTHER_USER_ID = '00000000-0000-4000-8000-000000000002'
 
 export class FakeServer implements SyncApi {
   online = true
@@ -43,10 +46,17 @@ export class FakeServer implements SyncApi {
   historyId = 'history-1'
   /** False acts like a server from before history ids: none sent, none checked. */
   historyIds = true
+  /**
+   * False acts like a server from before GET /api/workspace/status: workspaceStatus answers as the app's
+   * client does then (it asks getWorkspace instead, or says not_found without the fallback).
+   */
+  statusRoute = true
   private histories = 1
   rows = new Map<string, Row>()
   lastVersion = new Map<string, number>()
   lastOp = new Map<string, 'upsert' | 'delete'>()
+  /** Who wrote each record's newest change (its upsert or its delete). */
+  lastBy = new Map<string, string | null>()
   log: Change[] = []
   /** Every call, in order, and when it was made (Date.now(), fake timers in tests). */
   calls: string[] = []
@@ -100,6 +110,10 @@ export class FakeServer implements SyncApi {
     return this.gate('me', true, () => ({ ok: true, status: 200, data: { user: { ...this.user } } }))
   }
 
+  session(): Promise<ApiResult<{ user: SyncUser | null }>> {
+    return this.gate('session', false, () => ({ ok: true, status: 200, data: { user: this.signedIn ? { ...this.user } : null } }))
+  }
+
   getWorkspace(): Promise<ApiResult<WorkspaceSnapshot>> {
     return this.gate<WorkspaceSnapshot>('getWorkspace', true, () => {
       this.onGetWorkspace?.()
@@ -108,6 +122,22 @@ export class FakeServer implements SyncApi {
       if (this.historyIds) snap.historyId = this.historyId
       return { ok: true, status: 200, data: snap }
     })
+  }
+
+  async workspaceStatus(opts?: WorkspaceStatusOptions): Promise<ApiResult<WorkspaceStatusResult>> {
+    if (!this.statusRoute) {
+      this.calls.push('workspaceStatus')
+      this.callTimes.push(Date.now())
+      if (opts?.fallback === false) return { ok: false, kind: 'not_found', status: 404, error: 'not_found' }
+      const snap = await this.getWorkspace()
+      if (snap.ok) return { ok: true, status: 200, data: { empty: false, workspaceId: snap.data.workspaceId, seq: snap.data.seq, snapshot: snap.data } }
+      return snap.kind === 'empty' ? { ok: true, status: 404, data: { empty: true } } : snap
+    }
+    return this.gate<WorkspaceStatusResult>('workspaceStatus', true, () =>
+      this.hasWorkspace
+        ? { ok: true, status: 200, data: { empty: false, workspaceId: 'default', seq: this.seq, ...this.history() } }
+        : { ok: true, status: 200, data: { empty: true } },
+    )
   }
 
   putWorkspace(db: DB, confirmReplace?: boolean): Promise<ApiResult<PutWorkspaceResponse>> {
@@ -119,9 +149,10 @@ export class FakeServer implements SyncApi {
       this.rows.clear()
       this.lastVersion.clear()
       this.lastOp.clear()
-      for (const k of DOC_KEYS) if (src[k] !== undefined) this.write(DOC_COLLECTION, k, src[k])
+      this.lastBy.clear()
+      for (const k of DOC_KEYS) if (src[k] !== undefined) this.write(DOC_COLLECTION, k, src[k], this.user.id)
       for (const c of RECORD_COLLECTIONS) {
-        for (const r of (src[c] as Array<{ id: string }>) ?? []) this.write(c, r.id, r)
+        for (const r of (src[c] as Array<{ id: string }>) ?? []) this.write(c, r.id, r, this.user.id)
       }
       // A replace starts a new log: every other client has to resync.
       this.minSeq = this.seq
@@ -163,13 +194,29 @@ export class FakeServer implements SyncApi {
       const applied: Applied[] = []
       const conflicts: Conflict[] = []
       // The same rules as server/src/repo.ts applyChanges.
+      const byYou = (by: string | null | undefined) => (by === this.user.id ? { byYou: true as const } : {})
+      // This exact upsert is in the log after its base (the real server forgets a record's rows on delete).
+      const landed = (ch: ClientChange) => {
+        if (ch.op !== 'upsert') return {}
+        const json = JSON.stringify(ch.data)
+        let found = false
+        for (const c of this.log) {
+          if (c.collection !== ch.collection || c.id !== ch.id) continue
+          if (c.op === 'delete') found = false
+          else if (c.seq > (ch.baseVersion ?? 0) && JSON.stringify(c.data) === json) found = true
+        }
+        return found ? { landed: true as const } : {}
+      }
       for (const ch of changes) {
         const key = recordKey(ch.collection, ch.id)
         const row = this.rows.get(key)
         if (row) {
           if (ch.baseVersion !== row.version) {
-            if (ch.op === 'upsert' && JSON.stringify(row.data) === JSON.stringify(ch.data)) applied.push({ collection: ch.collection, id: ch.id, version: row.version })
-            else conflicts.push({ collection: ch.collection, id: ch.id, serverVersion: row.version, serverData: wire(row.data) })
+            if (ch.op === 'upsert' && JSON.stringify(row.data) === JSON.stringify(ch.data)) {
+              applied.push({ collection: ch.collection, id: ch.id, version: row.version, existing: true })
+            } else {
+              conflicts.push({ collection: ch.collection, id: ch.id, serverVersion: row.version, serverData: wire(row.data), ...byYou(row.by), ...landed(ch) })
+            }
             continue
           }
         } else {
@@ -178,13 +225,15 @@ export class FakeServer implements SyncApi {
             applied.push({ collection: ch.collection, id: ch.id, version: this.lastVersion.get(key) ?? 0 })
             continue
           }
-          const lastWasDelete = this.lastOp.get(key) === 'delete'
-          if (ch.baseVersion !== null && !lastWasDelete && ch.collection !== DOC_COLLECTION) {
-            conflicts.push({ collection: ch.collection, id: ch.id, serverVersion: null, serverData: null })
+          // A record comes back only from a client that believes it is new or saw the delete.
+          const deleted = this.lastOp.get(key) === 'delete'
+          const sawDelete = deleted && ch.baseVersion !== null && ch.baseVersion >= (this.lastVersion.get(key) ?? 0)
+          if (ch.baseVersion !== null && !sawDelete && ch.collection !== DOC_COLLECTION) {
+            conflicts.push({ collection: ch.collection, id: ch.id, serverVersion: null, serverData: null, ...(deleted ? byYou(this.lastBy.get(key)) : {}) })
             continue
           }
         }
-        const version = this.commit(ch.collection, ch.id, ch.op, ch.data)
+        const version = this.commit(ch.collection, ch.id, ch.op, ch.data, this.user.id)
         applied.push({ collection: ch.collection, id: ch.id, version })
       }
       return { ok: true, status: 200, data: { ...this.history(), seq: this.seq, applied, conflicts } }
@@ -195,13 +244,16 @@ export class FakeServer implements SyncApi {
   // Test controls: another device writing, pruning the log, reading the server's state.
   // ------------------------------------------------------------------------------------------
 
-  /** Another device saves a record (always accepted). */
-  serverUpsert(collection: string, id: string, data: unknown): number {
-    return this.commit(collection, id, 'upsert', data)
+  /**
+   * Another device saves a record (always accepted). `by`: who wrote it, another user unless told (pass
+   * server.user.id for the admin on another computer).
+   */
+  serverUpsert(collection: string, id: string, data: unknown, by: string | null = OTHER_USER_ID): number {
+    return this.commit(collection, id, 'upsert', data, by)
   }
 
-  serverDelete(collection: string, id: string): number {
-    return this.commit(collection, id, 'delete')
+  serverDelete(collection: string, id: string, by: string | null = OTHER_USER_ID): number {
+    return this.commit(collection, id, 'delete', undefined, by)
   }
 
   /**
@@ -225,6 +277,7 @@ export class FakeServer implements SyncApi {
     this.rows.clear()
     this.lastVersion.clear()
     this.lastOp.clear()
+    this.lastBy.clear()
     this.log = []
     this.minSeq = this.seq
   }
@@ -283,19 +336,21 @@ export class FakeServer implements SyncApi {
   }
 
   /** Stores a row at the next seq, which is its version. */
-  private write(collection: string, id: string, data: unknown): number {
+  private write(collection: string, id: string, data: unknown, by: string | null): number {
     const key = recordKey(collection, id)
     const version = ++this.seq
     this.lastVersion.set(key, version)
-    this.rows.set(key, { collection, id, version, data: wire(data) })
+    this.lastBy.set(key, by)
+    this.rows.set(key, { collection, id, version, data: wire(data), by })
     return version
   }
 
-  private commit(collection: string, id: string, op: 'upsert' | 'delete', data?: unknown): number {
+  private commit(collection: string, id: string, op: 'upsert' | 'delete', data: unknown, by: string | null): number {
     const key = recordKey(collection, id)
     let version: number
     this.lastOp.set(key, op)
-    if (op === 'upsert') version = this.write(collection, id, data)
+    this.lastBy.set(key, by)
+    if (op === 'upsert') version = this.write(collection, id, data, by)
     else {
       version = ++this.seq
       this.lastVersion.set(key, version)
@@ -318,7 +373,9 @@ export function deviceLink(server: SyncApi): DeviceLink {
     login: (email, password, opts) => (link.online ? server.login(email, password, opts) : offline()),
     logout: () => (link.online ? server.logout() : offline()),
     me: () => (link.online ? server.me() : offline()),
+    session: () => (link.online ? server.session() : offline()),
     getWorkspace: () => (link.online ? server.getWorkspace() : offline()),
+    workspaceStatus: (opts) => (link.online ? server.workspaceStatus(opts) : offline()),
     putWorkspace: (db, confirmReplace) => (link.online ? server.putWorkspace(db, confirmReplace) : offline()),
     getChanges: (since, historyId) => (link.online ? server.getChanges(since, historyId) : offline()),
     postChanges: (changes, opts) => (link.online ? server.postChanges(changes, opts) : offline()),

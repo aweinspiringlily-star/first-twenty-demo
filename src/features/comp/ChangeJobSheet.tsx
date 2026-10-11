@@ -4,14 +4,13 @@
 // names the tasks it created.
 import { useMemo, useRef, useState } from 'react'
 import { useViewer } from '@/app/useViewer'
-import { holidayDates } from '@/domain/checklists/generate'
 import { current409A, pctOfFullyDiluted } from '@/domain/equity'
 import { defaultExemptionBasis, exemptCheck, isAdminPerson } from '@/domain/hiring/offers'
-import { changeJobOrPay, currentJob, type JobChange, payrollUpdateDue } from '@/domain/lifecycle'
+import { changeJobOrPay, changeTaskPlan, compReasonLabel, currentJob, type JobChange, reportsAsOf } from '@/domain/lifecycle'
 import { bandFor, bandLabel, compaRatio, fullTimeEquivalentBase } from '@/domain/pay'
-import { directReports, employedOn, founder, fullName, incomingOn } from '@/domain/people'
+import { employedOn, founder, fullName, incomingOn } from '@/domain/people'
 import type { CompReason, ExemptionBasis, FLSA, ID } from '@/domain/types'
-import { addDays, addMonths, fmtDate, fmtDay, today } from '@/lib/dates'
+import { fmtDate, fmtDay, today } from '@/lib/dates'
 import { money, money2, num, pct } from '@/lib/format'
 import { useDB } from '@/store/db'
 import {
@@ -35,12 +34,28 @@ import {
   TextInput,
   toast,
 } from '@/ui'
-import { effectiveDatePresets, EXEMPTION_LABEL, nextLevel, proposedBase, REASON_LABEL, snapTo1K, suggestTitle } from './helpers'
+import {
+  effectiveDatePresets,
+  EXEMPTION_LABEL,
+  nextLevel,
+  NOTE_MAX_CHARS,
+  noteCountText,
+  payLimitProblem,
+  proposedBase,
+  REASON_LABEL,
+  snapTo1K,
+  suggestTitle,
+} from './helpers'
 import { BandTrack } from './shared'
 
 const REASONS: CompReason[] = ['promotion', 'market', 'merit', 'title_only', 'manager_change', 'transfer']
 
 const EXCEPTION_CHIPS = ['Founding, equity-heavy', 'Retention risk', 'Market data for this role', 'Internal equity'] as const
+
+/** "Supervisor harassment..." becomes "supervisor harassment..." after a name; "Labor Code..." keeps its capital. */
+function lowerFirst(s: string): string {
+  return /^[A-Z][a-z]* [a-z]/.test(s) ? s[0].toLowerCase() + s.slice(1) : s
+}
 
 /** Change job or pay workflow. Admin only; the sheet explains when someone else opens it. */
 export function ChangeJobSheet({ personId, open, onClose }: { personId: ID; open: boolean; onClose: () => void }) {
@@ -127,7 +142,10 @@ function ChangeJobForm({ personId, onClose }: { personId: ID; onClose: () => voi
   const curFte = fte(curPay)
   const newFte = fte(pay)
   const outOfBand = !!newBand && pay != null && (newFte < newBand.min || newFte > newBand.max)
+  // A mistyped amount (digits typed onto the prefilled one) blocks Save, exception reason or not.
+  const payTooHigh = pay != null && pay > 0 ? payLimitProblem({ hourly, pay, fte: newFte, currentFte: curFte, bandMax: newBand?.max }) : null
   const exceptionReason = (exceptionChip ?? exceptionOther).trim()
+  const noteCount = noteCountText(note)
   const fd = db.equity.fullyDilutedShares
 
   const pickReason = (r: CompReason) => {
@@ -159,7 +177,9 @@ function ChangeJobForm({ personId, onClose }: { personId: ID; onClose: () => voi
   }
 
   // Exempt check on the new pay (hiring/offers exemptCheck: CA exempt floor and computer professional minimums).
+  // A current employee gets the 2810.5 change-notice wording, not the hire's start-date wording.
   const exempt = exemptCheck(db, {
+    context: 'change',
     flsa,
     payType: hourly ? 'hourly' : 'salary',
     ...(hourly ? { hourlyRate: pay ?? 0 } : { salary: pay ?? 0 }),
@@ -206,29 +226,34 @@ function ChangeJobForm({ personId, onClose }: { personId: ID; onClose: () => voi
       change.flsa !== undefined ||
       (change.exemptionBasis !== undefined && basis !== startBasis) ||
       !!change.refreshGrantShares)
-  const payChanged = !!change && (change.salary !== undefined || change.hourlyRate !== undefined || change.variablePct !== undefined || change.flsa !== undefined)
 
   const problems: string[] = []
   if (!reason) problems.push('Pick a reason.')
   else if (!changedSomething) problems.push('Change at least one field, or add a refresh grant.')
   if (pay == null || pay <= 0) problems.push('Enter the new pay.')
+  else if (payTooHigh) problems.push(payTooHigh)
   if (outOfBand && !exceptionReason) problems.push('Pay is outside the band: add an exception reason.')
   if (refresh && !(refreshShares && refreshShares > 0)) problems.push('Enter the refresh grant shares, or turn it off.')
   const fieldError = {
     reason: tried && !reason ? 'Pick a reason.' : undefined,
-    pay: tried && (pay == null || pay <= 0) ? 'Enter the new pay.' : undefined,
+    pay: !tried ? undefined : pay == null || pay <= 0 ? 'Enter the new pay.' : (payTooHigh ?? undefined),
     exception: tried && outOfBand && !exceptionReason ? 'Pick or write an exception reason.' : undefined,
     refresh: tried && refresh && !(refreshShares && refreshShares > 0) ? 'Enter the refresh grant shares, or turn it off.' : undefined,
   }
 
-  // Task preview (the domain decides; this mirrors its rules so nothing surprises).
-  const holidays = holidayDates(db)
+  // Task preview: the same plan changeJobOrPay saves with, so the list names only tasks the save creates
+  // (no payroll task for a manager move alone, supervisor training only for a California manager at 5+ workers).
   const newManager = managerId ? db.people.find((p) => p.id === managerId) : undefined
   const firstReport =
-    !!newManager && managerId !== curManager && directReports(db, managerId, effectiveOn).filter((p) => p.id !== personId).length === 0
-  const preview: string[] = [`Update payroll by ${fmtDay(payrollUpdateDue(effectiveOn, date, holidays))}`]
-  if (payChanged && flsa === 'non_exempt') preview.push(`Give the Labor Code 2810.5 change notice by ${fmtDay(addDays(effectiveOn, 7))}`)
-  if (firstReport && newManager) preview.push(`${fullName(newManager)} gets a first direct report: 2-hour supervisor training due ${fmtDate(addMonths(effectiveOn, 6))} (California staff)`)
+    !!newManager && managerId !== curManager && reportsAsOf(db, managerId, effectiveOn).filter((p) => p.id !== personId).length === 0
+  const plan = useMemo(() => (change ? changeTaskPlan(db, personId, change, date) : null), [db, personId, change, date])
+  const preview: string[] = []
+  if (plan?.payroll) preview.push(`Update payroll by ${fmtDay(plan.payroll)}`)
+  if (plan?.notice2810_5) preview.push(`Give the Labor Code 2810.5 change notice by ${fmtDay(plan.notice2810_5)}`)
+  const trainee = plan?.supervisorTraining ? db.people.find((p) => p.id === plan.supervisorTraining?.personId) : undefined
+  if (plan?.supervisorTraining && trainee) {
+    preview.push(`${fullName(trainee)} gets a first direct report: 2-hour supervisor harassment prevention training due ${fmtDate(plan.supervisorTraining.dueOn)}`)
+  }
 
   const fmv = current409A(db, date)?.fmvPerShare
   const managers = [...employedOn(db, date), ...incomingOn(db, date)]
@@ -245,13 +270,23 @@ function ChangeJobForm({ personId, onClose }: { personId: ID; onClose: () => voi
       return
     }
     const name = fullName(person)
-    const label = `Recorded a ${REASON_LABEL[change.reason].toLowerCase()} for ${name}`
+    // The reason as the activity log words it ('a merit increase', 'a title change').
+    const label = `Recorded a ${compReasonLabel(change.reason)} for ${name}`
     const before = useDB.getState().db.checklists.length
     useDB.getState().mutate(label, (draft) => {
       changeJobOrPay(draft, personId, change, { date, actorId: viewer.personId })
     })
-    const created = useDB.getState().db.checklists.slice(before).flatMap((c) => c.tasks)
-    const tasks = [...created].sort((a, b) => a.dueOn.localeCompare(b.dueOn)).map((t) => `${t.title.replace(/\.$/, '')} (due ${fmtDay(t.dueOn)})`)
+    const after = useDB.getState().db
+    const created = after.checklists.slice(before).flatMap((c) => c.tasks)
+    const tasks = [...created]
+      .sort((a, b) => a.dueOn.localeCompare(b.dueOn))
+      .map((t) => {
+        // A task someone else owns (the new manager's supervisor training) names them, so it does not read as this person's.
+        const owner = t.assigneeId && t.assigneeId !== personId ? after.people.find((p) => p.id === t.assigneeId) : undefined
+        const title = t.title.replace(/\.$/, '')
+        const due = t.dueOn.slice(0, 4) === date.slice(0, 4) ? fmtDay(t.dueOn) : fmtDate(t.dueOn)
+        return `${owner ? `${fullName(owner)}: ${lowerFirst(title)}` : title}, due ${due}`
+      })
     toast({
       text: `${label}, effective ${fmtDate(change.effectiveOn)}.${tasks.length ? ` Tasks: ${tasks.join('; ')}.` : ''}`,
       action: { label: 'Undo', onClick: () => useDB.getState().undo() },
@@ -543,8 +578,8 @@ function ChangeJobForm({ personId, onClose }: { personId: ID; onClose: () => voi
         )}
       </div>
 
-      <Field label="Note (optional)" hint="Dictation works here: Win+H on Windows, or dictation on a Mac.">
-        {(id, d) => <TextArea id={id} aria-describedby={d} rows={2} value={note} onChange={(e) => setNote(e.target.value)} />}
+      <Field label="Note (optional)" hint={`Dictation works here: Win+H on Windows, or dictation on a Mac.${noteCount ? ` ${noteCount}.` : ''}`}>
+        {(id, d) => <TextArea id={id} aria-describedby={d} rows={2} maxLength={NOTE_MAX_CHARS} value={note} onChange={(e) => setNote(e.target.value)} />}
       </Field>
 
       <div className="rounded-xl bg-surface-2 px-4 py-3 text-[13.5px] text-ink-2">

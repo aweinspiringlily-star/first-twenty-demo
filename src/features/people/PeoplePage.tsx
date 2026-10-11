@@ -5,7 +5,7 @@ import type { PageProps } from '@/app/routes'
 import { links, navigate, replaceRoute } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { TimeOffTab, WhosOutStrip } from '@/features/timeoff'
-import { canSeePerson } from '@/domain/access'
+import { canSeePerson, canSeeSeparation } from '@/domain/access'
 import { headcountOn, incomingOn } from '@/domain/people'
 import type { ChecklistKind, DB, Viewer } from '@/domain/types'
 import { addDays, fmtDate, fmtMonth, fmtQuarter, fmtShort, today } from '@/lib/dates'
@@ -120,7 +120,14 @@ function Directory({ db, viewer }: { db: DB; viewer: Viewer }) {
       sort: (r) => r.status,
       cell: (r) =>
         r.person ? (
-          <PersonStatusBadge db={db} person={r.person} status={r.status} leave={r.leave} showLeaveType={canSeePerson(viewer, db, r.person.id, 'leave')} />
+          <PersonStatusBadge
+            db={db}
+            person={r.person}
+            status={r.status}
+            leave={r.leave}
+            showLeaveType={canSeePerson(viewer, db, r.person.id, 'leave')}
+            showLastDay={canSeeSeparation(viewer, db, r.person.id)}
+          />
         ) : (
           <span className="flex flex-col items-start gap-1">
             <Badge tone="outline">{r.kind === 'advisor' ? 'Advisor' : 'Contractor'}</Badge>
@@ -195,6 +202,10 @@ function SeatCard({ seat, db, viewer }: { seat: Seat; db: DB; viewer: Viewer }) 
     const name = `${p.preferredName || p.firstName} ${p.lastName}`
     const alumni = seat.kind === 'alumni'
     const incoming = seat.kind === 'incoming'
+    // A rehire's two seats point at each other: "Back as #18" on the old one, "Rehire of #10" on the new.
+    const backAs = db.people.find((x) => x.rehireOfPersonId === p.id)
+    const earlier = p.rehireOfPersonId ? db.people.find((x) => x.id === p.rehireOfPersonId) : undefined
+    const link = backAs ? `Back as #${backAs.hireNumber}` : earlier ? `Rehire of #${earlier.hireNumber}` : ''
     return (
       <a
         href={links.person(p.id)}
@@ -209,13 +220,14 @@ function SeatCard({ seat, db, viewer }: { seat: Seat; db: DB; viewer: Viewer }) 
               ? 'border-2 border-accent bg-surface shadow-card hover:bg-surface-2/50'
               : 'border border-line bg-surface shadow-card hover:border-line-strong',
         )}
-        aria-label={`Seat ${seat.n}: #${p.hireNumber} ${name}${alumni ? ', alumni' : incoming ? `, starts ${fmtShort(p.startDate)}` : ''}`}
+        aria-label={`Seat ${seat.n}: #${p.hireNumber} ${name}${alumni ? ', alumni' : incoming ? `, starts ${fmtShort(p.startDate)}` : ''}${link ? `, ${link.toLowerCase()}` : ''}`}
       >
         <Avatar name={name} size={44} muted={alumni} />
         <span className="ft-seat__num mt-2 font-mono text-[12.5px] font-bold text-ink-3">#{p.hireNumber}</span>
         <span className={cx('ft-seat__name font-semibold leading-snug', alumni ? 'text-ink-3' : 'text-ink')}>{name}</span>
         <span className="ft-seat__date mt-auto pt-1 text-[12.5px] text-ink-3">
           {alumni && p.endDate ? `${fmtMonth(p.startDate)} to ${fmtMonth(p.endDate)}` : incoming ? `Starts ${fmtShort(p.startDate)}` : `Since ${fmtDate(p.startDate)}`}
+          {link && <span className="block">{link}</span>}
         </span>
         {incoming && (
           <Badge tone="accent" className="absolute top-2.5 right-3">

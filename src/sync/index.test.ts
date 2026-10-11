@@ -11,6 +11,7 @@ const fakeWindow = { addEventListener: () => {}, removeEventListener: () => {} }
 
 beforeAll(() => setClockOverride('2026-10-10'))
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetModules()
 })
@@ -93,6 +94,9 @@ describe('initSync', () => {
     vi.stubGlobal('window', fakeWindow)
     vi.stubGlobal('localStorage', storage)
     vi.stubGlobal('fetch', fetch)
+    // The modules load fresh, and prefs.ts resets their clock override on load: fix the date itself
+    // (only Date, so the engine's timers still run) before the store reads today().
+    vi.useFakeTimers({ now: new Date('2026-10-10T17:00:00.000Z'), toFake: ['Date'] })
     const { initSync, getSyncEngine } = await import('./index')
     const { useDB } = await import('@/store/db')
     // db.ts applied the promotion while loading, before the engine existed.
@@ -141,6 +145,39 @@ describe('wipeAppStorage', () => {
         removeItem: () => {},
       }),
     ).not.toThrow()
+  })
+})
+
+describe('a notice across a reload (r3-10)', () => {
+  it('is read once, from sessionStorage, so removing this browser\'s data does not clear it', async () => {
+    const session = memoryStorage()
+    const { leaveReloadNotice, RELOAD_NOTICE_KEY, takeReloadNotice, wipeAppStorage } = await import('./index')
+    expect(RELOAD_NOTICE_KEY.startsWith('first-twenty:')).toBe(false)
+    leaveReloadNotice('Signed out and removed this browser\'s data.', session)
+    wipeAppStorage(null)
+    expect(takeReloadNotice(session)).toBe('Signed out and removed this browser\'s data.')
+    expect(takeReloadNotice(session)).toBeNull()
+    expect(session.data.size).toBe(0)
+  })
+
+  it('a browser whose storage throws shows no notice and never fails', async () => {
+    const blocked = {
+      getItem: () => {
+        throw new Error('blocked')
+      },
+      setItem: () => {
+        throw new Error('blocked')
+      },
+      removeItem: () => {
+        throw new Error('blocked')
+      },
+    }
+    const { leaveReloadNotice, takeReloadNotice } = await import('./index')
+    expect(() => leaveReloadNotice('x', blocked)).not.toThrow()
+    expect(takeReloadNotice(blocked)).toBeNull()
+    expect(takeReloadNotice(null)).toBeNull()
+    // No sessionStorage at all (outside a browser): nothing to read.
+    expect(takeReloadNotice()).toBeNull()
   })
 })
 

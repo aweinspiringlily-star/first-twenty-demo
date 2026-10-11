@@ -1,7 +1,7 @@
 // Pure helpers for interviews, scheduling, scorecards, the hiring pulse and referrals.
 // No store or React imports, so they can be unit tested (logic.test.ts).
 import { jobStages, stageById } from '@/domain/hiring/pipeline'
-import { lowerFirst, pacificToUTC } from '@/domain/hiring/util'
+import { candidateName, latestOffer, lowerFirst, pacificToUTC } from '@/domain/hiring/util'
 import type { Rate } from '@/domain/hiring/metrics'
 import { reportingLine } from '@/domain/people'
 import type { Application, DB, ID, Interview, InterviewStep, Job, Offer, Rating, StageKind, Viewer } from '@/domain/types'
@@ -90,23 +90,35 @@ export function ratingTone(r: Rating | null | undefined): 'good' | 'warn' | 'out
   return 'outline'
 }
 
-/** 'Expires today', 'Expires tomorrow', 'Expires in 5 days', 'Expired Oct 12'. */
-export function expiryPhrase(expiresOn: ISODate, date: ISODate): string {
+/**
+ * 'Expires today', 'Expires tomorrow', 'Expires in 5 days', 'Expired Mon, Oct 12'. With `midSentence`,
+ * only the leading word is lowercased ('expired Mon, Oct 12'), so day and month names keep their capitals.
+ */
+export function expiryPhrase(expiresOn: ISODate, date: ISODate, opts: { midSentence?: boolean } = {}): string {
   const n = daysBetween(date, expiresOn)
-  if (n < 0) return `Expired ${fmtDay(expiresOn)}`
-  if (n === 0) return 'Expires today'
-  if (n === 1) return 'Expires tomorrow'
-  return `Expires in ${n} days`
+  const phrase = n < 0 ? `Expired ${fmtDay(expiresOn)}` : n === 0 ? 'Expires today' : n === 1 ? 'Expires tomorrow' : `Expires in ${n} days`
+  return opts.midSentence ? phrase.charAt(0).toLowerCase() + phrase.slice(1) : phrase
 }
 
 /**
  * One line per outstanding offer for the hiring pulse: 'Offer out to Daniel Reyes, expires in 5 days',
- * 'Offer for Daniel Reyes waiting for approval', 'Lucas Ferreira accepted, starts Mon, Oct 19'.
+ * 'Offer for Daniel Reyes waiting for approval', 'Lucas Ferreira accepted, starts Mon, Oct 19'. A sent
+ * offer past its expiry date reads as expired ('Offer to Kenji Mori expired Fri, Oct 16'), never as out,
+ * and so does one marked expired (expiry runs on load) while the candidate is still active: pass
+ * `appActive: false` once the application has closed, and it drops off.
  */
-export function offerPulseLine(offer: Pick<Offer, 'status' | 'expiresOn' | 'startDate' | 'personId'>, name: string, date: ISODate): string | null {
+export function offerPulseLine(
+  offer: Pick<Offer, 'status' | 'expiresOn' | 'startDate' | 'personId'>,
+  name: string,
+  date: ISODate,
+  opts: { appActive?: boolean } = {},
+): string | null {
   switch (offer.status) {
     case 'sent':
-      return `Offer out to ${name}, ${expiryPhrase(offer.expiresOn, date).toLowerCase()}`
+      if (offer.expiresOn < date) return `Offer to ${name} ${expiryPhrase(offer.expiresOn, date, { midSentence: true })}`
+      return `Offer out to ${name}, ${expiryPhrase(offer.expiresOn, date, { midSentence: true })}`
+    case 'expired':
+      return opts.appActive === false ? null : `Offer to ${name} expired ${fmtDay(offer.expiresOn)}`
     case 'awaiting_approval':
       return `Offer for ${name} waiting for approval`
     case 'approved':
@@ -118,6 +130,39 @@ export function offerPulseLine(offer: Pick<Offer, 'status' | 'expiresOn' | 'star
     default:
       return null
   }
+}
+
+/** An offer still waiting on someone (sent, awaiting approval, approved, or accepted with no person yet). */
+function stillOut(o: Pick<Offer, 'status' | 'personId'>): boolean {
+  return o.status === 'sent' || o.status === 'awaiting_approval' || o.status === 'approved' || (o.status === 'accepted' && !o.personId)
+}
+
+/** Each application's newest offer on the job (the one the pulse speaks for). */
+function latestOffersOn(db: Pick<DB, 'offers'>, jobId: ID): Offer[] {
+  return [...new Set(db.offers.filter((o) => o.jobId === jobId).map((o) => o.applicationId))].map((appId) => latestOffer(db, appId)).filter((o) => !!o)
+}
+
+/**
+ * Jobs the Home hiring pulse lists: every open job, plus a filled job that still has an offer out, so a
+ * second offer sent after one hire filled the job stays in sight. A filled job whose offer to a candidate
+ * still active expired stays too (its line reads 'Offer to <name> expired <day>') until that application
+ * closes. Oldest opened first.
+ */
+export function pulseJobs(db: Pick<DB, 'jobs' | 'offers' | 'applications'>): Job[] {
+  const expiredForActive = (o: Offer) => o.status === 'expired' && db.applications.some((a) => a.id === o.applicationId && a.status === 'active')
+  return db.jobs
+    .filter((j) => j.status === 'open' || (j.status === 'filled' && latestOffersOn(db, j.id).some((o) => stillOut(o) || expiredForActive(o))))
+    .sort((a, b) => (a.openedOn ?? '').localeCompare(b.openedOn ?? ''))
+}
+
+/** The offer lines under a job in the hiring pulse (offerPulseLine for each application's newest offer). */
+export function pulseOfferLines(db: Pick<DB, 'offers' | 'applications' | 'candidates'>, jobId: ID, date: ISODate): string[] {
+  return latestOffersOn(db, jobId)
+    .map((o) => {
+      const app = db.applications.find((a) => a.id === o.applicationId)
+      return offerPulseLine(o, candidateName(db, o.candidateId), date, { appActive: app?.status === 'active' })
+    })
+    .filter((x): x is string => !!x)
 }
 
 /** Splits 'Jordan Lee Park' into first 'Jordan' and last 'Lee Park'. */
@@ -158,7 +203,9 @@ export function metricsRange(kind: '90d' | '12m' | 'all', date: ISODate, founded
 
 /**
  * Confirmation note for a booked interview (the "This time" option): the time in Pacific and the
- * candidate's zone, length, format and who they will meet.
+ * candidate's zone, length, format, the video link and who they will meet. It goes out through a
+ * mailto link, which cannot carry an attachment, so it never says a calendar invite is attached; a
+ * video call without a link promises to send one.
  */
 export function confirmationBody(input: {
   firstName: string
@@ -170,21 +217,32 @@ export function confirmationBody(input: {
   companyName: string
   address?: string
   senderName: string
+  videoLink?: string
+  /** The old time, when the interview was moved: the note says so and asks to drop the old time. */
+  movedFrom?: string
 }): string {
+  const link = input.videoLink?.trim()
   const how =
     input.format === 'onsite'
       ? `at our office${input.address ? ` (${input.address})` : ''}`
       : input.format === 'phone'
         ? 'by phone; we will call the number you gave us'
-        : 'on video; the link is in the calendar invite'
+        : 'on video'
+  const video = input.format === 'video'
+  const sendLater = video && !link ? ' I will send the video link before the call.' : ''
+  const joinLine = video && link ? `\n\nJoin here: ${link}` : ''
   const meet = input.panel.length ? ` You will meet ${listOf(input.panel)}.` : ''
+  const lead = input.movedFrom
+    ? `Your ${lowerFirst(input.interviewName)} with ${input.companyName} has moved from ${input.movedFrom} to:`
+    : `You are confirmed for the ${lowerFirst(input.interviewName)} with ${input.companyName}:`
+  const dropOld = input.movedFrom ? ' Please take the old time off your calendar.' : ''
   return `Hi ${input.firstName},
 
-You are confirmed for the ${lowerFirst(input.interviewName)} with ${input.companyName}:
+${lead}
 
 ${input.when}
 
-It runs ${input.durationMin} minutes, ${how}.${meet} A calendar invite is attached. If the time stops working, reply and we will find another.
+It runs ${input.durationMin} minutes, ${how}.${meet}${sendLater}${dropOld} If the time stops working, reply and we will find another.${joinLine}
 
 ${input.senderName}`
 }

@@ -23,7 +23,7 @@ import {
   TextInput,
 } from '@/ui'
 import { commit, EditSheet, Row, RowList } from './kit'
-import { CUSTOM_TASK_PREFIX, describeCondition, isCustomTask } from './logic'
+import { CUSTOM_TASK_PREFIX, describeCondition, hintWithCount, isCustomTask, SHORT_TEXT_MAX_CHARS } from './logic'
 import { newId } from '@/lib/id'
 
 const KIND_LABELS: Record<ChecklistKind, string> = {
@@ -142,7 +142,7 @@ function TemplatePanel({ template }: { template: ChecklistTemplate }) {
           {defaults && changed && (
             <ConfirmButton
               icon="rotate-ccw"
-              confirmLabel="Click again to reset"
+              confirmLabel="Press again to reset"
               onConfirm={() =>
                 commit(`Reset ${template.name} to the defaults`, (d) => {
                   const i = d.checklistTemplates.findIndex((t) => t.id === template.id)
@@ -239,8 +239,17 @@ function TemplatePanel({ template }: { template: ChecklistTemplate }) {
               <Field label="Title" required>
                 {(id) => <TextInput id={id} value={d.title} onChange={(e) => set({ title: e.target.value })} />}
               </Field>
-              <Field label="Why it matters" hint="One plain sentence. Shows on the task.">
-                {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} value={d.why ?? ''} onChange={(e) => set({ why: e.target.value })} />}
+              <Field label="Why it matters" hint={hintWithCount('One plain sentence. Shows on the task.', d.why, SHORT_TEXT_MAX_CHARS)}>
+                {(id, hint) => (
+                  <TextArea
+                    id={id}
+                    aria-describedby={hint}
+                    rows={3}
+                    maxLength={SHORT_TEXT_MAX_CHARS}
+                    value={d.why ?? ''}
+                    onChange={(e) => set({ why: e.target.value })}
+                  />
+                )}
               </Field>
               <div className="flex flex-col gap-1.5">
                 <span className="text-[13.5px] font-semibold text-ink-2">Owner</span>

@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest'
+import { generateChecklist } from '@/domain/checklists/generate'
 import {
   evaluateAll,
   evaluateRule,
+  hasPerPersonTasks,
   headcountRuler,
   milestoneHistory,
   nextThreshold,
   payRangeRequiredToPost,
   roughDate,
   ruleApplies,
+  ruleDeadlineBesideTasks,
   summarizeResults,
 } from './engine'
 import { RULE_BY_ID, RULES } from './rules'
@@ -334,8 +337,41 @@ describe('event triggers', () => {
 
   it('EDD registration is due 15 days after the first payroll', () => {
     const db = makeDB('2025-01-06')
+    db.company.firstPayrollOn = '2025-01-06'
     const r = evaluateRule(db, rule('edd-registration'), '2025-01-10')
     expect(r).toMatchObject({ state: 'applies', firstAppliedOn: '2025-01-06', dueOn: '2025-01-21' })
+    // A recorded first payroll makes it a legal deadline, not an estimate.
+    expect(r.dueEstimated).toBeUndefined()
+  })
+
+  it('a founder working unpaid does not start the DE 1 clock; a paid founder starts it as an estimate', () => {
+    const db = makeDB('2025-01-06')
+    expect(evaluateRule(db, rule('edd-registration'), '2025-01-10')).toMatchObject({ state: 'not_yet', dueOn: undefined })
+    db.comp.push({ id: 'cr-f', personId: 'p-founder', effectiveOn: '2025-01-06', payType: 'salary', salary: 0, title: 'CEO', levelId: 'lv-l3', reason: 'hire' })
+    expect(evaluateRule(db, rule('edd-registration'), '2025-01-10').state).toBe('not_yet')
+    db.comp.push({ id: 'cr-f2', personId: 'p-founder', effectiveOn: '2025-03-03', payType: 'salary', salary: 90000, title: 'CEO', levelId: 'lv-l3', reason: 'merit' })
+    const paid = evaluateRule(db, rule('edd-registration'), '2025-04-01')
+    expect(paid).toMatchObject({ state: 'applies', firstAppliedOn: '2025-03-03', dueOn: '2025-03-18', dueEstimated: true })
+  })
+
+  it('the golden path: an unpaid founder from Jan 1 and a first hire on Nov 2 date DE 1 from the hire, as an estimate', () => {
+    const db = makeDB('2026-01-01')
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    db.comp.push({ id: 'cr-1', personId: 'p-first', effectiveOn: '2026-11-02', payType: 'salary', salary: 150000, title: 'Engineer', levelId: 'lv-l3', reason: 'hire' })
+    const before = evaluateRule(db, rule('edd-registration'), '2026-10-10')
+    expect(before).toMatchObject({ state: 'approaching', projectedOn: '2026-11-02', dueOn: '2026-11-17', dueEstimated: true })
+    const on = evaluateRule(db, rule('edd-registration'), '2026-11-02')
+    expect(on).toMatchObject({ state: 'applies', firstAppliedOn: '2026-11-02', dueOn: '2026-11-17', dueEstimated: true })
+  })
+
+  it('stay-or-pay applies to contracts from Jan 1, 2027: preparation before, in force from then, never since founding', () => {
+    const db = makeDB('2025-02-03')
+    const before = evaluateRule(db, rule('stay-or-pay-ban'), '2026-10-09')
+    expect(before).toMatchObject({ state: 'applies', firstAppliedOn: undefined, effectiveOn: '2027-01-01' })
+    expect(before.howCounted).toContain('contracts entered on or after Jan 1, 2027')
+    const after = evaluateRule(db, rule('stay-or-pay-ban'), '2027-02-01')
+    expect(after).toMatchObject({ state: 'applies', firstAppliedOn: '2027-01-01' })
+    expect(after.effectiveOn).toBeUndefined()
   })
 
   it('CalSavers applies at the first non-owner hire but has no deadline until a notice is recorded', () => {
@@ -546,10 +582,47 @@ describe('yearly cycles', () => {
 
   it('a company that first hires after Feb 1 owes its first notice the next Feb 1, with nothing open before then', () => {
     const db = makeDB('2026-03-02')
+    addPerson(db, { id: 'p-first', startDate: '2026-03-02' })
     const r = evaluateRule(db, rule('sb294-annual-notice'), '2026-06-01')
     expect(r.state).toBe('applies')
     expect(r.openActions).toEqual([])
     expect(evaluateRule(db, rule('sb294-annual-notice'), '2026-12-15').openActions.map((a) => a.id)).toEqual(['send-annual', 'record-dates'])
+  })
+
+  it('owes no yearly employee notice while the only person is an owner with no pay', () => {
+    const db = makeDB('2026-01-01')
+    // Before any hire: nothing open, nothing overdue for the Feb 1, 2026 cycle, and the card says why.
+    const solo = evaluateRule(db, rule('sb294-annual-notice'), '2026-10-11')
+    expect(solo.openActions).toEqual([])
+    expect(solo.cycle).toMatchObject({ awaitingEmployees: true })
+    expect(solo.cycle?.overdueYear).toBeUndefined()
+    expect(evaluateRule(db, rule('victims-leave-notice'), '2026-10-11').cycle?.overdueYear).toBeUndefined()
+    expect(evaluateRule(db, rule('sb294-annual-notice'), '2027-01-25').openActions).toEqual([])
+    // A first hire on Nov 2 makes the Feb 1, 2027 notice the first one owed.
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    const hired = evaluateRule(db, rule('sb294-annual-notice'), '2026-12-15')
+    expect(hired.cycle?.awaitingEmployees).toBeUndefined()
+    expect(hired.cycle?.overdueYear).toBeUndefined()
+    expect(hired.openActions.map((a) => a.id)).toEqual(['send-annual', 'record-dates'])
+    // A founder on paid payroll is an employee to notify.
+    const paid = makeDB('2026-01-01')
+    paid.comp.push({ id: 'cr-f', personId: 'p-founder', effectiveOn: '2026-01-01', payType: 'salary', salary: 120_000, title: 'CEO', levelId: 'lv-l5', reason: 'hire' })
+    expect(evaluateRule(paid, rule('sb294-annual-notice'), '2026-10-11').cycle?.overdueYear).toBe(2026)
+  })
+
+  it('the yearly employee notices apply from the first paid employee, not from an unpaid founding', () => {
+    const db = makeDB('2026-01-01')
+    // A solo founder with no pay: nobody to send them to yet, so no start date.
+    expect(evaluateRule(db, rule('sb294-annual-notice'), '2026-10-11').firstAppliedOn).toBeUndefined()
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    for (const id of ['sb294-annual-notice', 'victims-leave-notice']) {
+      expect(evaluateRule(db, rule(id), '2026-11-02')).toMatchObject({ state: 'applies', firstAppliedOn: '2026-11-02' })
+    }
+    // Duties at hire still start with the company's first employee.
+    expect(evaluateRule(db, rule('sb294-new-hire'), '2026-11-02').firstAppliedOn).toBe('2026-01-01')
+    // A founder on paid payroll from Mar 2 is the first person owed the notices.
+    db.comp.push({ id: 'cr-f', personId: 'p-founder', effectiveOn: '2026-03-02', payType: 'salary', salary: 120_000, title: 'CEO', levelId: 'lv-l5', reason: 'merit' })
+    expect(evaluateRule(db, rule('sb294-annual-notice'), '2026-11-02').firstAppliedOn).toBe('2026-03-02')
   })
 
   it('a rule marked done counts for its cycle only', () => {
@@ -595,23 +668,88 @@ describe('first payroll and data on file', () => {
   it('uses the first payroll date from Settings, and an estimate otherwise', () => {
     const db = makeDB('2025-02-03')
     addPerson(db, { id: 'p-tomas', startDate: '2025-05-12' })
+    // The founder has no pay recorded, so the estimate starts with the first paid employee.
     const est = evaluateRule(db, rule('edd-registration'), '2025-06-01')
-    expect(est).toMatchObject({ firstAppliedOn: '2025-02-03', dueOn: '2025-02-18' })
-    expect(est.howCounted).toContain('Estimated from the first W-2 start on record')
+    expect(est).toMatchObject({ firstAppliedOn: '2025-05-12', dueOn: '2025-05-27', dueEstimated: true })
+    expect(est.howCounted).toContain('Estimated from the first paid W-2 start on record')
+    expect(est.howCounted).toContain('Owners with no pay recorded are left out.')
     db.company.firstPayrollOn = '2025-05-15'
     const exact = evaluateRule(db, rule('edd-registration'), '2025-06-01')
     expect(exact).toMatchObject({ firstAppliedOn: '2025-05-15', dueOn: '2025-05-30' })
+    expect(exact.dueEstimated).toBeUndefined()
     expect(exact.howCounted).toBe('First payroll on May 15, 2025 (from Settings).')
   })
 
-  it("treats a saved EDD account number and workers' comp carrier as done", () => {
+  it("treats a saved EDD account number and workers' comp policy number as done", () => {
     const db = makeDB('2025-02-03')
     addPerson(db, { id: 'p-tomas', startDate: '2025-05-12' })
     db.company.eddAccountNumber = '123-4567-8'
     db.company.workersCompCarrier = { name: 'Golden Poppy Mutual' }
+    // EDD issues the account number only after registration: both steps are on file and the rule is done.
     const edd = evaluateRule(db, rule('edd-registration'), '2025-06-01')
-    expect(edd.openActions.map((a) => a.id)).toEqual(['register'])
-    expect(edd.onFile).toEqual(['save-account'])
+    expect(edd.openActions).toEqual([])
+    expect(edd.onFile).toEqual(['register', 'save-account'])
+    expect(edd.state).toBe('done')
+    // A carrier name alone does not show a bound policy; its policy number does.
     expect(evaluateRule(db, rule('workers-comp'), '2025-06-01').openActions.map((a) => a.id)).toEqual(['bind-policy', 'new-hire-pamphlet'])
+    db.company.workersCompCarrier = { name: 'Golden Poppy Mutual', policyNumber: ' WC-2025-0042 ' }
+    const wc = evaluateRule(db, rule('workers-comp'), '2025-06-01')
+    expect(wc.openActions.map((a) => a.id)).toEqual(['new-hire-pamphlet'])
+    expect(wc.onFile).toEqual(['bind-policy', 'save-carrier'])
+  })
+})
+
+describe('per-person deadlines on checklist tasks', () => {
+  /** An unpaid founder since Jan 1 and Maria, the first hire, starting Mon Nov 2 with her onboarding checklist. */
+  function golden() {
+    const db = makeDB('2026-01-01')
+    const maria = addPerson(db, { id: 'p-maria', firstName: 'Maria', lastName: 'Gonzalez', startDate: '2026-11-02' })
+    db.checklists.push(generateChecklist(db, { id: 'ck-maria', person: maria, templateId: 'tpl-onboarding', anchorDate: '2026-11-02', createdOn: '2026-10-11' }))
+    return db
+  }
+
+  it("gives an overdue DE 34 the task's file-by day, and a deadline recorded on the card its own", () => {
+    const db = golden()
+    // DE 34 is due Sun Nov 22: file by Fri Nov 20, as the checklist row says.
+    const late = evaluateRule(db, rule('new-hire-reporting'), '2026-11-30')
+    expect(late).toMatchObject({ state: 'applies', dueOn: '2026-11-22', fileBy: '2026-11-20' })
+    expect(late.followUps?.[0]).toMatchObject({ personId: 'p-maria', dueOn: '2026-11-22', fileBy: '2026-11-20' })
+    // I-9 section 1 is not an agency filing (and is due on a Monday anyway).
+    const i9 = evaluateRule(db, rule('form-i9'), '2026-11-30')
+    expect(i9.dueOn).toBe('2026-11-02')
+    expect(i9.fileBy).toBeUndefined()
+    // DE 34 is an agency filing: a deadline recorded on the card for Sat Dec 5 is filed by Fri Dec 4.
+    db.complianceStatus['new-hire-reporting'] = { dueOn: '2026-12-05' }
+    expect(evaluateRule(db, rule('new-hire-reporting'), '2026-11-10')).toMatchObject({ dueOn: '2026-12-05', fileBy: '2026-12-04' })
+  })
+
+  it("leaves a date that comes from a task on the task, and keeps a deadline of the rule's own", () => {
+    const db = golden()
+    expect(['new-hire-reporting', 'form-i9', 'sb294-new-hire', 'wage-notice-2810-5'].every(hasPerPersonTasks)).toBe(true)
+    expect(hasPerPersonTasks('edd-registration')).toBe(false)
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, rule('new-hire-reporting'), '2026-11-30'))).toBeUndefined()
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, rule('form-i9'), '2026-11-30'))).toBeUndefined()
+    db.complianceStatus['new-hire-reporting'] = { dueOn: '2026-12-15' }
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, rule('new-hire-reporting'), '2026-11-30'))).toBe('2026-12-15')
+    // Other rules keep their own dates.
+    db.company.firstPayrollOn = '2026-11-13'
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, rule('edd-registration'), '2026-11-30'))).toBe('2026-11-28')
+  })
+
+  it('keeps a clock for a hire with no such task, and drops it once their checklist has one', () => {
+    // A per-person rule with a clock from its trigger (none in the catalog today): the founder started it.
+    const clocked = { ...rule('new-hire-reporting'), dueDaysAfterTrigger: 20 }
+    const db = makeDB('2026-11-02')
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, clocked, '2026-11-30'))).toBe('2026-11-22')
+    db.checklists.push({
+      id: 'ck-founder',
+      personId: 'p-founder',
+      kind: 'onboarding',
+      templateId: 'tpl-onboarding',
+      anchorDate: '2026-11-02',
+      createdOn: '2026-11-02',
+      tasks: [{ id: 't-de34', templateTaskId: 'on-de34', title: 'DE 34 new hire report filed', ownerRole: 'admin', dueOn: '2026-11-22', status: 'done', category: 'legal', statutory: true }],
+    })
+    expect(ruleDeadlineBesideTasks(db, evaluateRule(db, clocked, '2026-11-30'))).toBeUndefined()
   })
 })

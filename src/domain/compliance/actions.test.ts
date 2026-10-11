@@ -19,6 +19,7 @@ const {
   setRuleActionDone,
   setRuleDeadline,
   setRuleStatus,
+  trainingsRecordedBy,
 } = await import('./actions')
 const { evaluateRule } = await import('./engine')
 const { RULE_BY_ID } = await import('./rules')
@@ -101,6 +102,25 @@ describe('yearly actions', () => {
 })
 
 describe('training and recurring helpers', () => {
+  it("says how many WVPP training records 'Train everyone' creates, and creates exactly those", () => {
+    let db = makeDB('2025-01-06')
+    db.locations[0].typicalMaxOnSite = 12
+    addMany(db, 11, '2026-03-02')
+    addPerson(db, { id: 'p-remote', startDate: '2026-03-02', workMode: 'remote', locationId: 'loc-remote-tx', homeState: 'TX' })
+    const t = '2026-10-09'
+    const n = trainingsRecordedBy(db, 'wvpp', 'train', t)
+    // The founder and the 11 on-site staff; the remote employee is outside SB 553.
+    expect(n).toBe(12)
+    expect(trainingsRecordedBy(db, 'wvpp', 'write-plan', t)).toBe(0)
+    expect(trainingsRecordedBy(db, 'iipp', 'train', t)).toBe(0)
+    const before = db.trainings.length
+    db = produce(db, (d) => setRuleActionDone(d, 'wvpp', 'train', t))
+    expect(db.trainings.filter((x) => x.kind === 'wvpp' && x.completedOn === t)).toHaveLength(n)
+    expect(db.trainings.length - before).toBe(n)
+    // Everyone is trained now, so ticking again would record nothing.
+    expect(trainingsRecordedBy(db, 'wvpp', 'train', t)).toBe(0)
+  })
+
   it('fills an open training row or adds one', () => {
     let db = makeDB()
     addPerson(db, { id: 'p-a', firstName: 'Aisha', lastName: 'Bello', startDate: '2026-09-08' })
@@ -164,6 +184,7 @@ describe('anonymizeCandidate', () => {
       sponsorship: 'no',
       tags: ['keep warm'],
       desiredPay: 200000,
+      desiredPayUnit: 'year',
       summary: 'Strong',
       createdOn: '2021-01-04',
     })
@@ -175,6 +196,7 @@ describe('anonymizeCandidate', () => {
     expect(c).toMatchObject({ firstName: 'Former', lastName: 'applicant', email: '', links: {}, tags: [], archived: true, anonymizedOn: '2026-10-09' })
     expect(c.phone).toBeUndefined()
     expect(c.desiredPay).toBeUndefined()
+    expect(c).not.toHaveProperty('desiredPayUnit')
     expect(c.location).toBeUndefined()
     expect(db.applications[0].outcomeNote).toBeUndefined()
     expect(db.applications[0].closedOn).toBe('2021-02-01')

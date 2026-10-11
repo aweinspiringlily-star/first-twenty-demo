@@ -40,6 +40,12 @@ import { commit } from './mutate'
 /** Lets a button's label wrap instead of running past a narrow or zoomed panel. */
 const WRAP_BUTTON = 'h-auto! min-h-11 max-w-full shrink! py-2 text-left whitespace-normal!'
 
+/**
+ * The longest 'What changed' summary a policy version keeps. A policy record holds every past version's
+ * summary and syncs as at most 256 KB (docs/SYNC.md), so each one stays short.
+ */
+const SUMMARY_MAX = 2_000
+
 export function NoticesTab() {
   const db = useDB((s) => s.db)
   const [publishFor, setPublishFor] = useState<Policy | null>(null)
@@ -130,7 +136,9 @@ function PolicyRow({ db, policy, onPublish }: { db: DB; policy: Policy; onPublis
                 Everyone is current
               </Badge>
             ) : (
-              <Badge tone={owed.some((o) => o.overdue) ? 'warn' : 'neutral'}>{plural(owed.length, 'person', 'people')} still owe it</Badge>
+              <Badge tone={owed.some((o) => o.overdue) ? 'warn' : 'neutral'}>
+                {plural(owed.length, 'person', 'people')} still {owed.length === 1 ? 'owes' : 'owe'} it
+              </Badge>
             )}
           </div>
           <Meter value={ackedNow} max={Math.max(1, employed)} tone={owed.some((o) => o.overdue) ? 'warn' : owed.length ? 'accent' : 'good'} label={`${ackedNow} of ${employed} acknowledged`} className="max-w-md" />
@@ -265,16 +273,19 @@ function PublishModal({ policy, onClose }: { policy: Policy | null; onClose: () 
           />
           {choice === 'other' && (
             <Field label="Version number" error={custom && sameVersion(custom, policy.version) ? 'That is the current version. Pick a new number.' : undefined}>
-              {(id, d) => <TextInput id={id} aria-describedby={d} value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="For example 2.5" />}
+              {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={20} value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="For example 2.5" />}
             </Field>
           )}
         </div>
         <DateChips label="Effective date" value={date} onChange={setDate} />
-        <Field label="What changed" hint="A sentence or two. People see this when they acknowledge.">
-          {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} value={summary} onChange={(e) => setSummary(e.target.value)} />}
+        <Field
+          label="What changed"
+          hint={`A sentence or two. People see this when they acknowledge.${summary.length >= SUMMARY_MAX - 200 ? ` ${summary.length.toLocaleString('en-US')} of ${SUMMARY_MAX.toLocaleString('en-US')} characters.` : ''}`}
+        >
+          {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} maxLength={SUMMARY_MAX} value={summary} onChange={(e) => setSummary(e.target.value)} />}
         </Field>
         <Field label="Link to the policy" hint="Where the document lives (Drive, Notion, the PEO). Never the file itself.">
-          {(id, d) => <TextInput id={id} aria-describedby={d} type="url" inputMode="url" value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://" />}
+          {(id, d) => <TextInput id={id} aria-describedby={d} type="url" inputMode="url" maxLength={500} value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://" />}
         </Field>
         <Checkbox
           checked={ask}

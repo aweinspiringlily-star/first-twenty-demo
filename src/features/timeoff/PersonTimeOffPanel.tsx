@@ -11,7 +11,7 @@ import type { ID, LeaveCase, Person, TimeOffRequest, Viewer } from '@/domain/typ
 import { fmtDate, fmtDay, today } from '@/lib/dates'
 import { useDB } from '@/store/db'
 import { Badge, Button, Callout, EmptyState, Icon, IconButton, Menu, Money, Panel, SectionLabel } from '@/ui'
-import { approveTimeOff, cancelTimeOff, copyRequestDates, declineTimeOff, downloadRequestICS } from './actions'
+import { approveTimeOff, cancelTimeOff, copyRequestDates, declineTimeOff, downloadRequestICS, earlyWait, recordUnpaidTimeOff } from './actions'
 import { designationState, hoursWithDays, leavePhase, leaveText, rangeText } from './logic'
 import { LEAVE_LINKS, LegalNote, NoticeBadge, StatusBadge } from './parts'
 import { RequestTimeOffSheet } from './RequestTimeOffSheet'
@@ -32,7 +32,10 @@ export function PersonTimeOffPanel({ personId, hideRequest = false }: { personId
 
   if (!canSee) return <PrivateTimeOff person={person} />
 
-  const rows = balances(db, personId, t)
+  // An alumnus's balances stay as they were on the last day: nothing is earned or used after it.
+  const isFormer = !!person.endDate && person.endDate < t
+  const asOf = isFormer && person.endDate ? person.endDate : t
+  const rows = balances(db, personId, asOf)
   const tracked = rows.filter((r) => r.display !== 'per_event')
   const asNeeded = rows.filter((r) => r.display === 'per_event')
   const hpd = hoursPerDayFor(person)
@@ -46,14 +49,17 @@ export function PersonTimeOffPanel({ personId, hideRequest = false }: { personId
     return ph === 'upcoming' || ph === 'on_leave'
   })
   const sick = rows.find((r) => r.policy.kind === 'sick')
-  const isFormer = !!person.endDate && person.endDate < t
 
   return (
     <div className="flex flex-col gap-4">
       <Panel
         title={self ? 'My time off' : 'Time off'}
         icon="calendar"
-        subtitle={`${self ? 'You work' : `${firstName(person)} works`} ${person.hoursPerWeek} hours a week, so a day off is ${hpd} hours.`}
+        subtitle={
+          isFormer
+            ? `${firstName(person)} worked ${person.hoursPerWeek} hours a week. Balances as of the last day, ${fmtDate(asOf)}.`
+            : `${self ? 'You work' : `${firstName(person)} works`} ${person.hoursPerWeek} hours a week, so a day off is ${hpd} hours.`
+        }
         actions={
           canRequest && !isFormer && !hideRequest ? (
             <Button variant="primary" size="lg" icon="plus" onClick={() => setRequesting(true)}>
@@ -72,7 +78,7 @@ export function PersonTimeOffPanel({ personId, hideRequest = false }: { personId
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {tracked.map((r) => (
-                <BalanceCard key={r.policy.id} row={r} hpd={hpd} person={person} showPayout={viewer.role === 'admin'} />
+                <BalanceCard key={r.policy.id} row={r} hpd={hpd} person={person} showPayout={viewer.role === 'admin'} ended={isFormer} />
               ))}
             </div>
           )}
@@ -134,12 +140,27 @@ function asNeededNote(r: BalanceRow): string {
   return used > 0 ? `${r.note} ${hoursWithDays(used)} used or planned this year.` : r.note
 }
 
-function BalanceCard({ row, hpd, person, showPayout }: { row: BalanceRow; hpd: number; person: Person; showPayout: boolean }) {
+/**
+ * One balance. `ended`: the person has left, so the card shows the balance at the last day. The payout line
+ * follows the last day too: paid out at exit for an alumnus, at the last day for someone offboarding, and
+ * 'if they left today' for everyone else.
+ */
+function BalanceCard({ row, hpd, person, showPayout, ended }: { row: BalanceRow; hpd: number; person: Person; showPayout: boolean; ended: boolean }) {
   const db = useDB((s) => s.db)
   const t = today()
   const flexible = row.display === 'flexible'
-  const payout = showPayout && row.policy.paidOutOnExit && row.policy.method === 'accrual' ? vacationPayout(db, person.id, t) : null
+  const lastDay = person.endDate ?? undefined
+  const payout = showPayout && row.policy.paidOutOnExit && row.policy.method === 'accrual' ? vacationPayout(db, person.id, lastDay ?? t) : null
   const payoutRow = payout?.rows.find((r) => r.policyId === row.policy.id)
+  const before = row.startsOn
+  const amount = before ? before.hours : (row.available ?? 0)
+  const unit = before
+    ? `hours on ${fmtDate(before.date)}${row.usableFrom && row.usableFrom > before.date ? `, usable from ${fmtDate(row.usableFrom)}` : ''}`
+    : ended
+      ? 'hours at the last day'
+      : row.usableFrom
+        ? `hours, usable from ${fmtDate(row.usableFrom)}`
+        : 'hours available'
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-line bg-surface-2/50 px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -150,30 +171,45 @@ function BalanceCard({ row, hpd, person, showPayout }: { row: BalanceRow; hpd: n
               At cap
             </Badge>
           )}
-          {row.usableFrom && <Badge tone="neutral">Usable from {fmtDate(row.usableFrom)}</Badge>}
-          {row.policy.autoApprove && <Badge tone="outline">No approval needed</Badge>}
+          {row.policy.autoApprove && !row.usableFrom && !ended && <Badge tone="outline">No approval needed</Badge>}
         </span>
       </div>
       {flexible ? (
         <p className="num font-display text-[26px] leading-none font-bold text-ink">Flexible</p>
       ) : (
+        // Before the service wait ends the hours are granted but not yet usable, so they are not "available".
         <p className="flex flex-wrap items-baseline gap-x-2">
-          <span className="num font-display text-[28px] leading-none font-bold text-ink">{fmt(row.available ?? 0)}</span>
-          <span className="text-[14px] font-semibold text-ink-2">hours available</span>
-          <span className="num text-[13px] text-ink-3">({daysText((row.available ?? 0) / hpd)})</span>
+          <span className="num font-display text-[28px] leading-none font-bold text-ink">{fmt(amount)}</span>
+          <span className="text-[14px] font-semibold text-ink-2">{unit}</span>
+          <span className="num text-[13px] text-ink-3">({daysText(amount / hpd)})</span>
         </p>
       )}
       <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-[13px] sm:grid-cols-4">
-        {row.earned != null && <Fact label={row.policy.method === 'frontload' ? 'Granted' : 'Earned'} value={row.earned} />}
+        {row.earned != null && !before && <Fact label={row.policy.method === 'frontload' ? 'Granted' : 'Earned'} value={row.earned} />}
         <Fact label="Used" value={row.used} />
         <Fact label="Scheduled" value={row.scheduled} />
         <Fact label="Pending" value={row.pending} />
       </dl>
       <p className="text-[12.5px] text-ink-3">{row.note}</p>
       {row.policy.kind === 'sick' && <LegalNote label={LEAVE_LINKS.sick.label} url={LEAVE_LINKS.sick.url} extra="Never paid out at exit; restored if rehired within 12 months." />}
-      {payoutRow && (
+      {payoutRow && payout && (
         <p className="text-[12.5px] text-ink-2">
-          If {firstName(person)} left today: {fmt(payoutRow.hours)} hours paid out, <Money value={Math.round(payoutRow.amount)} /> (counts this pay period so far, since vacation is earned as it is worked). Unused vacation is paid with the final paycheck (
+          {ended ? (
+            <>
+              Paid out at exit, {fmtDate(payout.asOf)}: {fmt(payoutRow.hours)} hours, <Money value={Math.round(payoutRow.amount)} /> at the final rate.
+            </>
+          ) : lastDay ? (
+            <>
+              At the last day, {fmtDate(payout.asOf)}: {fmt(payoutRow.hours)} hours paid out, <Money value={Math.round(payoutRow.amount)} /> (counts what is earned through
+              that day, less time off taken by then).
+            </>
+          ) : (
+            <>
+              If {firstName(person)} left today: {fmt(payoutRow.hours)} hours paid out, <Money value={Math.round(payoutRow.amount)} /> (counts this pay period so far, since vacation is
+              earned as it is worked).
+            </>
+          )}{' '}
+          Unused vacation is paid with the final paycheck (
           <a href={LEAVE_LINKS.payout.url} target="_blank" rel="noreferrer noopener" className="font-semibold text-accent underline">
             {LEAVE_LINKS.payout.label}
           </a>
@@ -260,7 +296,9 @@ function RequestRow({ req, viewer }: { req: TimeOffRequest; viewer: Viewer }) {
   const self = viewer.personId === req.personId
   const typeName = policy ? (isConfidentialKind(policy.kind) && viewer.role !== 'admin' && !self ? 'Time off' : policy.name) : 'Time off'
   const canCancel = (self || viewer.role === 'admin') && (req.status === 'pending' || (req.status === 'approved' && req.startDate > t))
-  const canDecide = req.status === 'pending' && !policy?.autoApprove && canApproveTimeOff(viewer, db, req)
+  // Sick leave waits only when it falls before the service wait: Admin waives it or records it as unpaid.
+  const wait = earlyWait(db, req)
+  const canDecide = req.status === 'pending' && (!policy?.autoApprove || !!wait) && canApproveTimeOff(viewer, db, req)
   const approver = req.approverId ? db.people.find((p) => p.id === req.approverId) : undefined
   const hpd = person ? hoursPerDayFor(person) : 8
   return (
@@ -276,16 +314,32 @@ function RequestRow({ req, viewer }: { req: TimeOffRequest; viewer: Viewer }) {
         </p>
         <p className="text-[12.5px] text-ink-3">
           Requested {fmtDate(req.requestedOn)}
-          {req.status === 'approved' && policy?.autoApprove
+          {req.status === 'approved' && policy?.autoApprove && req.decisionNote === 'Approved automatically'
             ? '; approved automatically'
             : req.decidedOn && req.status !== 'pending'
               ? `; ${req.status} ${fmtDate(req.decidedOn)}${approver ? ` by ${fullName(approver)}` : ''}`
-              : ''}
+              : wait
+                ? `; waits for Admin (before sick leave is usable on ${fmtDate(wait.usableFrom)})`
+                : ''}
         </p>
+        {/* Why a decision went the way it did: a waived wait, unpaid days, an exit that cancelled it. */}
+        {req.decisionNote && req.decisionNote !== 'Approved automatically' && (self || viewer.role === 'admin') && (
+          <p className="text-[12.5px] text-ink-3">{req.decisionNote.replace(/\.?$/, '.')}</p>
+        )}
         {req.note && (self || viewer.role === 'admin' || canDecide) && <p className="mt-0.5 text-[13px] text-ink-2">&ldquo;{req.note}&rdquo;</p>}
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        {canDecide && (
+        {canDecide && wait && (
+          <>
+            <Button variant="primary" icon="check" onClick={() => act(req.id, () => approveTimeOff(req, viewer))}>
+              Waive the wait
+            </Button>
+            <Button variant="secondary" onClick={() => act(req.id, () => recordUnpaidTimeOff(req, viewer))}>
+              Record as unpaid
+            </Button>
+          </>
+        )}
+        {canDecide && !wait && (
           <>
             <Button variant="primary" icon="check" onClick={() => act(req.id, () => approveTimeOff(req, viewer))}>
               Approve

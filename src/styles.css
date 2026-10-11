@@ -178,6 +178,17 @@ body {
   }
 }
 
+/*
+  A text field focused by script (a sheet's first field, a deep link such as #settings.server) shows the
+  same ring. Browsers match :focus-visible there only after keyboard use, and some looks give fields no
+  :focus state of their own, so the caret would be the only sign of where typing goes. Unlayered, like
+  the ring above; :where keeps it below a look's own field focus rule (sleek's hugging ring).
+*/
+:where(.ft-input, .ft-select, .ft-textarea):focus:not(:focus-visible) {
+  outline: var(--focus-width) var(--focus-style) var(--focus);
+  outline-offset: var(--focus-offset);
+}
+
 ::selection {
   background: var(--accent-soft);
   color: var(--ink);

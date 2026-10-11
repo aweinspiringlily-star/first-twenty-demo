@@ -21,6 +21,11 @@ export function roleTemplates(db: Pick<DB, 'settings'>): RoleTemplate[] {
   return db.settings.roleTemplates ?? []
 }
 
+/** A template as a picker shows it: 'Customer success manager (CPA preferred)'. The job title is the name alone. */
+export function templateLabel(template: Pick<RoleTemplate, 'name' | 'hint'>): string {
+  return template.hint?.trim() ? `${template.name} (${template.hint.trim()})` : template.name
+}
+
 /** The template for a family and level: exact match first, then the same family. */
 export function findTemplateFor(db: Pick<DB, 'settings'>, familyId: ID, levelId?: ID): RoleTemplate | undefined {
   const list = roleTemplates(db)
@@ -43,10 +48,26 @@ export type JobFromTemplateOpts = {
   backfillForPersonId?: ID | null
 }
 
+/** The usual team for each job family track (default department ids). */
+function trackDepartments(): Record<string, ID> {
+  return { engineering: 'd-eng', product_design: 'd-product', gtm: 'd-gtm', finance_ops: 'd-ops', executive: 'd-exec' }
+}
+
+/**
+ * The team a job in this family usually sits in: the family track's default department when the
+ * workspace has it, else the first department on file (a renamed or custom set).
+ */
+export function departmentForFamily(db: Pick<DB, 'families' | 'departments'>, familyId: ID): ID {
+  const track = db.families.find((f) => f.id === familyId)?.track
+  const id = track ? trackDepartments()[track] : undefined
+  if (id && db.departments.some((d) => d.id === id)) return id
+  return db.departments[0]?.id ?? id ?? 'd-eng'
+}
+
 /**
  * A draft job prefilled from a role template: level, band (posted range = band min to max), equity
  * guideline, JD outline, stages and interview plan. Interviewers start empty except the hiring manager
- * on the panel.
+ * on the panel. The team comes from the template, else from the family (departmentForFamily).
  */
 export function jobFromTemplate(db: DB, template: RoleTemplate | undefined, opts: JobFromTemplateOpts): Job {
   const familyId = opts.familyId ?? template?.familyId ?? 'f-eng'
@@ -57,7 +78,7 @@ export function jobFromTemplate(db: DB, template: RoleTemplate | undefined, opts
     id: opts.id ?? newId('j'),
     // No template and no title: leave it empty so the sheet's required-title check asks for one.
     title: opts.title ?? template?.name ?? '',
-    departmentId: opts.departmentId ?? template?.departmentId ?? 'd-eng',
+    departmentId: opts.departmentId ?? template?.departmentId ?? departmentForFamily(db, familyId),
     familyId,
     levelId,
     hiringManagerId: opts.hiringManagerId,

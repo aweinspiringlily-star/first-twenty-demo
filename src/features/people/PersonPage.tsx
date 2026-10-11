@@ -1,6 +1,7 @@
 // Person profile: header (avatar, #number, title, team, manager, location, status, tenure, actions
 // by role) and tabs gated by canSeePerson: Overview, Job and pay, Equity, Time off, Checklists and
-// documents, Emergency contacts, Activity. '.offboard' and '.change' open those sheets.
+// documents, Emergency contacts, Activity. '.offboard' and '.change' open those sheets. A pending last
+// day shows only to those canSeeSeparation allows; an alumni profile offers Rehire to Admin.
 import { useMemo, useRef, useState } from 'react'
 import type { PageProps } from '@/app/routes'
 import { links, navigate, replaceRoute } from '@/app/router'
@@ -8,13 +9,13 @@ import { useViewer } from '@/app/useViewer'
 import { ChangeJobSheet, PersonEquityPanel, PersonJobPayPanel } from '@/features/comp'
 import { PersonTrainingPanel } from '@/features/compliance'
 import { PersonTimeOffPanel, StartLeaveSheet } from '@/features/timeoff'
-import { canSeeBackgroundDetail, canSeePerson, type PersonArea } from '@/domain/access'
+import { canSeeBackgroundDetail, canSeePerson, canSeeSeparation, type PersonArea } from '@/domain/access'
 import { personRetention } from '@/domain/compliance'
 import { grantSummary } from '@/domain/equity'
 import { departmentName, directReports, fullName, getPerson, levelLabel, onLeave } from '@/domain/people'
 import { trainingRequirements } from '@/domain/trainings'
 import type { DocumentRecord, EmergencyContact, ID, Person, Role } from '@/domain/types'
-import { addDays, fmtDate, fmtDateTime, fmtDuration, type ISODate, today } from '@/lib/dates'
+import { addDays, fmtDate, fmtDateTime, fmtDuration, fmtMonth, type ISODate, today } from '@/lib/dates'
 import { num } from '@/lib/format'
 import { newId } from '@/lib/id'
 import { logActivity, useDB } from '@/store/db'
@@ -38,7 +39,8 @@ import {
   Tabs,
   TextInput,
 } from '@/ui'
-import { dayLabel, nextAnniversary, personDirStatus, personLocation, startsInText } from './helpers'
+import { AddPersonSheet, prefillForRehire } from './AddPersonSheet'
+import { dayLabel, LINE_MAX_CHARS, LINK_MAX_CHARS, nextAnniversary, personDirStatus, personLocation, startsInText } from './helpers'
 import { OffboardSheet, SEPARATION_LABEL } from './OffboardSheet'
 import { ChecklistCard, PersonChecklistsPanel } from './panels'
 import { EmpNo, LEAVE_KIND_LABEL, PersonStatusBadge, undoToast } from './parts'
@@ -50,12 +52,91 @@ const WORK_MODE: Record<Person['workMode'], string> = { onsite: 'Onsite', hybrid
 const EMPLOYMENT: Record<Person['employmentType'], string> = { full_time: 'Full time', part_time: 'Part time', intern: 'Intern' }
 const ROLE_LABEL: Record<Role, string> = { admin: 'Admin', manager: 'Hiring manager', employee: 'Employee' }
 
-function PersonLink({ person }: { person: Person | undefined }) {
+/** A 40px tall target; `inline` pulls it back to the line height inside running text. */
+const LINK = 'inline-flex min-h-10 items-center font-semibold text-accent hover:underline'
+
+function PersonLink({ person, inline = true, suffix }: { person: Person | undefined; inline?: boolean; suffix?: string }) {
   if (!person) return <span className="text-ink-3">None</span>
   return (
-    <a href={links.person(person.id)} className="font-semibold text-accent hover:underline">
+    <a href={links.person(person.id)} className={inline ? `-my-2.5 ${LINK}` : LINK}>
       #{person.hireNumber} {fullName(person)}
+      {suffix}
     </a>
+  )
+}
+
+/** Work email, or "Not set" (no known company domain at hire); Admin can set it in place. */
+function WorkEmail({ person }: { person: Person }) {
+  const viewer = useViewer()
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(person.workEmail)
+  const [tried, setTried] = useState(false)
+  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+  const id = `work-email-${person.id}`
+  if (editing) {
+    const save = () => {
+      setTried(true)
+      if (!valid) return
+      const label = `Set the work email for ${fullName(person)}`
+      useDB.getState().mutate(label, (d) => {
+        const p = d.people.find((x) => x.id === person.id)
+        if (!p) return
+        p.workEmail = value.trim()
+        logActivity(d, { entityType: 'person', entityId: person.id, kind: 'work_email', text: label })
+      })
+      undoToast(label)
+      setEditing(false)
+    }
+    return (
+      <span className="flex flex-col gap-2">
+        <TextInput
+          id={id}
+          aria-label="Work email"
+          aria-invalid={tried && !valid ? true : undefined}
+          aria-describedby={tried && !valid ? `${id}-error` : undefined}
+          type="email"
+          maxLength={LINE_MAX_CHARS}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="name@yourcompany.com"
+          data-autofocus
+        />
+        {tried && !valid && (
+          <span id={`${id}-error`} className="text-[12.5px] font-semibold text-bad">
+            Enter an email address like name@yourcompany.com.
+          </span>
+        )}
+        <span className="flex flex-wrap gap-2">
+          <Button variant="primary" size="sm" onClick={save}>
+            Save
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+            Cancel
+          </Button>
+        </span>
+      </span>
+    )
+  }
+  const edit = () => {
+    setValue(person.workEmail)
+    setTried(false)
+    setEditing(true)
+  }
+  return (
+    <span className="flex flex-wrap items-center gap-x-3">
+      {person.workEmail ? (
+        <a className={`-my-2.5 ${LINK} font-normal`} href={`mailto:${person.workEmail}`}>
+          {person.workEmail}
+        </a>
+      ) : (
+        <span className="text-ink-3">Not set</span>
+      )}
+      {viewer.role === 'admin' && (
+        <button type="button" onClick={edit} className="-my-2.5 inline-flex min-h-10 items-center text-[13.5px] font-semibold text-ink-2 hover:text-ink" aria-label={`${person.workEmail ? 'Change' : 'Set'} the work email for ${fullName(person)}`}>
+          {person.workEmail ? 'Change' : 'Set work email'}
+        </button>
+      )}
+    </span>
   )
 }
 
@@ -74,13 +155,17 @@ function Overview({ person }: { person: Person }) {
   const reports = directReports(db, person.id)
   const status = personDirStatus(db, person, t)
   const anniv = nextAnniversary(person.startDate, t)
+  // A departure still ahead shows only to Admin, the person and their manager line; others see Active.
+  const separationVisible = canSeeSeparation(viewer, db, person.id)
+  const earlier = person.rehireOfPersonId ? getPerson(db, person.rehireOfPersonId) : undefined
+  const backAs = db.people.find((p) => p.rehireOfPersonId === person.id)
   const leave = db.leaveCases
     .filter((l) => l.personId === person.id && !l.returnedOn && !l.endedOn && (!l.expectedReturn || l.expectedReturn > t))
     .sort((a, b) => a.startDate.localeCompare(b.startDate))[0]
 
   const events: UpcomingEvent[] = []
   if (person.startDate > t) events.push({ date: person.startDate, icon: 'calendar', text: `Starts ${dayLabel(person.startDate)} (${startsInText(person.startDate, t).replace('starts ', '')})` })
-  if (person.endDate && person.endDate >= t) events.push({ date: person.endDate, icon: 'log-out', text: `Last day ${dayLabel(person.endDate)}` })
+  if (separationVisible && person.endDate && person.endDate >= t) events.push({ date: person.endDate, icon: 'log-out', text: `Last day ${dayLabel(person.endDate)}` })
   if (status !== 'alumni') {
     events.push({ date: anniv.date, icon: 'star', text: `${anniv.years}-year work anniversary ${dayLabel(anniv.date)}` })
   }
@@ -126,8 +211,9 @@ function Overview({ person }: { person: Person }) {
       })
     }
   }
-  // A leaver's anniversaries, vests and trainings after the last day never happen.
-  const until = person.endDate
+  // A leaver's anniversaries, vests and trainings after the last day never happen (cut only where the
+  // viewer may know the last day, so the list itself never gives a pending departure away).
+  const until = separationVisible || status === 'alumni' ? person.endDate : undefined
   const upcoming = (until ? events.filter((e) => e.date <= until) : events).sort((a, b) => a.date.localeCompare(b.date))
 
   const lists = can('checklists') ? db.checklists.filter((c) => c.personId === person.id && !c.completedOn) : []
@@ -147,9 +233,9 @@ function Overview({ person }: { person: Person }) {
                 {
                   label: 'Direct reports',
                   value: reports.length ? (
-                    <span className="flex flex-col gap-0.5">
+                    <span className="-my-2.5 flex flex-col">
                       {reports.map((r) => (
-                        <PersonLink key={r.id} person={r} />
+                        <PersonLink key={r.id} person={r} inline={false} />
                       ))}
                     </span>
                   ) : (
@@ -160,7 +246,13 @@ function Overview({ person }: { person: Person }) {
                 { label: 'Work mode', value: WORK_MODE[person.workMode] },
                 { label: 'Start date', value: fmtDate(person.startDate) },
                 { label: 'Tenure', value: person.startDate > t ? 'Not started yet' : fmtDuration(person.startDate, person.endDate && person.endDate < t ? person.endDate : t) },
-                { label: 'Work email', value: <a className="text-accent hover:underline" href={`mailto:${person.workEmail}`}>{person.workEmail}</a> },
+                { label: 'Work email', value: <WorkEmail person={person} /> },
+                {
+                  label: 'Rehire of',
+                  value: earlier ? <PersonLink person={earlier} suffix={` (${fmtMonth(earlier.startDate)} to ${fmtMonth(earlier.endDate)})`} /> : '',
+                  hidden: !earlier || !can('job'),
+                },
+                { label: 'Rehired as', value: <PersonLink person={backAs} />, hidden: !backAs || !can('job') },
                 { label: 'Level', value: levelLabel(db, person.levelId), hidden: !can('job') },
                 { label: 'Employment', value: `${EMPLOYMENT[person.employmentType]}, ${person.hoursPerWeek} hours a week`, hidden: !can('job') },
                 {
@@ -184,13 +276,15 @@ function Overview({ person }: { person: Person }) {
                 {
                   label: 'Hired from',
                   value: person.fromCandidateId ? (
-                    <a className="text-accent hover:underline" href={links.candidate(person.fromCandidateId)}>
+                    <a className={`-my-2.5 ${LINK}`} href={links.candidate(person.fromCandidateId)}>
                       Candidate record
                     </a>
                   ) : person.fromContractorId && db.contractors.some((k) => k.id === person.fromContractorId) ? (
-                    <a className="text-accent hover:underline" href={links.contractor(person.fromContractorId)}>
+                    <a className={`-my-2.5 ${LINK}`} href={links.contractor(person.fromContractorId)}>
                       Converted from a contractor
                     </a>
+                  ) : earlier ? (
+                    'Rehired by hand'
                   ) : (
                     'Added by hand'
                   ),
@@ -338,10 +432,10 @@ function ContactForm({ initial, onSave, onCancel, saveLabel }: { initial: Emerge
     <div className="rounded-xl border border-line bg-surface-2/50 p-4">
       <FormGrid>
         <Field label="Name" required error={tried && !c.name.trim() ? 'Add a name.' : undefined}>
-          {(id, d) => <TextInput id={id} aria-describedby={d} value={c.name} onChange={(e) => setC({ ...c, name: e.target.value })} data-autofocus autoComplete="off" />}
+          {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={c.name} onChange={(e) => setC({ ...c, name: e.target.value })} data-autofocus autoComplete="off" />}
         </Field>
         <Field label="Phone" required error={tried && !c.phone.trim() ? 'Add a phone number.' : undefined}>
-          {(id, d) => <TextInput id={id} aria-describedby={d} type="tel" inputMode="tel" value={c.phone} onChange={(e) => setC({ ...c, phone: e.target.value })} autoComplete="off" />}
+          {(id, d) => <TextInput id={id} aria-describedby={d} type="tel" inputMode="tel" maxLength={LINE_MAX_CHARS} value={c.phone} onChange={(e) => setC({ ...c, phone: e.target.value })} autoComplete="off" />}
         </Field>
       </FormGrid>
       <Field label="Relationship" className="mt-4" id={`rel-${initial.name || 'new'}`}>
@@ -354,7 +448,15 @@ function ContactForm({ initial, onSave, onCancel, saveLabel }: { initial: Emerge
               onChange={(v) => setC({ ...c, relation: v === 'Other' ? '' : v })}
               options={[...RELATIONS, 'Other'].map((r) => ({ value: r, label: r }))}
             />
-            {other && <TextInput aria-label="Relationship (other)" placeholder="For example: roommate" value={c.relation} onChange={(e) => setC({ ...c, relation: e.target.value })} />}
+            {other && (
+              <TextInput
+                aria-label="Relationship (other)"
+                placeholder="For example: roommate"
+                maxLength={LINE_MAX_CHARS}
+                value={c.relation}
+                onChange={(e) => setC({ ...c, relation: e.target.value })}
+              />
+            )}
           </div>
         )}
       </Field>
@@ -436,7 +538,7 @@ function EmergencyContacts({ person }: { person: Person }) {
                     {c.name} <span className="font-normal text-ink-3">({c.relation})</span>
                   </p>
                   <p className="text-[14px] text-ink-2">
-                    <a href={`tel:${c.phone}`} className="hover:text-accent">
+                    <a href={`tel:${c.phone}`} className="-my-2.5 inline-flex min-h-10 items-center hover:text-accent">
                       {c.phone}
                     </a>
                   </p>
@@ -563,7 +665,16 @@ function Documents({ person }: { person: Person }) {
               )}
             </Field>
             <Field label="Name" hint="Optional">
-              {(id, d) => <TextInput id={id} aria-describedby={d} value={form.name} placeholder={DOC_TYPE[form.type]} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} />}
+              {(id, d) => (
+                <TextInput
+                  id={id}
+                  aria-describedby={d}
+                  maxLength={LINE_MAX_CHARS}
+                  value={form.name}
+                  placeholder={DOC_TYPE[form.type]}
+                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                />
+              )}
             </Field>
           </FormGrid>
           <Field label="Status" className="mt-4" id="doc-status">
@@ -592,7 +703,17 @@ function Documents({ person }: { person: Person }) {
             )}
           </Field>
           <Field label="Link to the file" className="mt-4" hint="Where it lives. Never upload the file here.">
-            {(id, d) => <TextInput id={id} aria-describedby={d} type="url" value={form.link} placeholder="https://" onChange={(e) => setForm((f) => ({ ...f, link: e.target.value }))} />}
+            {(id, d) => (
+              <TextInput
+                id={id}
+                aria-describedby={d}
+                type="url"
+                maxLength={LINK_MAX_CHARS}
+                value={form.link}
+                placeholder="https://"
+                onChange={(e) => setForm((f) => ({ ...f, link: e.target.value }))}
+              />
+            )}
           </Field>
           <div className="mt-4 flex flex-wrap gap-2">
             <Button variant="primary" onClick={save}>
@@ -715,6 +836,9 @@ export function PersonPage({ route }: PageProps) {
   const seg = route.segments[2]
   const person = getPerson(db, id)
   const [leaveOpen, setLeaveOpen] = useState(false)
+  const [rehireOpen, setRehireOpen] = useState(false)
+  // Built once per opening, so the sheet resets to it (a new object every render would reset it each time).
+  const rehirePrefill = useMemo(() => (rehireOpen && person ? prefillForRehire(useDB.getState().db, person.id) : undefined), [rehireOpen, person?.id])
   const t = today()
 
   if (!person) {
@@ -727,7 +851,7 @@ export function PersonPage({ route }: PageProps) {
           title="This change was undone"
           body={`Undid: ${undone}. The record is no longer in this workspace.`}
           action={
-            <a href={links.people()} className="font-bold text-accent underline">
+            <a href={links.people()} className="inline-flex min-h-10 items-center font-bold text-accent underline">
               Back to People
             </a>
           }
@@ -740,7 +864,7 @@ export function PersonPage({ route }: PageProps) {
         title={contractor ? `${contractor.name} is a ${contractor.kind}` : 'No one with that link'}
         body={contractor ? 'Contractors and advisors have their own page.' : 'This link does not match anyone in this workspace. Data lives in each browser, so someone added in another browser is not here.'}
         action={
-          <a href={contractor ? links.contractor(contractor.id) : links.people()} className="font-bold text-accent underline">
+          <a href={contractor ? links.contractor(contractor.id) : links.people()} className="inline-flex min-h-10 items-center font-bold text-accent underline">
             {contractor ? 'Open their page' : 'Back to People'}
           </a>
         }
@@ -771,6 +895,8 @@ export function PersonPage({ route }: PageProps) {
   const changeOpen = seg === 'change' && admin
   const closeSheet = () => replaceRoute('person', person.id)
   const alumni = status === 'alumni'
+  // Rehire is offered until a newer record for the same person exists.
+  const rehiredAs = db.people.find((p) => p.rehireOfPersonId === person.id)
 
   return (
     <>
@@ -797,7 +923,7 @@ export function PersonPage({ route }: PageProps) {
                 {person.title}, {departmentName(db, person.departmentId)}
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 text-[13.5px] text-ink-2">
-                <PersonStatusBadge db={db} person={person} status={status} leave={leave} showLeaveType={can('leave')} />
+                <PersonStatusBadge db={db} person={person} status={status} leave={leave} showLeaveType={can('leave')} showLastDay={canSeeSeparation(viewer, db, person.id)} />
                 {manager && (
                   <span>
                     Reports to <PersonLink person={manager} />
@@ -821,9 +947,14 @@ export function PersonPage({ route }: PageProps) {
         </div>
         {admin && (
           <div className="ft-pagehead__actions flex flex-wrap items-center gap-2">
+            {alumni && !rehiredAs && (
+              <Button variant="primary" icon="user-plus" onClick={() => setRehireOpen(true)}>
+                Rehire
+              </Button>
+            )}
             {!alumni && (
               <>
-                <Button variant="primary" icon="trend" onClick={() => navigate('person', person.id, 'change')}>
+                <Button variant="primary" icon="trend" data-change-job onClick={() => navigate('person', person.id, 'change')}>
                   Change job or pay
                 </Button>
                 {!leave && (
@@ -869,6 +1000,17 @@ export function PersonPage({ route }: PageProps) {
           <OffboardSheet personId={person.id} open={offboardOpen} onClose={closeSheet} />
           <ChangeJobSheet personId={person.id} open={changeOpen} onClose={closeSheet} />
           <StartLeaveSheet personId={person.id} open={leaveOpen} onClose={() => setLeaveOpen(false)} />
+          {alumni && (
+            <AddPersonSheet
+              open={rehireOpen}
+              prefill={rehirePrefill}
+              onClose={() => setRehireOpen(false)}
+              onCreated={(newId) => {
+                setRehireOpen(false)
+                navigate('person', newId)
+              }}
+            />
+          )}
         </>
       )}
     </>

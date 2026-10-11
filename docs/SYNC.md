@@ -18,11 +18,12 @@ Decisions (from the user, October 2026):
 
 | Piece | Where | Notes |
 |---|---|---|
-| API server | `server/src/**` (Fastify 5 + `pg`), built into `dist-server/server.mjs` with Vite SSR | Node 22+. Serves `/api/*` and, when `SERVE_APP=true`, the one-file app at `/`. |
+| API server | `server/src/**` (Fastify 5 + `pg`), built into `dist-server/server.mjs` with Vite SSR | Node 22+. Serves `/api/*` and, when `SERVE_APP=true`, the one-file app at `/` and its offline worker at `/sw.js`. |
 | SQL migrations | `server/sql/NNN_name.sql`, applied by `npm run server:migrate` | Tracked in `schema_migrations`. |
 | Shared collection list | `src/sync/collections.ts` | The single source of truth for which DB keys are record collections (one table each) and which are single documents. Server and client both import it. A test asserts it matches `src/domain/types.ts`. |
 | Browser sync engine | `src/sync/**` | Diff, outbox, API client, pull/push loop, status store. No UI. |
-| Sync UI | Settings > Server (`#settings.server`), a header status chip, sync banners under the header, the rail note | Opened from a file or the claude.ai artifact viewer, Settings > Server only explains the server and makes no request. |
+| Sync UI | Settings > Server (`#settings.server`), a header status chip, sync banners under the header, the rail note, the sample banner | Opened from a file or the claude.ai artifact viewer, Settings > Server only explains the server and makes no request. A browser that is not connected asks once per page load (`checkServer`) whether a server answers here: for the sample on any page served over http(s), and for any other workspace only on a page the server served (`isServedPage()`, the served mark), so the Vite dev server or a file never probes `/api` for it. If one does, the sample banner offers "Sign in to your server" (or, signed in to an empty server, Start fresh, which then uploads, and Import a backup) before Start fresh, the rail note says where to sign in, and a dismissible notice points a workspace of the company's own at the server while it lives in this browser only. A sign-in asks again; connecting or disconnecting updates the answer. `checkServer` asks `GET /api/auth/session`, so a browser that is not signed in logs no 401 on a normal page load, and, signed in and not connected, `GET /api/workspace/status` (`empty`; never the old servers' fallback, which would download the workspace). |
+| Offline worker | `server/src/offline.ts` (served at `/sw.js`), registered by `src/main.tsx` | Keeps the latest app page, so a page the server served opens again from the browser's copy while the server cannot be reached (see Opening while offline). |
 | Deploy kit | `server/deploy/**` and `docs/SERVER.md` | EC2 setup script, systemd unit, Caddyfile, Postgres role and database SQL, backups, SSH tunnel for development. |
 | Dev database | `DATABASE_URL=pglite:./.data/pg` (default when unset in development) | PGlite (real Postgres in WebAssembly) so development and tests need no Postgres install. Production always uses `pg`. |
 
@@ -98,7 +99,9 @@ scripts) are not affected, and the development origin (`ALLOWED_ORIGIN`) is exem
 | `POST /api/auth/login` | `{email, password, remember?: boolean}` (body limit 8 KB) | `200 {user: {id, email, role}}` + cookie (see `remember` above); `400` when `remember` is not a boolean; `401 {error: 'invalid_credentials'}`; `429 {error: 'rate_limited', retryAfter}` (per 15 minutes: 10 attempts per client address, IPv6 per /64; 10 per email from one address, cleared by a successful sign-in; 100 failures per email from all addresses; a sign-in with a valid trusted-device cookie for this login is held to none of these, only to 10 attempts per device, cleared by a successful sign-in, so failures from many addresses cannot lock its owner out); `429 {error: 'busy', retryAfter}` when too many password checks are waiting. The email is trimmed and lowercased once, and that one string is both the rate-limit key and the lookup (never cut short). A sign-in with no password check (empty email or password, an email over 254 characters after trimming, a password over 1,024 characters, or refused as busy) counts against the client address only. Each limit keeps at most 50,000 keys in memory. The two email limits never drop a key that holds a lockout; when every key of one holds one, a sign-in that needs a new email key gets `429 rate_limited` until the oldest lockout ends (filling them takes password checks, which run two at a time). Every sign-in adds an address key, even one with no password check, so when every address key holds a lockout the oldest one is forgotten instead: cheap sign-ins from many addresses cannot lock everyone else out. |
 | `POST /api/auth/logout` | | `204`, session deleted and the cookie cleared (the trusted-device cookie stays). Clients treat `204` and `401` as "no session left"; anything else (no answer, `5xx`) means the session may still be open (see Sign-out below). |
 | `GET /api/auth/me` | | `200 {user}` or `401`. |
-| `GET /api/workspace` | | `200 {workspaceId, historyId, seq, db, versions}` where `versions` maps `"collection:id"` to version; `404 {error: 'empty'}` before the first upload. |
+| `GET /api/auth/session` | | `200 {user}` when signed in, `200 {user: null}` when not: never `401`, which browsers log as a console error, so the app's checks on every page load (`checkServer`, the session probe on focus) use it. A cookie that names no live session is cleared, as on `/api/auth/me`. Servers from before it answer `404`; the client then asks `/api/auth/me` (a `401` there means nobody) for the rest of the page's life. |
+| `GET /api/workspace` | | `200 {workspaceId, historyId, seq, db, versions}` where `versions` maps `"collection:id"` to version; `404 {error: 'empty'}` before the first upload (kept for older apps). |
+| `GET /api/workspace/status` | | `200 {empty: true}` before the first upload, else `200 {empty: false, workspaceId, historyId, seq}`, with no records read: the app's "is it empty?" looks (the connect step, the `server_empty` hold, `checkServer`) use it, so an empty server is an answer and not a `404` in the console. `401` without a session. Servers from before it answer `404`; the client (`workspaceStatus()`) then asks `GET /api/workspace` instead for the rest of the page's life (its `empty` becomes `{empty: true}`, and a workspace comes along as `snapshot`), or, with `fallback: false` (`checkServer`), answers kind `not_found` without asking. |
 | `PUT /api/workspace` | `{db, confirmReplace?: boolean}` | Replaces everything in one transaction and starts a new history. Allowed without `confirmReplace` only when the server is empty. `200 {historyId, seq, versions}`. Used for the first upload, Import and Start fresh. Body limit 10 MB. |
 | `GET /api/changes?since=<seq>&history=<historyId>` | | `200 {historyId, seq, changes: Change[]}` (oldest first, at most 5,000; `more: true` when truncated) or `200 {resync: true}`, also when `history` is given and is not the current history id. `history` is optional. |
 | `POST /api/changes` | `{changes: ClientChange[], historyId?}` (at most 2,000) | `200 {historyId, seq, applied: Applied[], conflicts: Conflict[]}`. Applied in one transaction; each change independently accepted or rejected. `409 {error: 'resync'}` (nothing applied) when `historyId` is given and is not the current one: load the snapshot, rebase, then push again. |
@@ -108,8 +111,8 @@ Types:
 ```ts
 type Change = { seq: number; collection: string; id: string; op: 'upsert' | 'delete'; version: number; data?: unknown }
 type ClientChange = { collection: string; id: string; op: 'upsert' | 'delete'; data?: unknown; baseVersion: number | null }
-type Applied = { collection: string; id: string; version: number }
-type Conflict = { collection: string; id: string; serverVersion: number | null; serverData: unknown | null }
+type Applied = { collection: string; id: string; version: number; existing?: true }
+type Conflict = { collection: string; id: string; serverVersion: number | null; serverData: unknown | null; byYou?: true; landed?: true }
 ```
 
 Rules:
@@ -117,10 +120,37 @@ Rules:
 - `collection` must be a known record collection or `$doc` (with a known doc key); anything else is
   `400`. Records must have `data.id === id`. Each record is at most 256 KB.
 - `baseVersion` is the version the client last saw (`null` = the client believes it is new). The server
-  accepts when it matches the current version (or the record does not exist and `baseVersion` is `null`
-  or the record was deleted). Otherwise it returns a conflict with the server's current copy.
+  accepts when it matches the current version, or the record does not exist and `baseVersion` is `null`,
+  or the record was deleted and `baseVersion` is at least the delete's version (a client that saw the
+  delete). A missing document is always recreated. Otherwise it returns a conflict with the server's
+  current copy (`serverData` null when the record is gone): an edit made on a copy from before another
+  device's delete loses to the delete, like any newer change, and never brings the record back. A client
+  re-creates a record it deleted (Undo) as new: it forgets the version after its delete is applied or
+  pulled, and sends `baseVersion: null`.
+- An upsert whose data already equals the server's copy is applied without a write and marked
+  `existing: true` (a retried push whose first attempt landed). A conflict carries `byYou: true` when the
+  signed-in user wrote the server's copy (or the delete that removed it), from any device, and
+  `landed: true` when the change log holds this exact upsert after `baseVersion` (an earlier attempt of it
+  landed; the log forgets a record's upserts when it is deleted, and every row after 120 days). All three
+  are additive: older clients ignore them, and older servers never send them.
 - **The server wins conflicts.** The client replaces its copy with `serverData` (or removes it when
-  `serverData` is null) and tells the user how many items were refreshed.
+  `serverData` is null) and tells the user which items were refreshed (`refreshedKeys`, named and linked
+  in the notice). The edit that lost leaves no trace: the Undo step that made it goes (when all of that
+  step's record changes lost), and so do the activity rows that step logged while they were unsynced
+  (still queued, or delivered in the same batch: then the client sends a delete), so neither Undo nor the
+  activity log claims an edit that never landed. A step that also changed something that stayed keeps its
+  place and its rows. After a reload there is no Undo history to read, so a lost record takes the unsynced
+  rows whose `entityId` is that record. Two exceptions, both about pushes whose answers this browser lost
+  (see Unanswered pushes): an activity row the server reports `existing` is history (an earlier push of
+  its step landed), so it is never deleted and its step stays; and a retry of an attempt that `landed`,
+  beaten by a copy the same user wrote (`byYou`), takes that copy quietly, with no notice.
+- **Documents merge by field.** A `$doc` record holds unrelated panels (Settings > Company has eight), so
+  the client also records which top-level fields it changed while the document is queued, each with a
+  fingerprint of its value in the copy the edit was made on (`fieldBases`). On a conflict, when the
+  server's copy still has the base value (or already this device's value) in every one of those fields,
+  the client takes `serverData`, puts its own fields on top, and sends that on the server's version: both
+  edits survive and nothing counts as refreshed. Otherwise (both changed one field, or a document queued
+  by an older build without field prints) the server wins as above. Record collections always merge whole.
 - Deletes are hard deletes in the record table plus a `delete` change in the log.
 - Clients should send the `historyId` they last received with every pull and push. The server checks it
   only when it is sent, so older clients keep working; for them the seq-based versions and the
@@ -133,15 +163,21 @@ Rules:
 
 - `connection` state per device (localStorage `first-twenty:sync:v1`): `{v: 1, mode: 'local' | 'server',
   workspaceId, seq, versions, outbox, rejected, lastSyncAt, user, sampleAllowed, hold, unconfirmed,
-  bases, schema, storeMark, historyId}`. `bases` holds, per queued or refused key, a fingerprint of the
-  server's copy the edit was made on (see Server lost its workspace). `historyId` is the server's history id from the last snapshot, replace or
+  bases, fieldBases, schema, storeMark, historyId, signedOutByUser}`. `bases` holds, per queued or refused
+  key, a fingerprint of the server's copy the edit was made on (see Server lost its workspace);
+  `fieldBases` the same per changed field of a queued document (see Documents merge by field).
+  `signedOutByUser` is set by Sign out and cleared by the next sign-in (see Sign-out). `historyId` is the server's history id from the last snapshot, replace or
   pull page (null for connections saved by older builds or servers without history ids; a pull page
   teaches it, a push answer never does). `schema` is a fingerprint of the shared collection list: a build whose list differs
   rebuilds from the server snapshot on start. `storeMark` must equal the counter in
   `first-twenty:sync:mark:v1`, written after the store is saved; when they differ (the tab died between
   the two saves) the engine also rebuilds from the snapshot before pushing. Queued edits survive both.
 - **Connecting** offers "Upload this browser's workspace" (empty server, or `confirmReplace`) or "Use the
-  server's copy". The sample company never syncs implicitly: loading it over a synced workspace puts the
+  server's copy". `inspectServer()` asks `GET /api/workspace/status` first and downloads the workspace only
+  when there is one. When the two copies share a name, the one that is newer and holds more records (people,
+  jobs, candidates, funding rounds, departments, filled company settings; activity rows only break a tie)
+  is marked Recommended, unless the copy it would replace holds records it lacks: then neither is, and the
+  step says what each choice would lose. The sample company never syncs implicitly: loading it over a synced workspace puts the
   connection on **hold** (`'sample'`), and undoing back to the synced workspace resumes. Other holds:
   `'server_empty'` (the server lost its workspace, see below), `'replaced'` (the store swapped workspaces
   outside `replaceWorkspace()`) and `'demo_clock'` (see Demo clock). After Upload, Use the server's copy
@@ -150,13 +186,19 @@ Rules:
 - **Server lost its workspace** (`'server_empty'`: a push or pull answered `404 empty`, after a database
   reset or a restore from an empty backup): nothing is pushed or pulled, but edits keep queueing (and so do
   changes applied on load), so they count as pending and survive a reload. The engine looks at the server
-  again on start, on window focus and on `online` (never on a timer). Once another computer has uploaded:
+  again on start, on window focus and on `online` (never on a timer), with `GET /api/workspace/status`
+  first, so a server that is still empty logs no `404`. Once another computer has uploaded:
   the same workspace (`isWorkspaceSwap` false) is joined. The base versions of queued and refused edits
   belong to the copy the server lost, so each key is compared by content instead (`bases`): where the
   uploaded record is still the one the edit was made on, the edit stays on top and goes out on the
-  server's current version; where it differs (another computer changed it, before the reset or during the
-  hold), the server wins as in any conflict, the edit is dropped and the record counts in `refreshed`.
-  Keys queued by older builds have no fingerprint and stay on top. A different workspace is taken whole, as under Replaced
+  server's current version (a document whose uploaded copy changed only other fields keeps this device's
+  fields on top, as in Documents merge by field); where it differs (another computer changed it, before
+  the reset or during the hold), the server wins as in any conflict, the edit is dropped (with its Undo
+  step and unsynced activity rows) and the record counts in `refreshed`. Keys queued by older builds have
+  no fingerprint and stay on top. The same comparison runs whenever a rebuild from the snapshot finds this
+  same workspace under another history id (another computer re-uploaded it, or imported a backup of it,
+  or the server was restored): a browser that never saw the server empty gets `409 resync` on its push
+  instead of `404`, and its queued edits are kept or dropped by content exactly the same way. A different workspace is taken whole, as under Replaced
   from another computer. `uploadLocal()` from this hold that gets `409 not_empty` does the same look and
   resolves `{ok: true, message}` (`JOINED_MESSAGE` or `SWITCHED_MESSAGE`). `useServerCopy()` from this hold
   joins the same workspace with the queued edits; for a different one it answers kind `'pending'` while
@@ -164,13 +206,14 @@ Rules:
   `not_empty` it could not resolve, Use the server's copy and Replace the server's workspace.
 - **Demo clock** ('Pretend today is', Settings > Data; `clockOverride` option, the app passes
   `getClockOverride`): a pretend date applies job changes and hand-offs that are not due yet when the
-  page loads, marks them applied on that date and saves them, and activity rows get pretend timestamps.
+  page loads, marks them applied on that date and saves them, expires sent offers whose date it has
+  passed, and activity rows get pretend timestamps.
   None of it may reach the server, so while the clock is on the connection holds (`'demo_clock'`): start
   queues nothing (no baseline diff) and fixes the queued entries with the data saved before that load,
   edits are not queued, nothing is pushed or pulled, and `uploadLocal`, `useServerCopy` and a connected
   `replaceWorkspace` refuse with kind `'demo_clock'` (`CLOCK_MESSAGE`). Decision: the records the pretend
   date touched (comp rows marked applied on a future date, the people they changed, hand-off
-  reassignments) and edits made while pretending cannot be told apart from real data record by record, so
+  reassignments, offers it expired and the options they released) and edits made while pretending cannot be told apart from real data record by record, so
   none of them is kept; the promotion then takes effect on its real date like any other.
   The way back: the first start on a pretend date saves the workspace as saved before that load, with the
   connection as it was, under `first-twenty:sync:clock:v1`. It is kept apart from the connection, so a tab
@@ -195,8 +238,10 @@ Rules:
 - **Diff**: after every store change, compare the previous and next `DB` (Immer keeps unchanged
   objects identical): for each collection whose array changed, records added or replaced become upserts and
   records gone become deletes; changed documents become `$doc` upserts. Pure function `diffDB(prev, next)`.
-  Changes the store applies on load (effective-dated job changes, hand-offs) are diffed against the saved
-  copy and pushed too; the activity rows they log get content-based ids (`act-auto-<hash>`) so every
+  Changes the store applies on load (effective-dated job changes, hand-offs, then offers past their expiry
+  date: `applyLoadChanges` in `src/store/db.ts`, which the engine's `onLoad` uses too, so the two never
+  drift apart) are diffed against the saved copy and pushed too; the activity rows they log get
+  content-based ids (`act-auto-<hash>`, unless the domain gave them a deterministic id already) so every
   device writes the same row.
 - **Outbox**: one entry per `collection:id` holding keys only (`{collection, id, op, rev}`); the data is
   read from the store when the push goes out (entries keep their data, `fixed`, only while a hold shows
@@ -209,15 +254,39 @@ Rules:
   write and rebases on it. Versions are workspace-wide seqs, so that write is rarely at base + 1 (another
   record in the batch, the activity row each edit logs, another device): only the order is checked, and
   the fingerprint is the evidence. The test server (`src/sync/testing/fakeServer.ts`) numbers versions the
-  same way.
+  same way. The notes are saved with the connection before the push leaves, and every answer is saved as
+  soon as it arrives (`commit`), but a browser that dies (a crash, power loss) can lose its latest
+  localStorage writes, since browsers write them to disk in batches: it restarts from an older saved
+  state, with the store and the connection from the same moment. Its first push is then a retry of moves
+  the server already took, followed by newer ones of its own, and the note that it sent them may be among
+  the lost writes too. A conflict that says `landed` and `byYou` (the server's log holds this exact upsert,
+  and this user wrote its newer copy), with no newer local edit of the record, takes the server's copy
+  quietly whether or not a note survived: no notice, and its Undo step and activity rows stay. A conflict
+  whose server copy is exactly what was sent counts as applied (newer servers answer `existing`). A noted delete on the same base whose
+  record is gone on the server (`serverData` null) means this device's delete landed: an upsert after it
+  (Undo) goes out again as new (`baseVersion: null`). An activity row applied as `existing` is never
+  deleted as part of an edit that lost (see The server wins conflicts).
 - **Refused changes**: a batch the server refuses with `400`/`413` is halved until the bad change is found;
-  that change is set aside in `rejected` (still counted as pending; `retryRejected()` puts it back).
+  that change is set aside in `rejected` (still counted as pending; `retryRejected()` puts it back). Each
+  keeps its reason: `'too_large'` for a record over 256 KB, which the client sets aside without sending it
+  (or the server's `413`). Retrying cannot help those, so `retryRejected()` leaves them, and the UI offers
+  Discard instead: `discardRejected(refs?)` drops the refused change and puts the server's copy back (from
+  the snapshot, or removes the record when the server never had it) like a pull, with no Undo step; the
+  Undo step that made it goes when nothing else is left of it, and so do the activity rows that step
+  logged, even ones an earlier batch delivered (the record change never reached the server): queued rows
+  leave the outbox, and rows the server has get a delete. With the step gone, its toast closes and the
+  header no longer offers its Undo. Known limit: after a reload there is no Undo history, so Discard
+  removes only the rows about the record (`entityId`) that are still queued; a row already delivered stays
+  on the server (telling it apart from another device's row about the same record would need the history).
   After 3 refusals in a row the engine stops and backs off as a server error.
 - **Pull**: every 30 seconds while visible, on window focus and after each push; applies remote changes
   straight into the store with `useDB.setState` (not through `mutate`, so they do not become Undo steps),
   updating `versions` and `seq`. Changes that echo this device's own pushes are skipped by version. A
-  record with a queued or refused local change is never overwritten by a pull. `resync: true` rebuilds
-  from the snapshot. The client sends its `historyId` with every pull (`&history=`) and push (body), so
+  deleted record has no version left, so the engine remembers, in memory, the version of each delete it
+  had applied until a pull passes it: the echo of its own delete (and anything older) is skipped too.
+  Applying it would also remove the record from every Undo snapshot, and Undo of the delete would bring
+  nothing back. A record with a queued or refused local change is never overwritten by a pull. `resync: true` rebuilds
+  from the snapshot (by content when the history id changed: see Server lost its workspace). The client sends its `historyId` with every pull (`&history=`) and push (body), so
   after a replace or restore a push is refused whole (`409 resync`): the engine loads the snapshot first,
   then pushes what is left.
 - **Replaced from another computer**: when a rebuild from the snapshot finds a different workspace (another
@@ -226,11 +295,34 @@ Rules:
   keeps what this browser showed in memory. The status gets `replacedRemotely: {companyName, previousName,
   at}`; `getReplacedBackup()` returns the copy for a backup download and `clearReplacedRemotely()` lets it
   go. The header shows a role=alert notice with Download backup, Copy backup and Dismiss. The same
-  history (a pruned log) or the same workspace (a restore) rebases as before, keeping queued edits.
+  history (a pruned log) rebases as before, keeping queued edits. The same workspace under another
+  history (a restore, an Import of a backup or a re-upload on another computer) rebases by content and
+  sets `restoredRemotely: {at}`, so the header can say that the server's copy was replaced by another copy
+  of it and changes made after that copy was taken may be gone (`clearRestoredRemotely()` dismisses it). This browser's own
+  Import, Start fresh or upload learns the new history id from its answer, so it never sees the notice.
 - **Replacing everything** (Import, Start fresh): `replaceWorkspace(db)` sends `PUT /api/workspace` with
   `confirmReplace` and only then sets the store; on failure nothing changes. Not connected, it is
   `useDB.replace`.
-- **Sign-out**: `signOut()` keeps the offline copy and resolves `{ok: true, confirmed, message}`. The
+- **Opening while offline**: the workspace, the outbox and the connection live in localStorage, so a tab
+  that stays open keeps working offline and syncs later. Opening the app again (a new tab, a restart)
+  needs the page itself: the server adds a `<meta name="first-twenty-served">` tag to the app page it
+  serves (right after `<head>`), and `src/main.tsx` registers the server's worker (`/sw.js`,
+  `server/src/offline.ts`) only when that tag is there, so never from a file, the claude.ai artifact
+  viewer or the Vite dev server (and browsers allow workers on https and localhost only). The worker
+  answers navigations to `/` and `/index.html` from the network first and keeps each good answer (and a
+  first copy when it installs); when the network fails, or the server answers `5xx` (Caddy's `502` while
+  the server is stopped), it opens the kept page, headers included, so its CSP still matches its scripts.
+  Cache Storage is only touched through caught calls (opening the cache, reading the kept page, keeping a
+  copy, dropping old caches), so a browser whose store fails (damaged, full disk, quota) still opens the
+  page from the network, just without an offline copy; when both fail, the network's own error stands.
+  It never handles `/api` or any other request, and holds no workspace data. The app then starts from the
+  browser's copy, shows Offline, and syncs when the server is back.
+- **Sign-out**: `signOut()` keeps the offline copy and resolves `{ok: true, confirmed, waiting, message}`.
+  Connected and signed in, it first sends what is queued while the session still works, starting batches
+  for up to 5 seconds (`SIGN_OUT_PUSH_MS`); `waiting` counts what is left, and `message` then adds that
+  those changes were not sent yet and sync after the next sign-in in this browser. It sets
+  `signedOutByUser`, so Settings keeps saying "You signed out" (not that the session ended) until a
+  sign-in clears it, even after edits or a reload. The
   session cookie is `HttpOnly`, so only the server can end it: when `POST /api/auth/logout` gets no `204`
   or `401` (offline, `5xx`), `confirmed` is false and the engine writes `first-twenty:logout-pending`. While
   that key exists the engine never resumes from the cookie (focus, start, `checkServer`, other tabs), the
@@ -239,12 +331,24 @@ Rules:
   sign-in removes the key too (the server drops the old session on every sign-in). `disconnect()` does
   the same and resolves `{ok: true, confirmed, message}`; the key outlives the cleared connection, so
   `initSync()` starts the engine for it even in a browser that is local only now.
-  `signOut({forgetThisBrowser: true})` sends queued changes first (counting any another tab saved), then
+  `signOut({forgetThisBrowser: true})` sends queued changes first (counting any another tab saved; when
+  signed out, the refusal says to sign in to send them first, or remove them anyway), then
   needs the server to end the session: if it cannot, nothing is removed and the result is kind
   `'session_open'` (`SESSION_OPEN_MESSAGE`), unless `keepServerSession` is set (then the data goes, the key
   is written after the wipe, and the session stays valid until this browser reaches the server again).
   Otherwise it removes every `first-twenty:` localStorage key and reloads; if changes are still queued it
-  removes nothing and returns kind `'pending'` (unless `discardPending`).
+  removes nothing and returns kind `'pending'` (unless `discardPending`). Its message
+  (`FORGOTTEN_MESSAGE`: signed out and removed, your server keeps everything that reached it; or
+  `FORGOTTEN_OPEN_MESSAGE`) goes to `reload(notice)`, which the app leaves in sessionStorage
+  (`first-twenty-reload-notice`, not a `first-twenty:` key, so the wipe keeps it); the next page shows it
+  once as a toast (`takeReloadNotice()`, in the shell). A browser whose storage refuses shows none.
+- **Starting without a 401**: page-load checks never meet a `401`. `start()` on a connection the user
+  signed out of (`signedOutByUser`) sends nothing at all: changes queue, status `signed_out`, until a sign-in
+  (or another tab's, seen on focus through `GET /api/auth/session`). With a saved user it first asks
+  `GET /api/auth/session`, and nothing syncs until that answers (`canSync`): nobody signed in (a session
+  cookie that ended with the browser, the 12-hour limit) is status `signed_out` with no authed request;
+  offline or a server error starts as before and the cycle reports it. The demo clock and hold branches
+  are unchanged (a `server_empty` hold looks at the server once the session holds).
 - **Other tabs**: removing this browser's data posts `{type: 'forget'}` on the BroadcastChannel
   `first-twenty`, and every other tab also sees the storage events. A tab whose workspace key is removed
   (only this flow removes it; a `clear()` by another page on a shared origin is ignored, since this tab's
@@ -254,19 +358,30 @@ Rules:
   its connection back (`disconnectedElsewhere()`). A tab that finds `first-twenty:logout-pending` set when
   it is about to sync treats itself as signed out and helps end the session.
 - **Status** (zustand store `useSyncStatus`): `status: 'local' | 'synced' | 'syncing' | 'offline' |
-  'signed_out' | 'error'`, plus `mode`, `pending`, `rejected`, `lastSyncAt`, `lastError`, `nextRetryAt`,
-  `user`, `hold`, `refreshed` (items the server's copy replaced), `storageFull` (the browser refused to
-  save changes that have not reached the server; the page then warns before closing), `logoutPending` (a
-  sign-out the server has not confirmed yet) and `replacedRemotely` (see above). `hold` is one of
+  'signed_out' | 'error'`, plus `mode`, `pending` (raw outbox entries, internal), `pendingEdits` (the same
+  as a person counts edits: an activity row is left out when the record it is about waits too, or the
+  document its entityType names (`compliance` for `complianceStatus`, `company`, `settings`, `equity`: one
+  kit checkbox counts once), and counted when it waits alone, like a note; every count shown to people
+  uses it, and `waitingCount()` adds `rejected` for "not reached the server"), `rejected`, `rejectedKeys`
+  (`{collection, id, tooLarge}` per refused change), `lastSyncAt`, `lastError`, `nextRetryAt`, `user`,
+  `hold`, `refreshed` (items the server's copy replaced, each counted once), `refreshedKeys` (which ones,
+  newest last, at most 20; one the server no longer has carries `removed: true` and `copy`, this browser's
+  last copy, in memory only, so the notice can say "Your edit to the Research department was dropped: it
+  was removed on another computer"),
+  `storageFull` (the browser refused to save changes that have not reached the server; the page then warns
+  before closing), `logoutPending` (a sign-out the server has not confirmed yet), `signedOutByUser` (see
+  Sign-out), `replacedRemotely` and `restoredRemotely` (see above). `hold` is one of
   `'sample' | 'server_empty' | 'replaced' | 'demo_clock'` (status `'local'` while it is set). The UI shows
   it; the engine never renders UI.
 - Undo keeps working: undoing produces a store change, which the diff turns into ordinary changes. Remote
-  changes are applied to the Undo history too, so Undo only reverts this user's own edits.
-- **Wiring** (done): `src/main.tsx` calls `initSync()` before the first render; Settings > Data calls
+  changes are applied to the Undo history too, so Undo only reverts this user's own edits (the echo of
+  this device's own delete is not remote: see Pull).
+- **Wiring** (done): `src/main.tsx` calls `initSync()` before the first render, and registers the offline
+  worker for a page the server served (see Opening while offline); Settings > Data calls
   `replaceWorkspace(db, label)` for Import and Start fresh; Settings > Server (`#settings.server`,
   `src/features/settings/ServerTab.tsx`) uses `connect.*` (`connect.signIn(email, password, {remember})`
-  sends Keep me signed in; `remember` defaults to false), `signOut`, `disconnect`, `syncNow`, shows
-  `res.message` after Sign out and Disconnect, and offers "Remove anyway" (`keepServerSession: true`) after
+  sends Keep me signed in; `remember` defaults to false), `signOut`, `disconnect`, `syncNow`,
+  `discardRejected`, shows `res.message` after Sign out and Disconnect, and offers "Remove anyway" (`keepServerSession: true`) after
   kind `'session_open'`. Its hold panel shows the result's `message` when Upload joined or switched, and
   offers Go back to the real date for `'demo_clock'` (once back on the real date with no copy to rebuild
   from, it says this browser waits for the server's copy and that changes made until then are not kept); Settings > Data's Pretend today is says, while
@@ -289,7 +404,9 @@ Rules:
 - Security headers on every response (CSP for the served app, `X-Content-Type-Options`, `Referrer-Policy`,
   `Frame-Options`); no CORS by default (`ALLOWED_ORIGIN` only for development). The app's CSP allows its
   inline scripts by SHA-256 hash (computed from `APP_FILE` at startup, which is then served from memory),
-  never `'unsafe-inline'` for scripts.
+  never `'unsafe-inline'` for scripts, and workers from its own origin only (`worker-src 'self'`). The
+  offline worker's script (`/sw.js`, `application/javascript`, `no-cache`) carries its own policy,
+  `default-src 'none'; connect-src 'self'`.
 - Every `/api` route sits in one Fastify plugin whose hooks (CSRF header, cross-site refusal,
   `Cache-Control: no-store`) apply by route match, so percent-encoded paths get the same guards. Never
   relax the CSRF header: on a shared parent domain such as `*.sslip.io`, `SameSite` treats every sibling

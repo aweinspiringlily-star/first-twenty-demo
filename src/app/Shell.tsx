@@ -9,9 +9,19 @@ import { plural } from '@/lib/format'
 import { useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
 import { LOOKS } from '@/themes/registry'
-import { Avatar, cx, Icon, rovingKeyDown, rovingTabIndex, Tally, useEscape, useFocusTrap } from '@/ui'
-import { useSyncStatus } from '@/sync'
-import { Header, openPalette, PreviewBanner, SampleBanner, SyncBanners, SyncChip, useSyncStorageWarning } from './Header'
+import { Avatar, cx, Icon, rovingKeyDown, rovingTabIndex, Tally, toast, useEscape, useFocusTrap } from '@/ui'
+import { isServedPage, takeReloadNotice, useSyncStatus } from '@/sync'
+import {
+  Header,
+  openPalette,
+  PreviewBanner,
+  SampleBanner,
+  ServerHereBanner,
+  SyncBanners,
+  SyncChip,
+  useServerHere,
+  useSyncStorageWarning,
+} from './Header'
 import { activeNavKey, visibleNav } from './nav'
 import { links, useRoute } from './router'
 import { useViewer } from './useViewer'
@@ -213,11 +223,32 @@ function RailNote() {
     if (s.hold) return 'Saved in this browser; syncing is paused'
     // Only states that last: 'syncing' passes in under a second after every edit, so it never changes the note.
     const stuck = s.status === 'signed_out' || s.status === 'offline' || s.status === 'error'
-    if (stuck && s.pending + s.rejected > 0) return 'Saved in this browser; changes wait to sync'
+    if (stuck && s.pendingEdits + s.rejected > 0) return 'Saved in this browser; changes wait to sync'
     if (s.rejected > 0) return 'Saved in this browser; some changes need attention'
     return 'Saved in this browser and on your server'
   })
-  return <p className="ft-rail__note px-1 text-[11.5px] text-ink-3">{text}</p>
+  // Not connected, on a page a server answered for: say where to sign in, or that an empty server waits
+  // for this workspace. Asked on every page the server served, sample or not (a founder who started fresh
+  // here keeps the pointer after a reload). Text only: the banners carry the 40px actions.
+  const local = useSyncStatus((s) => s.mode !== 'server')
+  const sample = useDB((s) => s.db.meta.sample)
+  const server = useServerHere(local && isServedPage())
+  const hint =
+    !local || !server
+      ? ''
+      : !server.signedIn
+        ? '. A server is available here: sign in under Settings, Server'
+        : !server.empty
+          ? ''
+          : sample
+            ? '. Your server is empty: start fresh or import your company, then upload it'
+            : '. Your server is empty: upload this workspace under Settings, Server'
+  return (
+    <p className="ft-rail__note px-1 text-[11.5px] text-ink-3">
+      {text}
+      {hint}
+    </p>
+  )
 }
 
 function StorageWarning() {
@@ -294,6 +325,12 @@ export function Shell({ children }: { children: ReactNode }) {
 
   useEffect(() => setMenuOpen(false), [route.raw])
 
+  // A notice the page before a reload left (Sign out and remove data reloads before its toast is read).
+  useEffect(() => {
+    const notice = takeReloadNotice()
+    if (notice) toast({ text: notice })
+  }, [])
+
   return (
     <div className="ft-app flex min-h-full">
       <aside className="ft-rail sticky top-0 hidden h-screen w-[264px] shrink-0 flex-col gap-3 border-r border-line bg-paper px-3 pt-4 pb-3 lg:flex">
@@ -355,6 +392,7 @@ export function Shell({ children }: { children: ReactNode }) {
           <SyncBanners />
           <PreviewBanner />
           <SampleBanner />
+          <ServerHereBanner />
           {children}
           {LookFooter && (
             <div className="ft-decor ft-decor--footer">

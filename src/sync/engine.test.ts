@@ -5,7 +5,15 @@ import { setClockOverride } from '@/lib/dates'
 import { useDB } from '@/store/db'
 import type { SyncApi } from './api'
 import { diffDB } from './diff'
-import { createSyncEngine, DEBOUNCE_MS, type EngineOptions, MAX_REFUSALS_IN_A_ROW, STORAGE_FULL_MESSAGE, type SyncEngine } from './engine'
+import {
+  createSyncEngine,
+  DEBOUNCE_MS,
+  type EngineOptions,
+  FORGOTTEN_MESSAGE,
+  MAX_REFUSALS_IN_A_ROW,
+  STORAGE_FULL_MESSAGE,
+  type SyncEngine,
+} from './engine'
 import { applyLoadChanges } from './index'
 import { workspaceIdOf } from './loadTime'
 import { CLOCK_COPY_KEY, emptyConnection, LOGOUT_PENDING_KEY, loadConnection, SYNC_SCHEMA, SYNC_STORAGE_KEY, saveConnection } from './state'
@@ -135,6 +143,8 @@ describe('connecting', () => {
     server.signedIn = false
     const b = device(server)
     expect(await b.engine.checkServer()).toEqual({ ok: true, version: 'test', signedIn: false, user: null })
+    // Asked the way that answers "nobody" without a 401 (r2-48).
+    expect(server.calls).toEqual(['health', 'session'])
     const wrong = await b.engine.signIn(TEST_ADMIN_EMAIL, 'nope')
     expect(wrong).toMatchObject({ ok: false, kind: 'invalid_credentials' })
     if (!wrong.ok) expect(wrong.message).toMatch(/email and password/)
@@ -584,8 +594,9 @@ describe('sessions', () => {
     a.mutate(rename('p-2', 'Also signed out'))
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS)
     expect(syncCalls()).toBe(calls)
-    // Focus only checked whether the session came back.
-    expect(server.calls.at(-1)).toBe('me')
+    // Focus only checked whether the session came back (GET /api/auth/session: no 401 for nobody).
+    expect(server.calls.at(-1)).toBe('session')
+    expect(server.calls).not.toContain('me')
     expect(a.st().pending).toBe(2)
     expect(await a.engine.signIn(TEST_ADMIN_EMAIL, 'wrong')).toMatchObject({ ok: false })
     expect(a.st().status).toBe('signed_out')
@@ -1582,7 +1593,7 @@ describe('signing out and forgetting this browser (SEC-2)', () => {
     const server = new FakeServer()
     const a = forgetful(server)
     expect(await a.engine.uploadLocal()).toEqual({ ok: true })
-    expect(await a.engine.signOut()).toEqual({ ok: true, confirmed: true, message: 'Signed out. This browser keeps an offline copy.' })
+    expect(await a.engine.signOut()).toEqual({ ok: true, confirmed: true, waiting: 0, message: 'Signed out. This browser keeps an offline copy.' })
     expect(a.wipeLocal).not.toHaveBeenCalled()
     expect(a.db().people.some((p) => p.id === 'p-1')).toBe(true)
   })
@@ -1691,6 +1702,7 @@ describe('sign-outs the server could not confirm (security F1, F2)', () => {
     expect(res).toEqual({
       ok: true,
       confirmed: false,
+      waiting: 0,
       message: 'Signed out in this browser. Your server could not be reached, so its session stays open until this browser reconnects and ends it.',
     })
     expect(a.st()).toMatchObject({ status: 'signed_out', user: null, logoutPending: true })
@@ -2374,5 +2386,935 @@ describe('after the server lost its workspace (review #4)', () => {
     // B's edit to a record A left alone still goes on top.
     expect(serverTitle(server, 'p-1')).toBe('Queued on B')
     expect(b.st()).toMatchObject({ status: 'synced', hold: null, pending: 0, refreshed: 1 })
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end review, package P1 (sync engine)
+// ---------------------------------------------------------------------------------------------
+
+/** A rename that also logs an activity row about the person, as the app's edits do. */
+const renameLogged =
+  (id: string, title: string, rowId: string): Recipe =>
+  (d) => {
+    d.people.find((p) => p.id === id)!.title = title
+    d.activity.push({ id: rowId, at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: id, kind: 'edited', text: `Renamed to ${title}` })
+  }
+const hasRow = (db: DB, id: string) => db.activity.some((r) => r.id === id)
+const labels = (dev: Device) => dev.store.getState().past.map((e) => e.label)
+
+describe("an edit the server's copy replaced leaves no trace (r1-01)", () => {
+  it('names the record, and drops its Undo step and the activity row it logged, here and on the server', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    b.mutate(rename('p-1', 'B wins'))
+    await quiet(b)
+    a.store.getState().mutate('Renamed p-1', renameLogged('p-1', 'A loses', 'act-a-lost'))
+    expect(labels(a)).toEqual(['Renamed p-1'])
+    await quiet(a)
+    expect(titleOf(a, 'p-1')).toBe('B wins')
+    expect(a.st()).toMatchObject({ refreshed: 1, refreshedKeys: [{ collection: 'people', id: 'p-1' }], pending: 0 })
+    // Nothing claims the edit any more: no Undo step, no activity row here or on the server.
+    expect(labels(a)).toEqual([])
+    expect(hasRow(a.db(), 'act-a-lost')).toBe(false)
+    expect(server.record('activity', 'act-a-lost')).toBeUndefined()
+    await b.engine.syncNow()
+    expect(hasRow(b.db(), 'act-a-lost')).toBe(false)
+    expect(diffDB(a.db(), server.snapshot())).toEqual([])
+  })
+
+  it('keeps the Undo step and the row of an edit that also changed something that stayed', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    b.mutate(rename('p-1', 'B wins'))
+    await quiet(b)
+    a.store.getState().mutate('Renamed two people', (d) => {
+      renameLogged('p-1', 'A loses', 'act-two')(d)
+      d.people.find((p) => p.id === 'p-2')!.title = 'A keeps'
+    })
+    await quiet(a)
+    expect(titleOf(a, 'p-1')).toBe('B wins')
+    expect(serverTitle(server, 'p-2')).toBe('A keeps')
+    expect(labels(a)).toEqual(['Renamed two people'])
+    expect(server.record('activity', 'act-two')).toBeTruthy()
+  })
+
+  it('after a reload (no Undo history), the unsynced row about the lost record goes too', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a0 = await uploader(server, link)
+    link.online = false
+    a0.mutate(renameLogged('p-1', 'A offline', 'act-offline'))
+    await quiet(a0)
+    a0.engine.stop()
+    const a = device(link, a0.db(), a0.storage)
+    a.engine.start()
+    await a.engine.whenIdle()
+    const b = await joiner(server)
+    b.mutate(rename('p-1', 'B meanwhile'))
+    await quiet(b)
+    link.online = true
+    await a.engine.syncNow()
+    await quiet(a)
+    expect(titleOf(a, 'p-1')).toBe('B meanwhile')
+    expect(hasRow(a.db(), 'act-offline')).toBe(false)
+    expect(server.record('activity', 'act-offline')).toBeUndefined()
+    expect(a.st()).toMatchObject({ refreshed: 1, pending: 0 })
+  })
+
+  it('counts a record once while the notice shows, newest last', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    for (const [id, round] of [['p-1', 1], ['p-2', 1], ['p-1', 2]] as const) {
+      b.mutate(rename(id, `B ${round}`))
+      await quiet(b)
+      a.mutate(rename(id, `A ${round}`))
+      await quiet(a)
+    }
+    expect(a.st().refreshed).toBe(2)
+    expect(a.st().refreshedKeys).toEqual([
+      { collection: 'people', id: 'p-2' },
+      { collection: 'people', id: 'p-1' },
+    ])
+    a.engine.clearRefreshed()
+    expect(a.st()).toMatchObject({ refreshed: 0, refreshedKeys: [] })
+  })
+})
+
+describe('documents merged by field (r1-02)', () => {
+  it('two devices editing different fields of the company record both keep their edit', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    a.mutate((d) => {
+      d.company.website = 'https://a.example'
+    })
+    await quiet(a)
+    b.store.getState().mutate('Updated HQ and pay schedule', (d) => {
+      d.company.phone = '408-555-0100'
+      d.company.regularPayday = 'the 15th and the last day of each month'
+    })
+    await quiet(b)
+    expect(server.record('$doc', 'company')).toMatchObject({ website: 'https://a.example', phone: '408-555-0100' })
+    expect(b.db().company).toMatchObject({ website: 'https://a.example', phone: '408-555-0100' })
+    expect(b.st()).toMatchObject({ refreshed: 0, pending: 0 })
+    expect(labels(b)).toEqual(['Updated HQ and pay schedule'])
+    // Undo on B reverts B's fields only, never what A did.
+    b.store.getState().undo()
+    expect(b.db().company.website).toBe('https://a.example')
+    expect(b.db().company.phone).toBeUndefined()
+    await quiet(b)
+    await a.engine.syncNow()
+    expect(a.db().company.website).toBe('https://a.example')
+    expect(a.db().company.phone).toBeUndefined()
+    expect(diffDB(a.db(), server.snapshot())).toEqual([])
+  })
+
+  it('the same field edited on both: the server wins, and the record is named', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    a.mutate((d) => {
+      d.company.phone = '408-555-0101'
+    })
+    await quiet(a)
+    b.mutate((d) => {
+      d.company.phone = '408-555-0199'
+      d.company.website = 'https://b.example'
+    })
+    await quiet(b)
+    expect(b.db().company.phone).toBe('408-555-0101')
+    expect(b.db().company.website).toBeUndefined()
+    expect(b.st()).toMatchObject({ refreshed: 1, refreshedKeys: [{ collection: '$doc', id: 'company' }], pending: 0 })
+  })
+
+  it('a document queued before field tracking existed stays whole-record', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    a.mutate((d) => {
+      d.company.website = 'https://a.example'
+    })
+    await quiet(a)
+    b.engine.stop()
+    b.mutate((d) => {
+      d.company.phone = '408-555-0100'
+    })
+    // Saved by an older build: the key is queued, with no field prints.
+    saveConnection(b.storage, { ...b.conn(), outbox: [{ collection: '$doc', id: 'company', op: 'upsert', rev: 1, at: 0 }], fieldBases: {} })
+    const b2 = device(server, b.db(), b.storage)
+    b2.engine.start()
+    await quiet(b2)
+    expect(b2.db().company.phone).toBeUndefined()
+    expect(b2.st().refreshed).toBe(1)
+  })
+})
+
+describe('a server copy from another history of this workspace (r1-03, r1-12)', () => {
+  /** A and B synced; B goes offline with a queued edit; the server is reset and A uploads its copy again. */
+  async function resetWhileBOffline(editOnA?: Recipe) {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const link = deviceLink(server)
+    const b = await joiner(server, link)
+    link.online = false
+    b.mutate(rename('p-1', 'Tagged on B'))
+    await quiet(b)
+    server.loseWorkspace()
+    await a.engine.syncNow()
+    expect(a.st().hold).toBe('server_empty')
+    if (editOnA) a.mutate(editOnA)
+    expect(await a.engine.uploadLocal()).toEqual({ ok: true })
+    await a.engine.whenIdle()
+    link.online = true
+    return { server, a, b }
+  }
+
+  it('keeps an edit queued on the copy the server still has and sends it, after a 409 resync (never a 404)', async () => {
+    const { server, b } = await resetWhileBOffline()
+    const before = server.pushes.length
+    await b.engine.syncNow()
+    await quiet(b)
+    // The first push was refused whole (another history); the second carried the edit on the new version.
+    expect(server.pushes.length).toBe(before + 2)
+    expect(serverTitle(server, 'p-1')).toBe('Tagged on B')
+    expect(b.st()).toMatchObject({ status: 'synced', hold: null, pending: 0, refreshed: 0 })
+    expect(b.st().restoredRemotely).not.toBeNull()
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+
+  it('an edit to a record the re-uploaded copy changed loses, named, as any conflict would', async () => {
+    const { server, b } = await resetWhileBOffline(rename('p-1', 'A during the hold'))
+    await b.engine.syncNow()
+    await quiet(b)
+    expect(serverTitle(server, 'p-1')).toBe('A during the hold')
+    expect(titleOf(b, 'p-1')).toBe('A during the hold')
+    expect(b.st()).toMatchObject({ pending: 0, refreshed: 1, refreshedKeys: [{ collection: 'people', id: 'p-1' }] })
+  })
+
+  it('another computer importing an older backup of this workspace says so here, and only here (r1-12)', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    const backup = structuredClone(a.db())
+    b.mutate(rename('p-1', 'After the backup'))
+    await quiet(b)
+    await a.engine.syncNow()
+    expect(await a.engine.replaceWorkspace(backup, { label: 'Imported a backup' })).toEqual({ ok: true })
+    await a.engine.whenIdle()
+    b.page.emit('focus')
+    await b.engine.whenIdle()
+    expect(titleOf(b, 'p-1')).toBe('Engineer')
+    expect(b.st()).toMatchObject({ replacedRemotely: null, restoredRemotely: { at: expect.any(String) } })
+    // The computer that imported knows what it did: no notice there.
+    await a.engine.syncNow()
+    expect(a.st().restoredRemotely).toBeNull()
+    b.engine.clearRestoredRemotely()
+    expect(b.st().restoredRemotely).toBeNull()
+  })
+})
+
+describe('signing out with changes waiting (r1-04, r1-10, r1-13)', () => {
+  it('a plain sign-out sends queued changes first while the session still works', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    a.mutate(rename('p-1', 'Sent before sign-out'))
+    expect(await a.engine.signOut()).toMatchObject({ ok: true, confirmed: true, waiting: 0 })
+    expect(serverTitle(server, 'p-1')).toBe('Sent before sign-out')
+    expect(server.calls.filter((c) => c === 'postChanges' || c === 'logout').slice(-2)).toEqual(['postChanges', 'logout'])
+    expect(a.st()).toMatchObject({ status: 'signed_out', pending: 0, signedOutByUser: true })
+  })
+
+  it('says how many changes could not be sent, and keeps calling it a sign-out until the next sign-in', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    server.failures.push({ ok: false, kind: 'server', status: 503, error: null })
+    a.mutate(rename('p-1', 'Not sent'))
+    const res = await a.engine.signOut()
+    expect(res).toMatchObject({ ok: true, confirmed: true, waiting: 1 })
+    expect(res.ok && res.message).toBe(
+      'Signed out. This browser keeps an offline copy. 1 change was not sent yet; it syncs after you sign in again in this browser.',
+    )
+    a.mutate(rename('p-2', 'Queued while signed out'))
+    expect(a.st()).toMatchObject({ status: 'signed_out', pendingEdits: 2, signedOutByUser: true })
+    // A reload still knows the sign-out was on purpose.
+    a.engine.stop()
+    const a2 = device(server, a.db(), a.storage)
+    a2.engine.start()
+    await a2.engine.whenIdle()
+    expect(a2.st()).toMatchObject({ status: 'signed_out', pendingEdits: 2, signedOutByUser: true })
+    expect(await a2.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    expect(a2.st().signedOutByUser).toBe(false)
+    await a2.engine.whenIdle()
+    expect(serverTitle(server, 'p-2')).toBe('Queued while signed out')
+  })
+
+  it('a session that ended on its own is not called a sign-out', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    server.signedIn = false
+    a.mutate(rename('p-1', 'After the session ended'))
+    await quiet(a)
+    expect(a.st()).toMatchObject({ status: 'signed_out', signedOutByUser: false })
+  })
+
+  it('signed out, removing this browser\'s data says to sign in first, not to sync (r1-13)', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    expect(await a.engine.signOut()).toMatchObject({ ok: true })
+    a.mutate(renameLogged('p-1', 'Waiting', 'act-waiting'))
+    const res = await a.engine.signOut({ forgetThisBrowser: true })
+    expect(res).toMatchObject({ ok: false, kind: 'pending', pending: 1 })
+    expect(!res.ok && res.message).toBe(
+      "1 change has not reached the server. Removing this browser's data now loses it. Sign in to send it first, or remove it anyway.",
+    )
+  })
+})
+
+describe('a change too large to sync (r1-05)', () => {
+  const bigNote =
+    (id: string): Recipe =>
+    (d) => {
+      d.activity.push({ id, at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: 'p-1', kind: 'note', text: 'x'.repeat(300_000) })
+    }
+
+  it('is set aside as too large, never retried, and Discard removes it with its Undo step', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const before = server.pushes.length
+    a.store.getState().mutate('Added a note', bigNote('act-big'))
+    await quiet(a)
+    expect(server.pushes.length).toBe(before)
+    expect(a.st()).toMatchObject({ rejected: 1, rejectedKeys: [{ collection: 'activity', id: 'act-big', tooLarge: true }] })
+    a.engine.retryRejected()
+    await quiet(a)
+    expect(server.pushes.length).toBe(before)
+    expect(a.st().rejected).toBe(1)
+    const reads = server.callCount('getWorkspace')
+    expect(await a.engine.discardRejected()).toEqual({ ok: true })
+    // The server never had it: nothing to fetch, nothing to undo.
+    expect(server.callCount('getWorkspace')).toBe(reads)
+    expect(hasRow(a.db(), 'act-big')).toBe(false)
+    expect(labels(a)).toEqual([])
+    expect(a.st()).toMatchObject({ rejected: 0, pending: 0, rejectedKeys: [] })
+  })
+
+  it("Discard puts back the server's copy of a record the server has, with no Undo step", async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    a.mutate((d) => {
+      d.people.find((p) => p.id === 'p-2')!.notes = 'x'.repeat(300 * 1024)
+    })
+    await quiet(a)
+    expect(a.st().rejectedKeys).toEqual([{ collection: 'people', id: 'p-2', tooLarge: true }])
+    expect(await a.engine.discardRejected([{ collection: 'people', id: 'p-2' }])).toEqual({ ok: true })
+    expect(a.db().people.find((p) => p.id === 'p-2')?.notes).toBeUndefined()
+    expect(diffDB(a.db(), server.snapshot())).toEqual([])
+    expect(labels(a)).toEqual([])
+    a.mutate(rename('p-2', 'After discard'))
+    await quiet(a)
+    expect(serverTitle(server, 'p-2')).toBe('After discard')
+  })
+
+  it("Discard changes nothing when the server's copy cannot be fetched", async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a = await uploader(server, link)
+    a.mutate((d) => {
+      d.people.find((p) => p.id === 'p-2')!.notes = 'x'.repeat(300 * 1024)
+    })
+    await quiet(a)
+    link.online = false
+    expect(await a.engine.discardRejected()).toMatchObject({ ok: false, kind: 'offline' })
+    expect(a.st().rejected).toBe(1)
+    expect(a.db().people.find((p) => p.id === 'p-2')?.notes).toHaveLength(300 * 1024)
+  })
+})
+
+describe('counting waiting changes as a person does (r1-09)', () => {
+  it('an edit and its activity row count once; a note on its own counts; every message says the same', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a = await uploader(server, link)
+    link.online = false
+    a.mutate(renameLogged('p-1', 'Offline', 'act-offline'))
+    expect(a.st()).toMatchObject({ pending: 2, pendingEdits: 1 })
+    a.mutate((d) => {
+      d.activity.push({ id: 'act-note', at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: 'p-3', kind: 'note', text: 'Called back' })
+    })
+    expect(a.st()).toMatchObject({ pending: 3, pendingEdits: 2 })
+    expect(await a.engine.disconnect()).toMatchObject({ ok: false, kind: 'pending', pending: 2 })
+    expect(await a.engine.signOut({ forgetThisBrowser: true })).toMatchObject({ ok: false, kind: 'pending', pending: 2 })
+  })
+})
+
+describe('offers past their expiry date (r1-08)', () => {
+  function withSentOffer(): DB {
+    const db = makeDB()
+    db.offers.push({ id: 'o-1', applicationId: 'a-1', candidateId: 'c-1', jobId: 'j-1', status: 'sent', expiresOn: '2026-10-07' } as unknown as DB['offers'][number])
+    return db
+  }
+  const expiredRows = (db: DB) => db.activity.filter((r) => r.kind === 'offer_expired')
+
+  it('expire when a workspace loads; the change reaches the server once, and a second device adds nothing', async () => {
+    const server = new FakeServer()
+    const a0 = device(server, withSentOffer())
+    expect(await a0.engine.uploadLocal()).toEqual({ ok: true })
+    await a0.engine.whenIdle()
+    const b0 = await joiner(server)
+    a0.engine.stop()
+    b0.engine.stop()
+    const savedA = a0.db()
+    const loadedA = applyLoadChanges(savedA)
+    expect(loadedA.offers[0]).toMatchObject({ status: 'expired', decidedOn: '2026-10-07' })
+    const a = device(server, loadedA, a0.storage, { baseline: () => savedA })
+    a.engine.start()
+    await a.engine.whenIdle()
+    expect(server.record('offers', 'o-1')).toMatchObject({ status: 'expired' })
+    expect(expiredRows(server.snapshot())).toHaveLength(1)
+    expect(expiredRows(a.db())).toEqual(expiredRows(server.snapshot()))
+    const savedB = b0.db()
+    const b = device(server, applyLoadChanges(savedB), b0.storage, { baseline: () => savedB })
+    b.engine.start()
+    await b.engine.whenIdle()
+    // Every device logs the expiry under one id (src/sync/loadTime.ts), so the server keeps one row.
+    expect(expiredRows(server.snapshot())).toHaveLength(1)
+    expect(b.st()).toMatchObject({ refreshed: 0, pending: 0 })
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+
+  it('two devices opening on different days after the expiry write identical records: no "newer change" notice', async () => {
+    const db = withSentOffer()
+    db.jobs.push({ id: 'j-1', hiringManagerId: 'p-founder' } as unknown as DB['jobs'][number])
+    db.candidates.push({ id: 'c-1', firstName: 'Dana', lastName: 'Park' } as unknown as DB['candidates'][number])
+    db.applications.push({ id: 'a-1', candidateId: 'c-1', jobId: 'j-1', stageId: 'offer', status: 'active', nextStep: { text: 'Follow up on the offer', dueOn: '2026-10-06', ownerId: 'p-founder' } } as unknown as DB['applications'][number])
+    db.grants.push({ id: 'g-1', personId: 'c-1', holderType: 'candidate', type: 'ISO', shares: 25_000, strikePrice: 0, vestingStart: '2026-11-02', cliffMonths: 12, vestingMonths: 48, status: 'reserved', fromOfferId: 'o-1', exercisedShares: 0, postTerminationExerciseDays: 90 })
+    const server = new FakeServer()
+    const a0 = device(server, db)
+    expect(await a0.engine.uploadLocal()).toEqual({ ok: true })
+    await a0.engine.whenIdle()
+    const b0 = await joiner(server)
+    a0.engine.stop()
+    b0.engine.stop()
+    const openOn = (saved: DB, day: string) => {
+      setClockOverride(day)
+      try {
+        return applyLoadChanges(saved)
+      } finally {
+        setClockOverride('2026-10-10')
+      }
+    }
+    // A opens the day after the expiry, B two days later; each applies the expiry before it syncs.
+    const savedA = a0.db()
+    const savedB = b0.db()
+    const loadedA = openOn(savedA, '2026-10-08')
+    const loadedB = openOn(savedB, '2026-10-10')
+    expect(diffDB(loadedA, loadedB)).toEqual([])
+    expect(loadedB.grants[0]).toMatchObject({ status: 'cancelled', cancelledOn: '2026-10-07', cancelledShares: 25_000 })
+    expect(loadedB.applications[0].nextStep).toMatchObject({ text: 'Offer expired: extend it or close out', dueOn: '2026-10-08' })
+    const a = device(server, loadedA, a0.storage, { baseline: () => savedA })
+    a.engine.start()
+    await a.engine.whenIdle()
+    const b = device(server, loadedB, b0.storage, { baseline: () => savedB })
+    b.engine.start()
+    await b.engine.whenIdle()
+    expect(expiredRows(server.snapshot())).toHaveLength(1)
+    expect(b.st()).toMatchObject({ refreshed: 0, pending: 0 })
+    expect(a.st()).toMatchObject({ refreshed: 0 })
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end review, round 2, package E (sync engine and server)
+// ---------------------------------------------------------------------------------------------
+
+describe('a record another computer deleted (r2-44)', () => {
+  const renameOps =
+    (name: string): Recipe =>
+    (d) => {
+      d.departments.find((x) => x.id === 'd-ops')!.name = name
+    }
+  const removeOps: Recipe = (d) => {
+    d.departments = d.departments.filter((x) => x.id !== 'd-ops')
+  }
+  const hasOps = (dev: Device) => dev.db().departments.some((x) => x.id === 'd-ops')
+
+  it('a stale edit does not bring it back: the editing computer removes its copy and names it', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    // A removes the department; B, which has not pulled since, saves a new name for it.
+    a.mutate(removeOps)
+    await quiet(a)
+    expect(server.record('departments', 'd-ops')).toBeUndefined()
+    b.store.getState().mutate('Renamed the department', renameOps('Finance and ops'))
+    await quiet(b)
+    expect(server.record('departments', 'd-ops')).toBeUndefined()
+    expect(hasOps(b)).toBe(false)
+    expect(b.st()).toMatchObject({ refreshed: 1, refreshedKeys: [{ collection: 'departments', id: 'd-ops' }], pending: 0 })
+    expect(labels(b)).toEqual([])
+    // A never sees it come back, and has nothing to be told.
+    await a.engine.syncNow()
+    expect(hasOps(a)).toBe(false)
+    expect(a.st().refreshed).toBe(0)
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+
+  it('an edit queued offline before the delete reached the server loses the same way', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a = await uploader(server)
+    const b = await joiner(server, link)
+    link.online = false
+    b.mutate(renameOps('Offline name'))
+    await quiet(b)
+    a.mutate(removeOps)
+    await quiet(a)
+    link.online = true
+    await b.engine.syncNow()
+    expect(hasOps(b)).toBe(false)
+    expect(server.record('departments', 'd-ops')).toBeUndefined()
+    expect(b.st()).toMatchObject({ refreshed: 1, pending: 0 })
+  })
+
+  it('undoing your own delete still brings the record back everywhere', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    a.mutate(removeOps)
+    await quiet(a)
+    expect(a.conn().versions['departments:d-ops']).toBeUndefined()
+    a.store.getState().undo()
+    await quiet(a)
+    expect(server.record('departments', 'd-ops')).toMatchObject({ name: 'Finance and operations' })
+    expect(a.st()).toMatchObject({ refreshed: 0, pending: 0 })
+    await b.engine.syncNow()
+    expect(b.db().departments.find((x) => x.id === 'd-ops')?.name).toBe('Finance and operations')
+  })
+
+  it('undoing a delete whose answer was lost still brings it back, with no notice', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    server.loseResponses(1)
+    a.mutate(removeOps)
+    await quiet(a)
+    expect(server.record('departments', 'd-ops')).toBeUndefined()
+    expect(a.st().status).toBe('offline')
+    a.store.getState().undo()
+    await vi.advanceTimersByTimeAsync(2000)
+    await a.engine.whenIdle()
+    expect(server.record('departments', 'd-ops')).toMatchObject({ name: 'Finance and operations' })
+    expect(hasOps(a)).toBe(true)
+    expect(a.st()).toMatchObject({ status: 'synced', refreshed: 0, pending: 0 })
+  })
+})
+
+describe('a browser that died before saving its last answers (r2-45)', () => {
+  const moves = [
+    ['Technical', 'act-technical'],
+    ['Onsite', 'act-onsite'],
+    ['Offer', 'act-offer'],
+  ] as const
+
+  it('replays its first unanswered move on restart: no notice, and no activity row is deleted', async () => {
+    const server = new FakeServer()
+    const storage = memoryStorage()
+    // What the disk holds when the browser dies: everything saved up to the moment the first move left.
+    let disk: Map<string, string> | null = null
+    const api: SyncApi = {
+      ...deviceLink(server),
+      postChanges: (changes, opts) => {
+        if (!disk && changes.some((c) => c.id === 'act-technical')) disk = new Map(storage.data)
+        return server.postChanges(changes, opts)
+      },
+    }
+    const db = makeDB()
+    db.people.push(makePerson('p-1'))
+    const a = persistentBrowser(api, storage, db)
+    expect(await a.engine.uploadLocal()).toEqual({ ok: true })
+    await a.engine.whenIdle()
+    for (const [title, row] of moves) {
+      a.store.getState().mutate(`Moved to ${title}`, renameLogged('p-1', title, row))
+      await quiet(a)
+    }
+    expect(serverTitle(server, 'p-1')).toBe('Offer')
+    a.crash()
+    const restored = memoryStorage()
+    for (const [k, v] of disk!) restored.data.set(k, v)
+    expect(loadConnection(restored).unconfirmed['people:p-1']).toBeTruthy()
+    const pushesBefore = server.pushes.length
+    const b = persistentBrowser(server, restored)
+    expect(titleOf(b, 'p-1')).toBe('Technical')
+    b.engine.start()
+    await b.engine.whenIdle()
+    expect(titleOf(b, 'p-1')).toBe('Offer')
+    expect(b.st()).toMatchObject({ refreshed: 0, refreshedKeys: [], pending: 0, status: 'synced' })
+    for (const [, row] of moves) {
+      expect(server.record('activity', row)).toBeTruthy()
+      expect(hasRow(b.db(), row)).toBe(true)
+    }
+    expect(server.pushes.slice(pushesBefore).flat().filter((c) => c.op === 'delete')).toEqual([])
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+
+  it('an activity row the server already held stays, even when its edit lost to someone else after a reload', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a0 = await uploader(server, link)
+    server.loseResponses(1)
+    a0.mutate(renameLogged('p-1', 'A landed', 'act-landed'))
+    await quiet(a0)
+    expect(server.record('activity', 'act-landed')).toBeTruthy()
+    a0.engine.stop()
+    // Another user changes the record afterwards; this browser reloads (no Undo history).
+    server.serverUpsert('people', 'p-1', { ...(server.record('people', 'p-1') as object), title: 'Someone else' })
+    const pushesBefore = server.pushes.length
+    const a = device(link, a0.db(), a0.storage)
+    a.engine.start()
+    await a.engine.whenIdle()
+    expect(titleOf(a, 'p-1')).toBe('Someone else')
+    // Another user's change won: that is news. The row is history: the edit did happen.
+    expect(a.st()).toMatchObject({ refreshed: 1, pending: 0 })
+    expect(hasRow(a.db(), 'act-landed')).toBe(true)
+    expect(server.record('activity', 'act-landed')).toBeTruthy()
+    expect(server.pushes.slice(pushesBefore).flat().filter((c) => c.op === 'delete')).toEqual([])
+  })
+
+  it('a retry that never landed, beaten by the same user on another computer, still says so and drops its row', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a0 = await uploader(server, link)
+    link.online = false
+    a0.mutate(renameLogged('p-1', 'Never sent', 'act-never'))
+    await quiet(a0)
+    a0.engine.stop()
+    // The admin edits the record on another computer meanwhile.
+    server.serverUpsert('people', 'p-1', { ...(server.record('people', 'p-1') as object), title: 'Other computer' }, server.user.id)
+    link.online = true
+    const a = device(link, a0.db(), a0.storage)
+    a.engine.start()
+    await a.engine.whenIdle()
+    expect(titleOf(a, 'p-1')).toBe('Other computer')
+    expect(a.st()).toMatchObject({ refreshed: 1, pending: 0 })
+    expect(hasRow(a.db(), 'act-never')).toBe(false)
+    expect(server.record('activity', 'act-never')).toBeUndefined()
+  })
+
+  it('a retry that landed, beaten by the same user on another computer, takes that copy quietly', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    server.loseResponses(1)
+    a.mutate(rename('p-1', 'Landed'))
+    await quiet(a)
+    await b.engine.syncNow()
+    b.mutate(rename('p-1', 'B on top'))
+    await quiet(b)
+    // No new edit on A: its retry is the attempt that landed.
+    await vi.advanceTimersByTimeAsync(2000)
+    await a.engine.whenIdle()
+    expect(titleOf(a, 'p-1')).toBe('B on top')
+    expect(a.st()).toMatchObject({ refreshed: 0, pending: 0, status: 'synced' })
+  })
+})
+
+describe('discarding a change too large to sync (r2-46)', () => {
+  it('also removes the activity row an earlier batch delivered, and the Undo step, here and on the server', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    a.store.getState().mutate('Updated p-2', (d) => {
+      d.people.find((p) => p.id === 'p-2')!.notes = 'x'.repeat(300 * 1024)
+      d.activity.push({ id: 'act-big-edit', at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: 'p-2', kind: 'edited', text: 'Updated p-2' })
+    })
+    await quiet(a)
+    expect(a.st().rejectedKeys).toEqual([{ collection: 'people', id: 'p-2', tooLarge: true }])
+    // The row went out in the batch the record was set aside from.
+    expect(server.record('activity', 'act-big-edit')).toBeTruthy()
+    expect(labels(a)).toEqual(['Updated p-2'])
+    expect(await a.engine.discardRejected([{ collection: 'people', id: 'p-2' }])).toEqual({ ok: true })
+    // The Undo entry is gone (the toast bound to it closes), and so is the row.
+    expect(labels(a)).toEqual([])
+    expect(hasRow(a.db(), 'act-big-edit')).toBe(false)
+    expect(a.db().people.find((p) => p.id === 'p-2')?.notes).toBeUndefined()
+    await a.engine.whenIdle()
+    expect(server.record('activity', 'act-big-edit')).toBeUndefined()
+    expect(a.st()).toMatchObject({ rejected: 0, pending: 0, refreshed: 0 })
+    expect(diffDB(a.db(), server.snapshot())).toEqual([])
+  })
+
+  it('a row still queued with the change just leaves the outbox, and nothing is sent for it', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    server.signedIn = false
+    a.store.getState().mutate('Added p-big', (d) => {
+      d.people.push(makePerson('p-big', { notes: 'x'.repeat(300 * 1024) }))
+      d.activity.push({ id: 'act-queued', at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: 'p-big', kind: 'edited', text: 'Added p-big' })
+    })
+    await quiet(a)
+    expect(a.st().rejectedKeys).toEqual([{ collection: 'people', id: 'p-big', tooLarge: true }])
+    expect(a.conn().outbox.map((e) => e.id)).toEqual(['act-queued'])
+    // The server never had the person: nothing to fetch, so this works signed out too.
+    expect(await a.engine.discardRejected()).toEqual({ ok: true })
+    expect(labels(a)).toEqual([])
+    expect(hasRow(a.db(), 'act-queued')).toBe(false)
+    expect(a.conn().outbox).toEqual([])
+    expect(await a.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    await a.engine.whenIdle()
+    expect(server.record('activity', 'act-queued')).toBeUndefined()
+    expect(server.pushes.flat().some((c) => c.id === 'act-queued')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end review, round 3, package P1 (sync, server, shell and settings)
+// ---------------------------------------------------------------------------------------------
+
+describe('looking at an empty server without a 404 (r3-06)', () => {
+  it('the connect step asks the status route and downloads nothing from an empty server', async () => {
+    const server = new FakeServer()
+    const b = device(server)
+    expect(await b.engine.inspectServer()).toEqual({ ok: true, empty: true })
+    expect(server.calls).toEqual(['workspaceStatus'])
+    // With a workspace there, it downloads it once (and Use the server's copy reuses it).
+    await uploader(server)
+    const c = device(server, makeDB({ company: 'Elsewhere' }))
+    const reads = server.callCount('getWorkspace')
+    expect(await c.engine.inspectServer()).toMatchObject({ ok: true, empty: false, companyName: 'Acme' })
+    expect(await c.engine.useServerCopy()).toEqual({ ok: true })
+    expect(server.callCount('getWorkspace')).toBe(reads + 1)
+  })
+
+  it('a reload during the server_empty hold looks with the status route while the server stays empty', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    server.loseWorkspace()
+    a.mutate(rename('p-1', 'Waiting for a workspace'))
+    await quiet(a)
+    expect(a.st().hold).toBe('server_empty')
+    a.engine.stop()
+    const before = server.calls.length
+    const a2 = device(server, a.db(), a.storage)
+    a2.engine.start()
+    await a2.engine.whenIdle()
+    a2.page.emit('focus')
+    await a2.engine.whenIdle()
+    expect(server.calls.slice(before)).toEqual(['workspaceStatus', 'workspaceStatus'])
+    expect(a2.st()).toMatchObject({ hold: 'server_empty', pendingEdits: 1 })
+    // Another computer uploads this workspace again: the next look downloads it and joins, edit on top.
+    expect(await device(server, a.db()).engine.uploadLocal({ confirmReplace: true })).toEqual({ ok: true })
+    const reads = server.callCount('getWorkspace')
+    a2.page.emit('focus')
+    await a2.engine.whenIdle()
+    expect(server.callCount('getWorkspace')).toBe(reads + 1)
+    expect(a2.st().hold).toBeNull()
+    expect(serverTitle(server, 'p-1')).toBe('Waiting for a workspace')
+  })
+
+  it('a server from before the status route is asked the old way, once per look', async () => {
+    const server = new FakeServer()
+    server.statusRoute = false
+    const b = device(server)
+    expect(await b.engine.inspectServer()).toEqual({ ok: true, empty: true })
+    expect(server.callCount('getWorkspace')).toBe(1)
+    await uploader(server)
+    const c = device(server, makeDB({ company: 'Elsewhere' }))
+    const reads = server.callCount('getWorkspace')
+    expect(await c.engine.inspectServer()).toMatchObject({ ok: true, empty: false })
+    expect(await c.engine.useServerCopy()).toEqual({ ok: true })
+    // The snapshot the fallback downloaded is the one Use the server's copy takes.
+    expect(server.callCount('getWorkspace')).toBe(reads + 1)
+  })
+
+  it('checkServer says whether the server is empty for a signed-in browser that is not connected (r3-03)', async () => {
+    const server = new FakeServer()
+    const b = device(server)
+    expect(await b.engine.checkServer()).toEqual({ ok: true, version: 'test', signedIn: true, user: server.user, empty: true })
+    const a = await uploader(server)
+    expect(await b.engine.checkServer()).toMatchObject({ ok: true, signedIn: true, empty: false })
+    // Connected, or signed out: nothing to ask.
+    const calls = server.calls.length
+    expect(await a.engine.checkServer()).not.toHaveProperty('empty')
+    expect(server.calls.slice(calls)).toEqual(['health', 'session'])
+    server.signedIn = false
+    expect(await b.engine.checkServer()).toEqual({ ok: true, version: 'test', signedIn: false, user: null })
+    // An older server: no answer about emptiness, and nothing downloaded to find out.
+    server.signedIn = true
+    server.statusRoute = false
+    const reads = server.callCount('getWorkspace')
+    expect(await b.engine.checkServer()).not.toHaveProperty('empty')
+    expect(server.callCount('getWorkspace')).toBe(reads)
+  })
+})
+
+describe('page loads never meet a 401 (r3-07)', () => {
+  it('after a deliberate sign-out, a reload sends nothing until the next sign-in', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    expect(await a.engine.signOut()).toMatchObject({ ok: true, confirmed: true })
+    a.mutate(rename('p-1', 'Edited after signing out'))
+    a.engine.stop()
+    const before = server.calls.length
+    const a2 = device(server, a.db(), a.storage)
+    a2.engine.start()
+    await a2.engine.whenIdle()
+    a2.mutate(rename('p-2', 'Also after'))
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(server.calls.slice(before)).toEqual([])
+    expect(a2.st()).toMatchObject({ status: 'signed_out', signedOutByUser: true, pendingEdits: 2 })
+    expect(await a2.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    await a2.engine.whenIdle()
+    expect(serverTitle(server, 'p-1')).toBe('Edited after signing out')
+    expect(serverTitle(server, 'p-2')).toBe('Also after')
+  })
+
+  it('a session that ended while the browser was closed is found with the session check, not a 401', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    expect(await a.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    await a.engine.whenIdle()
+    a.mutate(rename('p-1', 'Before the browser closed'))
+    a.engine.stop()
+    // The session cookie ended with the browser.
+    server.signedIn = false
+    const before = server.calls.length
+    const a2 = device(server, a.db(), a.storage)
+    a2.engine.start()
+    await a2.engine.whenIdle()
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(server.calls.slice(before)).toEqual(['session'])
+    expect(a2.st()).toMatchObject({ status: 'signed_out', signedOutByUser: false, pendingEdits: 1 })
+    expect(await a2.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    await a2.engine.whenIdle()
+    expect(serverTitle(server, 'p-1')).toBe('Before the browser closed')
+    expect(a2.st()).toMatchObject({ status: 'synced', pending: 0 })
+  })
+
+  it('a session that still holds starts syncing right after the check', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    expect(await a.engine.signIn(TEST_ADMIN_EMAIL, TEST_ADMIN_PASSWORD)).toMatchObject({ ok: true })
+    await a.engine.whenIdle()
+    a.mutate(rename('p-1', 'Sent after the check'))
+    a.engine.stop()
+    const before = server.calls.length
+    const a2 = device(server, a.db(), a.storage)
+    a2.engine.start()
+    await a2.engine.whenIdle()
+    expect(server.calls.slice(before, before + 2)).toEqual(['session', 'postChanges'])
+    expect(serverTitle(server, 'p-1')).toBe('Sent after the check')
+    expect(a2.st()).toMatchObject({ status: 'synced', pending: 0 })
+  })
+})
+
+describe('waiting changes counted as a person counts them (r3-08)', () => {
+  it('one kit checkbox (complianceStatus and its activity row) counts as one change', async () => {
+    const server = new FakeServer()
+    const link = deviceLink(server)
+    const a = await uploader(server, link)
+    link.online = false
+    a.store.getState().mutate('Marked done: federal workplace posters', (d) => {
+      d.complianceStatus['posters-federal'] = { status: 'done', doneOn: '2026-10-10' }
+      d.activity.push({ id: 'act-posters', at: '2026-10-10T17:00:00.000Z', entityType: 'compliance', entityId: 'posters-federal', kind: 'compliance_status', text: 'Marked done' })
+    })
+    await quiet(a)
+    expect(a.conn().outbox.map((e) => e.id).sort()).toEqual(['act-posters', 'complianceStatus'])
+    expect(a.st().pendingEdits).toBe(1)
+    // The row alone (its document already sent) still counts: never 0 while something waits.
+    a.engine.stop()
+    saveConnection(a.storage, { ...a.conn(), outbox: a.conn().outbox.filter((e) => e.collection === 'activity') })
+    const a2 = device(link, a.db(), a.storage)
+    a2.engine.start()
+    expect(a2.st().pendingEdits).toBe(1)
+  })
+})
+
+describe("an edit that lost to another computer's delete is named (r3-12)", () => {
+  it("the notice keeps the record's last copy in this browser", async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    a.mutate((d) => {
+      d.departments = d.departments.filter((x) => x.id !== 'd-ops')
+    })
+    await quiet(a)
+    b.mutate((d) => {
+      d.departments.find((x) => x.id === 'd-ops')!.name = 'Finance and ops'
+    })
+    await quiet(b)
+    expect(b.db().departments.some((x) => x.id === 'd-ops')).toBe(false)
+    expect(b.st().refreshedKeys).toEqual([
+      { collection: 'departments', id: 'd-ops', removed: true, copy: expect.objectContaining({ id: 'd-ops', name: 'Finance and ops' }) },
+    ])
+  })
+
+  it('a copy the server replaced (not removed) carries no copy', async () => {
+    const server = new FakeServer()
+    const a = await uploader(server)
+    const b = await joiner(server)
+    b.mutate(rename('p-1', 'B wins'))
+    await quiet(b)
+    a.mutate(rename('p-1', 'A loses'))
+    await quiet(a)
+    expect(a.st().refreshedKeys).toEqual([{ collection: 'people', id: 'p-1' }])
+  })
+})
+
+describe('a retry the server already had, after the bookkeeping was lost (r3-13)', () => {
+  it('takes the newer copy this user wrote quietly, even with no record of having sent it', async () => {
+    const server = new FakeServer()
+    const storage = memoryStorage()
+    // What the disk holds when the browser dies: the store and the queued move, but not the note that
+    // it was sent (that last write was lost with the process).
+    let disk: Map<string, string> | null = null
+    const api: SyncApi = {
+      ...deviceLink(server),
+      postChanges: (changes, opts) => {
+        if (!disk && changes.some((c) => c.id === 'act-offer')) disk = new Map(storage.data)
+        return server.postChanges(changes, opts)
+      },
+    }
+    const db = makeDB()
+    db.people.push(makePerson('p-1'))
+    const a = persistentBrowser(api, storage, db)
+    expect(await a.engine.uploadLocal()).toEqual({ ok: true })
+    await a.engine.whenIdle()
+    a.store.getState().mutate('Moved to Offer', renameLogged('p-1', 'Offer', 'act-offer'))
+    await quiet(a)
+    a.store.getState().mutate('Sent the offer', renameLogged('p-1', 'Offer sent', 'act-sent'))
+    await quiet(a)
+    expect(serverTitle(server, 'p-1')).toBe('Offer sent')
+    a.crash()
+    const restored = memoryStorage()
+    for (const [k, v] of disk!) restored.data.set(k, v)
+    saveConnection(restored, { ...loadConnection(restored), unconfirmed: {} })
+    expect(loadConnection(restored).outbox.map((e) => e.id)).toContain('p-1')
+    const b = persistentBrowser(server, restored)
+    expect(titleOf(b, 'p-1')).toBe('Offer')
+    b.engine.start()
+    await b.engine.whenIdle()
+    expect(titleOf(b, 'p-1')).toBe('Offer sent')
+    expect(b.st()).toMatchObject({ refreshed: 0, refreshedKeys: [], pending: 0, status: 'synced' })
+    for (const row of ['act-offer', 'act-sent']) {
+      expect(server.record('activity', row)).toBeTruthy()
+      expect(hasRow(b.db(), row)).toBe(true)
+    }
+    expect(diffDB(b.db(), server.snapshot())).toEqual([])
+  })
+})
+
+describe('Sign out and remove data says what happened after the reload (r3-10)', () => {
+  it('hands its message to the reload, which the next page shows', async () => {
+    const server = new FakeServer()
+    const reload = vi.fn()
+    const a = device(server, makeDB(), memoryStorage(), { wipeLocal: vi.fn(), reload, freshDB: () => makeDB({ sample: true }) })
+    expect(await a.engine.uploadLocal()).toEqual({ ok: true })
+    const res = await a.engine.signOut({ forgetThisBrowser: true })
+    expect(res).toMatchObject({ ok: true, confirmed: true, forgotten: true, message: FORGOTTEN_MESSAGE })
+    expect(reload).toHaveBeenCalledWith(FORGOTTEN_MESSAGE)
+    expect(FORGOTTEN_MESSAGE).toBe("Signed out and removed this browser's data. Your server keeps everything that reached it.")
   })
 })

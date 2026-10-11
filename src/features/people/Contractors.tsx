@@ -1,7 +1,7 @@
 // Contractors and advisors: the list with AB5 results and paperwork flags, the Add sheet with the
 // 30-second AB5 check, and the contractor page. Contractors never count toward headcount, but they
 // do count toward the 5-person harassment training threshold. Advisors hold NSOs and no checklist.
-import { useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import type { PageProps } from '@/app/routes'
 import { href, links, navigate } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
@@ -47,14 +47,20 @@ import {
   AB5_PRONGS,
   ab5Result,
   contractorDirStatus,
+  contractorSizeError,
+  contractorTooLarge,
   convertedPerson,
   DE542_CITATION,
   de542Status,
   endReminder,
   FORM_1099_CITATION,
   form1099Flag,
+  LINE_MAX_CHARS,
   nextMonday,
   rateLabel,
+  SCOPE_MAX_CHARS,
+  scopeCountText,
+  scopeSummary,
   titleFromScope,
 } from './helpers'
 import { Ab5Badge, Ab5OutcomeBadge, ContractorStatusBadge, NotLegalAdvice, undoToast } from './parts'
@@ -375,26 +381,269 @@ function blankForm(db: DB): ContractorForm {
   }
 }
 
+/** The basic fields of a saved contractor, for the Edit sheet (AB5 and options are edited elsewhere). */
+function formFor(c: Contractor): ContractorForm {
+  return {
+    kind: c.kind,
+    name: c.name,
+    entityType: c.entityType,
+    entityName: c.entityName ?? '',
+    email: c.email,
+    scope: c.scope,
+    rate: c.rate,
+    rateUnit: c.rateUnit,
+    hoursPerWeek: c.hoursPerWeek ?? null,
+    startOn: c.startOn,
+    endOn: c.endOn ?? null,
+    managerId: c.managerId,
+    departmentId: c.departmentId,
+    state: c.state,
+    w9OnFile: c.w9OnFile,
+    ab5: c.ab5,
+    options: null,
+  }
+}
+
+/** Writes the form's basic fields onto a contractor (a draft, or a copy to check before saving). */
+function applyBasics(k: Contractor, form: ContractorForm): void {
+  k.name = form.name.trim()
+  k.entityType = form.entityType
+  if (form.entityType !== 'individual' && form.entityName.trim()) k.entityName = form.entityName.trim()
+  else delete k.entityName
+  k.email = form.email.trim()
+  k.scope = form.scope.trim()
+  if (k.kind === 'contractor') {
+    k.rate = form.rate ?? 0
+    k.rateUnit = form.rateUnit
+    if (form.rateUnit !== 'project' && form.hoursPerWeek) k.hoursPerWeek = form.hoursPerWeek
+    else delete k.hoursPerWeek
+  }
+  k.startOn = form.startOn
+  if (form.endOn) k.endOn = form.endOn
+  else if (k.endOn !== undefined) k.endOn = null
+  k.managerId = form.managerId
+  k.departmentId = form.departmentId
+  k.state = form.state
+}
+
+/** What a contractor form is missing, by field. */
+function formErrors(form: ContractorForm, scopeChanged = true): { name: string; scope: string; rate: string } {
+  const advisor = form.kind === 'advisor'
+  return {
+    name: !form.name.trim() ? 'Add a name.' : '',
+    scope: !form.scope.trim()
+      ? 'Describe the work in a line.'
+      : scopeChanged && form.scope.trim().length > SCOPE_MAX_CHARS
+        ? `A scope of work can be up to ${SCOPE_MAX_CHARS.toLocaleString('en-US')} characters. Shorten this one.`
+        : '',
+    rate: !advisor && !form.rate ? 'Add the rate.' : '',
+  }
+}
+
+/**
+ * The fields the Add and Edit sheets share: name and email, entity, scope of work, rate and hours, dates, who
+ * they work with and where. `children` goes after the rate (the Add sheet's advisor options).
+ */
+function ContractorFields({
+  form,
+  set,
+  err,
+  focusScope,
+  children,
+}: {
+  form: ContractorForm
+  set: <K extends keyof ContractorForm>(k: K, v: ContractorForm[K]) => void
+  err: (k: 'name' | 'scope' | 'rate') => string | undefined
+  /** Focus the scope of work when the sheet opens (to shorten one too large to sync) instead of the name. */
+  focusScope?: boolean
+  children?: ReactNode
+}) {
+  const db = useDB((s) => s.db)
+  const t = today()
+  const advisor = form.kind === 'advisor'
+  const people = useMemo(() => {
+    const list = employedOn(db).sort((a, b) => a.hireNumber - b.hireNumber)
+    // Someone who has since left still shows as who they work with until it is changed.
+    const current = getPerson(db, form.managerId)
+    return current && !list.includes(current) ? [...list, current] : list
+  }, [db, form.managerId])
+  const scopeCount = scopeCountText(form.scope)
+  return (
+    <>
+      <FormGrid>
+        <Field label="Name" required error={err('name')}>
+          {(id, d) => (
+            <TextInput
+              id={id}
+              aria-describedby={d}
+              maxLength={LINE_MAX_CHARS}
+              value={form.name}
+              onChange={(e) => set('name', e.target.value)}
+              data-autofocus={focusScope ? undefined : true}
+            />
+          )}
+        </Field>
+        <Field label="Email">
+          {(id) => <TextInput id={id} type="email" maxLength={LINE_MAX_CHARS} value={form.email} onChange={(e) => set('email', e.target.value)} />}
+        </Field>
+      </FormGrid>
+      {!advisor && (
+        <Field label="Entity type" id="k-entity" hint="DE 542 is only for individuals, not LLCs or corporations.">
+          {() => (
+            <div className="flex flex-col gap-2">
+              <ChipGroup
+                label="Entity type"
+                size="sm"
+                value={form.entityType}
+                onChange={(v) => set('entityType', v)}
+                options={[
+                  { value: 'individual', label: 'Individual' },
+                  { value: 'llc', label: 'LLC' },
+                  { value: 'corporation', label: 'Corporation' },
+                ]}
+              />
+              {form.entityType !== 'individual' && (
+                <TextInput
+                  aria-label="Business name"
+                  placeholder="Business name"
+                  maxLength={LINE_MAX_CHARS}
+                  value={form.entityName}
+                  onChange={(e) => set('entityName', e.target.value)}
+                />
+              )}
+            </div>
+          )}
+        </Field>
+      )}
+      <Field label="Scope of work" required error={err('scope')} hint={scopeCount ? `${scopeCount}.` : undefined}>
+        {(id, d) => (
+          <TextArea
+            id={id}
+            aria-describedby={d}
+            rows={2}
+            maxLength={SCOPE_MAX_CHARS}
+            value={form.scope}
+            onChange={(e) => set('scope', e.target.value)}
+            placeholder="One or two lines. Dictation works here (Win+H)."
+            data-autofocus={focusScope ? true : undefined}
+          />
+        )}
+      </Field>
+      {!advisor && (
+        <FormGrid>
+          <Field label="Rate" required error={err('rate')}>
+            {(id, d) => (
+              <div className="flex flex-col gap-2">
+                <ChipGroup
+                  label="Rate unit"
+                  size="sm"
+                  value={form.rateUnit}
+                  onChange={(v) => set('rateUnit', v)}
+                  options={[
+                    { value: 'hour', label: 'Hourly' },
+                    { value: 'month', label: 'Monthly' },
+                    { value: 'project', label: 'Project' },
+                  ]}
+                />
+                <MoneyInput id={id} aria-describedby={d} value={form.rate} onChange={(v) => set('rate', v)} suffix={form.rateUnit === 'hour' ? '/ hour' : form.rateUnit === 'month' ? '/ month' : 'total'} />
+              </div>
+            )}
+          </Field>
+          {form.rateUnit !== 'project' && (
+            <Field label="Hours per week">
+              {(id) => (
+                <div className="flex flex-col gap-2">
+                  <ChipGroup
+                    label="Hours per week"
+                    size="sm"
+                    value={String(form.hoursPerWeek ?? '')}
+                    onChange={(v) => set('hoursPerWeek', Number(v))}
+                    options={['5', '10', '20', '25', '40'].map((h) => ({ value: h, label: h }))}
+                  />
+                  <NumberInput id={id} value={form.hoursPerWeek} onChange={(v) => set('hoursPerWeek', v)} min={0} max={60} suffix="hours" />
+                </div>
+              )}
+            </Field>
+          )}
+        </FormGrid>
+      )}
+      {children}
+      <FormGrid>
+        <Field label="Starts" id="k-start">
+          {(id) => (
+            <DateChips
+              id={id}
+              label="Starts"
+              value={form.startOn}
+              onChange={(v) => set('startOn', v)}
+              presets={[
+                { label: 'Today', date: t },
+                { label: 'Next Mon', date: nextMonday(t) },
+                { label: '+2 weeks', date: addDays(t, 14) },
+              ]}
+            />
+          )}
+        </Field>
+        <Field label="Ends" id="k-end">
+          {(id) => (
+            <div className="flex flex-col gap-2">
+              <DateChips
+                id={id}
+                label="Ends"
+                value={form.endOn}
+                onChange={(v) => set('endOn', v)}
+                presets={[
+                  { label: '3 months', date: addDays(form.startOn, 91) },
+                  { label: '6 months', date: addDays(form.startOn, 182) },
+                  { label: '1 year', date: addDays(form.startOn, 365) },
+                ]}
+              />
+              {form.endOn && (
+                <Button variant="ghost" size="sm" onClick={() => set('endOn', null)}>
+                  No end date
+                </Button>
+              )}
+            </div>
+          )}
+        </Field>
+      </FormGrid>
+      <FormGrid>
+        <Field label="Works with">
+          {(id) => <Select id={id} value={form.managerId} onChange={(v) => set('managerId', v)} options={people.map((p) => ({ value: p.id, label: `#${p.hireNumber} ${fullName(p)}` }))} />}
+        </Field>
+        <Field label="Team">
+          {(id) => <Select id={id} value={form.departmentId} onChange={(v) => set('departmentId', v)} options={db.departments.map((d) => ({ value: d.id, label: d.name }))} />}
+        </Field>
+        <Field label="Works from (state)">
+          {(id) => <Select id={id} value={form.state} onChange={(v) => set('state', v)} options={US_STATES.map((s) => ({ value: s, label: s }))} />}
+        </Field>
+      </FormGrid>
+    </>
+  )
+}
+
 export function AddContractorSheet({ open, onClose, onConvert }: { open: boolean; onClose: () => void; onConvert: (p: PersonPrefill) => void }) {
   const db = useDB((s) => s.db)
   const [form, setForm] = useState<ContractorForm>(() => blankForm(db))
   const [tried, setTried] = useState(false)
+  // Set when the record would be too large to sync; cleared when the scope changes.
+  const [sizeError, setSizeError] = useState<string | null>(null)
   useEffect(() => {
     if (open) {
       setForm(blankForm(db))
       setTried(false)
+      setSizeError(null)
     }
     // Reset when the sheet opens.
   }, [open])
-  const set = <K extends keyof ContractorForm>(k: K, v: ContractorForm[K]) => setForm((f) => ({ ...f, [k]: v }))
-  const t = today()
-  const people = useMemo(() => employedOn(db).sort((a, b) => a.hireNumber - b.hireNumber), [db])
-  const advisor = form.kind === 'advisor'
-  const errors = {
-    name: !form.name.trim() ? 'Add a name.' : '',
-    scope: !form.scope.trim() ? 'Describe the work in a line.' : '',
-    rate: !advisor && !form.rate ? 'Add the rate.' : '',
+  const set = <K extends keyof ContractorForm>(k: K, v: ContractorForm[K]) => {
+    setForm((f) => ({ ...f, [k]: v }))
+    if (k === 'scope') setSizeError(null)
   }
+  const t = today()
+  const advisor = form.kind === 'advisor'
+  const errors = formErrors(form)
+  if (!errors.scope && sizeError) errors.scope = sizeError
   const valid = Object.values(errors).every((e) => !e)
   const err = (k: keyof typeof errors) => (tried ? errors[k] || undefined : undefined)
   const strike = current409A(db, t)?.fmvPerShare
@@ -426,6 +675,14 @@ export function AddContractorSheet({ open, onClose, onConvert }: { open: boolean
     }
     if (form.entityType !== 'individual' && form.entityName.trim()) c.entityName = form.entityName.trim()
     if (form.rateUnit !== 'project' && form.hoursPerWeek) c.hoursPerWeek = form.hoursPerWeek
+    // A record the server could never take is stopped here, before it is saved.
+    const tooLarge = contractorSizeError(c)
+    if (tooLarge) {
+      setSizeError(tooLarge)
+      toast({ text: tooLarge, tone: 'bad' })
+      focusFirstInvalid()
+      return
+    }
     const display = c.entityName || c.name
     const label = `Added ${display} as ${advisor ? 'an advisor' : 'a contractor'}`
     useDB.getState().mutate(label, (d) => {
@@ -513,132 +770,13 @@ export function AddContractorSheet({ open, onClose, onConvert }: { open: boolean
             />
           )}
         </Field>
-        <FormGrid>
-          <Field label="Name" required error={err('name')}>
-            {(id, d) => <TextInput id={id} aria-describedby={d} value={form.name} onChange={(e) => set('name', e.target.value)} data-autofocus />}
-          </Field>
-          <Field label="Email">
-            {(id) => <TextInput id={id} type="email" value={form.email} onChange={(e) => set('email', e.target.value)} />}
-          </Field>
-        </FormGrid>
-        {!advisor && (
-          <Field label="Entity type" id="k-entity" hint="DE 542 is only for individuals, not LLCs or corporations.">
-            {() => (
-              <div className="flex flex-col gap-2">
-                <ChipGroup
-                  label="Entity type"
-                  size="sm"
-                  value={form.entityType}
-                  onChange={(v) => set('entityType', v)}
-                  options={[
-                    { value: 'individual', label: 'Individual' },
-                    { value: 'llc', label: 'LLC' },
-                    { value: 'corporation', label: 'Corporation' },
-                  ]}
-                />
-                {form.entityType !== 'individual' && (
-                  <TextInput aria-label="Business name" placeholder="Business name" value={form.entityName} onChange={(e) => set('entityName', e.target.value)} />
-                )}
-              </div>
-            )}
-          </Field>
-        )}
-        <Field label="Scope of work" required error={err('scope')}>
-          {(id, d) => <TextArea id={id} aria-describedby={d} rows={2} value={form.scope} onChange={(e) => set('scope', e.target.value)} placeholder="One or two lines. Dictation works here (Win+H)." />}
-        </Field>
-        {!advisor && (
-          <FormGrid>
-            <Field label="Rate" required error={err('rate')}>
-              {(id, d) => (
-                <div className="flex flex-col gap-2">
-                  <ChipGroup
-                    label="Rate unit"
-                    size="sm"
-                    value={form.rateUnit}
-                    onChange={(v) => set('rateUnit', v)}
-                    options={[
-                      { value: 'hour', label: 'Hourly' },
-                      { value: 'month', label: 'Monthly' },
-                      { value: 'project', label: 'Project' },
-                    ]}
-                  />
-                  <MoneyInput id={id} aria-describedby={d} value={form.rate} onChange={(v) => set('rate', v)} suffix={form.rateUnit === 'hour' ? '/ hour' : form.rateUnit === 'month' ? '/ month' : 'total'} />
-                </div>
-              )}
+        <ContractorFields form={form} set={set} err={err}>
+          {advisor && (
+            <Field label="Options (NSO)" hint={`Vest monthly over 2 years with no cliff${strike ? `, strike ${money2(strike)} at the current 409A` : ''}. Queued for board consent.`}>
+              {(id, d) => <NumberInput id={id} aria-describedby={d} value={form.options} onChange={(v) => set('options', v)} min={0} step={1000} suffix="options" />}
             </Field>
-            {form.rateUnit !== 'project' && (
-              <Field label="Hours per week">
-                {(id) => (
-                  <div className="flex flex-col gap-2">
-                    <ChipGroup
-                      label="Hours per week"
-                      size="sm"
-                      value={String(form.hoursPerWeek ?? '')}
-                      onChange={(v) => set('hoursPerWeek', Number(v))}
-                      options={['5', '10', '20', '25', '40'].map((h) => ({ value: h, label: h }))}
-                    />
-                    <NumberInput id={id} value={form.hoursPerWeek} onChange={(v) => set('hoursPerWeek', v)} min={0} max={60} suffix="hours" />
-                  </div>
-                )}
-              </Field>
-            )}
-          </FormGrid>
-        )}
-        {advisor && (
-          <Field label="Options (NSO)" hint={`Vest monthly over 2 years with no cliff${strike ? `, strike ${money2(strike)} at the current 409A` : ''}. Queued for board consent.`}>
-            {(id, d) => <NumberInput id={id} aria-describedby={d} value={form.options} onChange={(v) => set('options', v)} min={0} step={1000} suffix="options" />}
-          </Field>
-        )}
-        <FormGrid>
-          <Field label="Starts" id="k-start">
-            {(id) => (
-              <DateChips
-                id={id}
-                label="Starts"
-                value={form.startOn}
-                onChange={(v) => set('startOn', v)}
-                presets={[
-                  { label: 'Today', date: t },
-                  { label: 'Next Mon', date: nextMonday(t) },
-                  { label: '+2 weeks', date: addDays(t, 14) },
-                ]}
-              />
-            )}
-          </Field>
-          <Field label="Ends" id="k-end">
-            {(id) => (
-              <div className="flex flex-col gap-2">
-                <DateChips
-                  id={id}
-                  label="Ends"
-                  value={form.endOn}
-                  onChange={(v) => set('endOn', v)}
-                  presets={[
-                    { label: '3 months', date: addDays(form.startOn, 91) },
-                    { label: '6 months', date: addDays(form.startOn, 182) },
-                    { label: '1 year', date: addDays(form.startOn, 365) },
-                  ]}
-                />
-                {form.endOn && (
-                  <Button variant="ghost" size="sm" onClick={() => set('endOn', null)}>
-                    No end date
-                  </Button>
-                )}
-              </div>
-            )}
-          </Field>
-        </FormGrid>
-        <FormGrid>
-          <Field label="Works with">
-            {(id) => <Select id={id} value={form.managerId} onChange={(v) => set('managerId', v)} options={people.map((p) => ({ value: p.id, label: `#${p.hireNumber} ${fullName(p)}` }))} />}
-          </Field>
-          <Field label="Team">
-            {(id) => <Select id={id} value={form.departmentId} onChange={(v) => set('departmentId', v)} options={db.departments.map((d) => ({ value: d.id, label: d.name }))} />}
-          </Field>
-          <Field label="Works from (state)">
-            {(id) => <Select id={id} value={form.state} onChange={(v) => set('state', v)} options={US_STATES.map((s) => ({ value: s, label: s }))} />}
-          </Field>
-        </FormGrid>
+          )}
+        </ContractorFields>
         <Switch checked={form.w9OnFile} onChange={(v) => set('w9OnFile', v)} label="W-9 on file" description="Collect it before the first payment. Keep it with your PEO or accounting system, not here." />
         {!advisor && (
           <>
@@ -650,6 +788,103 @@ export function AddContractorSheet({ open, onClose, onConvert }: { open: boolean
     </Sheet>
   )
 }
+
+// ---------------------------------------------------------------------------------------------
+// Edit sheet
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Edit a contractor's or advisor's basic details (name, entity, scope, rate, dates, who and where). The AB5 check,
+ * paperwork and options keep their own controls on the page. A record too large to sync opens with the scope
+ * focused, and the save is stopped until it fits.
+ */
+function EditContractorSheet({ c, open, onClose, focusScope }: { c: Contractor; open: boolean; onClose: () => void; focusScope?: boolean }) {
+  const [form, setForm] = useState<ContractorForm>(() => formFor(c))
+  const [tried, setTried] = useState(false)
+  useEffect(() => {
+    if (open) {
+      setForm(formFor(c))
+      setTried(false)
+    }
+    // Reset when the sheet opens.
+  }, [open])
+  const set = <K extends keyof ContractorForm>(k: K, v: ContractorForm[K]) => setForm((f) => ({ ...f, [k]: v }))
+  const scopeChanged = form.scope.trim() !== c.scope
+  const next: Contractor = { ...c }
+  applyBasics(next, form)
+  const errors = formErrors(form, scopeChanged)
+  const tooLarge = contractorSizeError(next, { scopeChanged })
+  if (!errors.scope && tooLarge) errors.scope = tooLarge
+  const valid = Object.values(errors).every((e) => !e)
+  const err = (k: keyof typeof errors) => (tried || (k === 'scope' && !!tooLarge) ? errors[k] || undefined : undefined)
+  const name = c.entityName || c.name
+
+  const save = () => {
+    setTried(true)
+    if (!valid) {
+      toast({ text: Object.values(errors).filter(Boolean).join(' '), tone: 'bad' })
+      focusFirstInvalid()
+      return
+    }
+    if (JSON.stringify(next) === JSON.stringify(c)) {
+      onClose()
+      return
+    }
+    const label = `Updated the details for ${next.entityName || next.name}`
+    useDB.getState().mutate(label, (d) => {
+      const k = d.contractors.find((x) => x.id === c.id)
+      if (!k) return
+      applyBasics(k, form)
+      logActivity(d, { entityType: 'contractor', entityId: c.id, kind: 'contractor_updated', text: label })
+    })
+    undoToast(label)
+    onClose()
+  }
+
+  return (
+    <Sheet
+      open={open}
+      onClose={onClose}
+      title={`Edit ${name}`}
+      subtitle={c.kind === 'advisor' ? 'Advisor details. Options are on the page.' : 'Contract details. The AB5 check and paperwork are on the page.'}
+      width={640}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="lg" icon="check" onClick={save}>
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-5">
+        <ContractorFields form={form} set={set} err={err} focusScope={focusScope} />
+      </div>
+    </Sheet>
+  )
+}
+
+/** The whole scope of work, cut to a preview with a Show all button when it runs long. */
+function ScopeText({ scope }: { scope: string }) {
+  const [all, setAll] = useState(false)
+  const long = scope.length > SCOPE_PREVIEW_CHARS
+  const shown = long && !all ? `${scope.slice(0, SCOPE_PREVIEW_CHARS).trimEnd()}...` : scope
+  return (
+    <div>
+      <p className="mt-0.5 text-[14.5px] break-words whitespace-pre-line text-ink">{shown || <span className="text-ink-3">Not set</span>}</p>
+      {long && (
+        <Button variant="ghost" size="sm" className="mt-1" aria-expanded={all} onClick={() => setAll((a) => !a)}>
+          {all ? 'Show less' : `Show all ${scope.length.toLocaleString('en-US')} characters`}
+        </Button>
+      )}
+    </div>
+  )
+}
+
+/** How much of a long scope the page shows before Show all. */
+const SCOPE_PREVIEW_CHARS = 600
 
 // ---------------------------------------------------------------------------------------------
 // Contractor page
@@ -693,9 +928,11 @@ export function ContractorPage({ route }: PageProps) {
   const c = db.contractors.find((k) => k.id === id)
   const [ab5, setAb5] = useState<Ab5Value | null>(null)
   const [endBy, setEndBy] = useState<ISODate | null>(null)
+  const [editing, setEditing] = useState<null | 'details' | 'scope'>(null)
   useEffect(() => {
     setAb5(null)
     setEndBy(null)
+    setEditing(null)
   }, [id])
   const t = today()
 
@@ -707,7 +944,7 @@ export function ContractorPage({ route }: PageProps) {
         title={undone ? 'This change was undone' : 'No contractor or advisor with that link'}
         body={undone ? `Undid: ${undone}. The record is no longer in this workspace.` : undefined}
         action={
-          <a href={links.people('contractors')} className="font-bold text-accent underline">
+          <a href={links.people('contractors')} className="inline-flex min-h-10 items-center font-bold text-accent underline">
             Back to contractors
           </a>
         }
@@ -719,7 +956,8 @@ export function ContractorPage({ route }: PageProps) {
   const name = c.entityName || c.name
   const status = contractorDirStatus(c, t)
   const convertedTo = convertedPerson(db, c)
-  const editing = ab5 ?? c.ab5
+  const ab5Value = ab5 ?? c.ab5
+  const tooLarge = admin && contractorTooLarge(c)
   const dirty = !!ab5 && JSON.stringify({ ...ab5, assessedOn: undefined }) !== JSON.stringify({ ...c.ab5, assessedOn: undefined })
 
   const update = (label: string, fn: (k: Contractor) => void) => {
@@ -740,24 +978,51 @@ export function ContractorPage({ route }: PageProps) {
         back={{ href: admin ? links.people('contractors') : links.people(), label: admin ? 'Contractors and advisors' : 'People' }}
         eyebrow={c.kind === 'advisor' ? 'Advisor' : 'Contractor'}
         title={name}
-        subtitle={c.scope}
+        subtitle={scopeSummary(c.scope)}
         actions={
-          <span className="flex flex-wrap gap-2">
+          <span className="flex flex-wrap items-center gap-2">
             <ContractorStatusBadge status={status} />
             {admin && <Ab5OrConverted c={c} person={convertedTo} />}
+            {admin && (
+              <Button size="sm" icon="edit" onClick={() => setEditing('details')}>
+                Edit details
+              </Button>
+            )}
           </span>
         }
       />
+      {tooLarge && (
+        <Callout
+          tone="warn"
+          icon="alert"
+          className="mb-4"
+          title="Too large to sync"
+          action={
+            <Button variant="primary" size="sm" icon="edit" onClick={() => setEditing('scope')}>
+              Shorten the scope
+            </Button>
+          }
+        >
+          This record is over 256 KB, the most a server takes for one record, so its changes stay on this device. Shorten the scope of work to sync it.
+        </Callout>
+      )}
       {/* Columns follow the page area (a container query), so 150% text and the rail both count. */}
       <div className="@container">
         <div className="grid grid-cols-1 gap-4 @[640px]:grid-cols-3">
           <div className="flex min-w-0 flex-col gap-4 @[640px]:col-span-2">
             <Panel title="Details">
+              {/* The subtitle holds a short scope; a longer one is cut there and shown in full here. */}
+              {scopeSummary(c.scope) !== c.scope.trim() && (
+                <div className="mb-4 min-w-0">
+                  <p className="text-[12.5px] font-semibold text-ink-3">Scope of work</p>
+                  <ScopeText scope={c.scope} />
+                </div>
+              )}
               <DescriptionList
                 items={[
                   { label: 'Name', value: c.entityName ? `${c.name} (${c.entityName})` : c.name },
                   { label: 'Entity', value: c.entityType === 'individual' ? 'Individual' : c.entityType === 'llc' ? 'LLC' : 'Corporation', hidden: !admin },
-                  { label: 'Works with', value: manager ? <a className="font-semibold text-accent hover:underline" href={links.person(manager.id)}>#{manager.hireNumber} {fullName(manager)}</a> : '' },
+                  { label: 'Works with', value: manager ? <a className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent hover:underline" href={links.person(manager.id)}>#{manager.hireNumber} {fullName(manager)}</a> : '' },
                   { label: 'Team', value: db.departments.find((d) => d.id === c.departmentId)?.name },
                   { label: 'Started', value: fmtDate(c.startOn) },
                   { label: 'Ends', value: c.endOn ? fmtDate(c.endOn) : 'No end date' },
@@ -765,7 +1030,7 @@ export function ContractorPage({ route }: PageProps) {
                   { label: 'Hours', value: c.hoursPerWeek ? `${c.hoursPerWeek} a week` : 'Project based', hidden: !admin },
                   { label: 'About a month', value: <Private>${num(Math.round(contractorMonthly(c).monthly))}</Private>, hidden: !admin || c.kind === 'advisor' },
                   { label: 'Works from', value: c.state },
-                  { label: 'Email', value: c.email ? <a className="text-accent hover:underline" href={`mailto:${c.email}`}>{c.email}</a> : '' },
+                  { label: 'Email', value: c.email ? <a className="-my-2.5 inline-flex min-h-10 items-center text-accent hover:underline" href={`mailto:${c.email}`}>{c.email}</a> : '' },
                   { label: 'Agreement signed', value: c.agreementSignedOn ? fmtDate(c.agreementSignedOn) : 'Not recorded', hidden: !admin },
                 ]}
               />
@@ -801,13 +1066,13 @@ export function ContractorPage({ route }: PageProps) {
                     {c.convertedOn ? `Recorded ${fmtDate(c.convertedOn)}. ` : ''}
                     {fullName(convertedTo)} {convertedTo.startDate > t ? 'starts' : 'started'} as an employee {fmtDate(convertedTo.startDate)}, so the AB5
                     risk is settled. The check below stays as the record.{' '}
-                    <a href={links.person(convertedTo.id)} className="font-semibold text-accent underline">
+                    <a href={links.person(convertedTo.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline">
                       Open employee #{convertedTo.hireNumber}
                     </a>
                   </Callout>
                 )}
                 <Ab5Check
-                  value={editing}
+                  value={ab5Value}
                   onChange={(v) => setAb5(v)}
                   onConvert={convertedTo ? undefined : () => navigate('people', 'new', c.id)}
                   onEndBy={convertedTo ? undefined : (d) => setEndBy(d)}
@@ -917,6 +1182,7 @@ export function ContractorPage({ route }: PageProps) {
           )}
         </div>
       </div>
+      {admin && <EditContractorSheet c={c} open={!!editing} onClose={() => setEditing(null)} focusScope={editing === 'scope'} />}
     </>
   )
 }

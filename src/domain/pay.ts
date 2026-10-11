@@ -56,6 +56,23 @@ export function compOrFirst(db: DB, personId: ID, date: ISODate): CompRecord | u
   return currentComp(db, personId, date) ?? compHistory(db, personId)[0]
 }
 
+/** The person's last day: the end date, or the last day of a separation in progress. */
+export function lastDayOf(person: Pick<Person, 'endDate' | 'separation'>): ISODate | undefined {
+  return person.endDate ?? person.separation?.lastDay ?? undefined
+}
+
+/**
+ * A person's job and pay history split at their last day. Rows dated after it never take effect (a change
+ * scheduled before offboarding started), so they stay out of the job title and wage rate history, the
+ * scheduled-change notice and the current job.
+ */
+export function compHistoryByLastDay(db: DB, person: Person): { history: CompRecord[]; afterLastDay: CompRecord[]; lastDay?: ISODate } {
+  const all = compHistory(db, person.id)
+  const lastDay = lastDayOf(person)
+  if (!lastDay) return { history: all, afterLastDay: [] }
+  return { history: all.filter((r) => r.effectiveOn <= lastDay), afterLastDay: all.filter((r) => r.effectiveOn > lastDay), lastDay }
+}
+
 /** Annual base pay: the salary, or hourly rate x hours per week x 52. */
 export function annualBase(rec: PayFields, hoursPerWeek = 40): number {
   if (rec.payType === 'hourly') return r2((rec.hourlyRate ?? 0) * hoursPerWeek * 52)
@@ -251,7 +268,10 @@ export type LoadedCostInput = {
   variablePct?: number
   /** Work state (two letters). */
   state: string
-  /** Count benefits per head (default true). Run-rate passes false below 30 hours a week. */
+  /**
+   * Count benefits per head (default true). Run-rate passes false below 30 hours a week. Benefits are never
+   * counted when Settings records that the company has no group health plan (benefitsBasis).
+   */
   benefits?: boolean
 } & TaxOptions
 
@@ -271,6 +291,16 @@ export type LoadedCost = {
 }
 
 /**
+ * Where the benefits per head figure stands: 'plan' when Settings has a group health plan start date,
+ * 'none' when it records no plan (benefits count as $0), 'assumed' while the health plan is not recorded
+ * (the per-head figure is counted as an assumption).
+ */
+export function benefitsBasis(company: Pick<DB['company'], 'groupHealthPlanStartedOn'>): 'plan' | 'none' | 'assumed' {
+  const on = company.groupHealthPlanStartedOn
+  return on ? 'plan' : on === null ? 'none' : 'assumed'
+}
+
+/**
  * Fully loaded annual and monthly cost of one employee, using the company's cost model. Tax assumptions come
  * from PAYROLL_TAX_2026, then company.costModel.taxOverrides, then `input.futa` and `input.rates`.
  */
@@ -280,7 +310,7 @@ export function loadedCost(db: Pick<DB, 'company'>, input: LoadedCostInput): Loa
   const variable = r2(base * (input.variablePct ?? 0))
   const wages = base + variable
   const taxes = employerTaxes(wages, { state: input.state, ...companyTax(db, { futa: input.futa, rates: input.rates }) })
-  const benefits = input.benefits === false ? 0 : model.benefitsPerHeadMonthly * 12
+  const benefits = input.benefits === false || benefitsBasis(db.company) === 'none' ? 0 : model.benefitsPerHeadMonthly * 12
   const peoTools = model.peoToolsPerHeadMonthly * 12
   const workersComp = r2(wages * model.workersCompPct)
   const totalAnnual = r2(wages + taxes.total + benefits + peoTools + workersComp)
@@ -353,18 +383,37 @@ export function slotJob(db: DB, slot: PlanSlot): Job | undefined {
   return (slot.jobId ? db.jobs.find((j) => j.id === slot.jobId) : undefined) ?? db.jobs.find((j) => j.planSlotId === slot.id)
 }
 
-/** The offer that decides a slot's status: an accepted one, else the newest outstanding one. */
+/** True when the offer is the one the person was hired from (by offer.personId, or the candidate they were). */
+function offerOfPerson(db: DB, o: Offer, personId: ID): boolean {
+  if (o.personId === personId) return true
+  const from = db.people.find((p) => p.id === personId)?.fromCandidateId
+  return !!from && from === o.candidateId
+}
+
+/**
+ * The offer that decides a slot's status. A held line (slot.personId) takes only the accepted offer its own
+ * person was hired from (the newest, for a rehire): two hires from one job each keep their own offer, and a
+ * person added without an offer has none (budgetVariance then reads their hire record). A line nobody holds
+ * takes an accepted offer no other line's person was hired from, else the newest outstanding one.
+ */
 export function slotOffer(db: DB, slot: PlanSlot): Offer | undefined {
   const job = slotJob(db, slot)
   if (!job) return undefined
   const offers = latestOffers(db).filter((o) => o.jobId === job.id)
+  if (slot.personId) {
+    const held = slot.personId
+    return offers
+      .filter((o) => o.status === 'accepted' && offerOfPerson(db, o, held))
+      .sort((a, b) => b.createdOn.localeCompare(a.createdOn))[0]
+  }
+  const holders = db.plan.filter((s) => s.id !== slot.id && s.personId).map((s) => s.personId as ID)
   return (
-    offers.find((o) => o.status === 'accepted') ??
+    offers.find((o) => o.status === 'accepted' && !holders.some((personId) => offerOfPerson(db, o, personId))) ??
     offers.filter((o) => OUTSTANDING_OFFER_STATUSES.includes(o.status)).sort((a, b) => b.createdOn.localeCompare(a.createdOn))[0]
   )
 }
 
-/** The person who filled a slot: slot.personId, else the person hired from the job's accepted offer. */
+/** The person who filled a slot: slot.personId, else the person hired from the accepted offer slotOffer picks for it. */
 export function slotPerson(db: DB, slot: PlanSlot): Person | undefined {
   if (slot.personId) {
     const p = db.people.find((x) => x.id === slot.personId)
@@ -526,11 +575,12 @@ function slotLine(db: DB, s: PlanSlot, tax: TaxOptions): RunRateLine {
 }
 
 /**
- * The run-rate lines for a scenario (W-2 only). At plan, employees with a known end date are left out
- * (they are gone at plan, as in plan.ts planEvents), and a slot whose offers have all lapsed counts as open.
+ * The run-rate lines for a scenario (W-2 only). Now is today's roster. Every forward scenario (with incoming,
+ * with offers, at plan) leaves out employees with a known last day (they are gone by then, as in plan.ts
+ * planEvents), and at plan a slot whose offers have all lapsed counts as open.
  */
 export function runRateLines(db: DB, date: ISODate, include: RunRateInclude, tax: TaxOptions = {}): RunRateLine[] {
-  const employees = employedOn(db, date).filter((p) => include !== 'at_plan' || !(p.endDate && p.endDate >= date))
+  const employees = employedOn(db, date).filter((p) => include === 'now' || !lastDayOf(p))
   const lines = employees.map((p) => personLine(db, p, date, 'employee', tax))
   if (include === 'now') return lines
   lines.push(...incomingOn(db, date).map((p) => personLine(db, p, date, 'incoming', tax)))
@@ -555,7 +605,7 @@ export function runRateLines(db: DB, date: ISODate, include: RunRateInclude, tax
  * Fully loaded monthly run-rate on a date.
  * now = employed on the date; with_incoming adds hires who have not started (and accepted offers not yet hired);
  * with_offers adds offers awaiting approval, approved or sent (not past expiry); at_plan adds planned and open
- * plan slots at their budgeted base or band midpoint and drops employees with a known end date.
+ * plan slots at their budgeted base or band midpoint. The three forward scenarios drop employees with a known last day.
  * Contractors are reported separately and never in `monthly`. `futa` and `rates` override the tax assumptions.
  */
 export function runRate(db: DB, date: ISODate, opts: { include: RunRateInclude } & TaxOptions = { include: 'now' }): RunRate {
@@ -633,9 +683,20 @@ const SCENARIO_PHRASE: Record<RunRateInclude, string> = {
   at_plan: 'if the plan hires on schedule',
 }
 
-/** "27 months", "0.8 months". */
+/** Past this many months runway reads "more than 5 years": a figure like 508 months is not a forecast anyone can use. */
+export const RUNWAY_CAP_MONTHS = 60
+
+/** "27 months", "0.8 months", or "more than 5 years" past RUNWAY_CAP_MONTHS. */
 function monthsText(months: number): string {
+  if (months > RUNWAY_CAP_MONTHS) return 'more than 5 years'
   return `${months >= 2 ? Math.round(months) : months.toFixed(1)} months`
+}
+
+/** A runway figure on its own: "27 months", "0.8 months", "More than 5 years", or "Not shrinking" when revenue covers spend. */
+export function runwayMonthsLabel(months: number): string {
+  if (months === Infinity) return 'Not shrinking'
+  const text = monthsText(months)
+  return text[0].toUpperCase() + text.slice(1)
 }
 
 /**
@@ -693,7 +754,7 @@ export function runway(db: DB, date: ISODate, scenario: RunRateInclude = 'now', 
     cashNow: Math.round(cashNow),
     months,
     runsOutOn: addDays(date, Math.floor(months * DAYS_PER_MONTH)),
-    text: `About ${monthsText(months)} of runway ${SCENARIO_PHRASE[scenario]}${stale}.`,
+    text: `${months > RUNWAY_CAP_MONTHS ? 'More than 5 years' : `About ${monthsText(months)}`} of runway ${SCENARIO_PHRASE[scenario]}${stale}.`,
   }
 }
 
@@ -811,24 +872,13 @@ export function exemptFlags(db: DB, date: ISODate): ExemptFlag[] {
 }
 
 /**
- * The band exception reason that still explains the person's pay on the date: walking back from the current
- * record, the first reason found, stopping at any earlier record that sat inside its own level's band (a
- * reason from before the person was in band is stale). Bands are not dated, so today's bands are used.
+ * The band exception reason on the record in force on the date (the first record for an incoming hire). An
+ * older record's reason never explains newer pay: changeJobOrPay carries the reason forward on a change that
+ * leaves pay alone, so a newer record without one is pay set with no exception recorded, or pay that sat
+ * inside the band until the band was edited (bands are not dated, so that cannot be told apart).
  */
 function latestExceptionReason(db: DB, person: Person, date: ISODate): string | undefined {
-  const history = compHistory(db, person.id)
-  const upTo = history.filter((c) => c.effectiveOn <= date)
-  const rows = upTo.length ? upTo : history.slice(0, 1)
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const rec = rows[i]
-    if (rec.exceptionReason) return rec.exceptionReason
-    if (i === rows.length - 1) continue
-    const band = bandFor(db, person.familyId, rec.levelId || person.levelId)
-    if (!band) continue
-    const fte = fullTimeEquivalentBase(rec, person.hoursPerWeek)
-    if (fte >= band.min && fte <= band.max) return undefined
-  }
-  return undefined
+  return compOrFirst(db, person.id, date)?.exceptionReason || undefined
 }
 
 export type OutOfBandRow = {
@@ -879,6 +929,8 @@ export type CompTableRow = {
   flsa: FLSA
   payType: 'salary' | 'hourly'
   hourlyRate?: number
+  /** Scheduled hours a week (40 for full time); part-time pay is restated at 40 in fteBase. */
+  hoursPerWeek: number
   /** Actual annual base (hourly x hours x 52 for hourly pay). */
   base: number
   /** Base restated at full time (used for the band comparison). */
@@ -916,6 +968,7 @@ export function compTable(db: DB, date: ISODate): CompTableRow[] {
       flsa: rec?.flsa ?? p.flsa,
       payType: rec?.payType ?? 'salary',
       ...(rec?.payType === 'hourly' ? { hourlyRate: rec.hourlyRate ?? 0 } : {}),
+      hoursPerWeek: p.hoursPerWeek || 40,
       base,
       fteBase,
       variablePct,
@@ -965,7 +1018,8 @@ export function peopleCostSummary(db: DB, date: ISODate, opts: TaxOptions = {}):
   if (atPlan.monthly !== withOffers.monthly) parts.push(`about ${moneyShort(atPlan.monthly)} at plan`)
   let text = `${parts.join(', ')}.`
   if (now.contractorsMonthly > 0) text += ` Contractors ${moneyShort(now.contractorsMonthly)} a month.`
-  const fmtMonths = (r: Runway) => (r.months === Infinity ? 'not shrinking' : `about ${monthsText(r.months ?? 0)}`)
+  const fmtMonths = (r: Runway) =>
+    r.months === Infinity ? 'not shrinking' : (r.months ?? 0) > RUNWAY_CAP_MONTHS ? monthsText(r.months ?? 0) : `about ${monthsText(r.months ?? 0)}`
   const stale =
     runwayNow.cashAsOf && runwayNow.cashAsOf < date && daysBetween(runwayNow.cashAsOf, date) > STALE_CASH_DAYS
       ? ` (cash as of ${fmtDate(runwayNow.cashAsOf)})`

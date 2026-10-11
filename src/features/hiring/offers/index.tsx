@@ -1,38 +1,51 @@
 // Offers, background checks and Hire (owned by the hiring-process builder).
 // Exports keep the names and props the hiring core imports.
 import type { ReactNode } from 'react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { canApproveOffer, canDraftOffer, canSeeOffer } from '@/domain/access'
+import { capTableIsPlaceholder } from '@/domain/equity'
 import { offerNudgeMessage } from '@/domain/hiring/messages'
 import {
   approvalRequired,
   approveOffer,
+  classificationIssues,
+  defaultStartDate,
   effectiveBand,
   extendOffer,
+  isDiscarded,
+  isLapsed,
   markAccepted,
   markSent,
+  moveOfferStart,
   offerEquitySummary,
-  sendBlockers,
+  offerLocationDrift,
+  offerWorkLocationText,
+  sendBlockerList,
+  startHasPassed,
   submitForApproval,
+  updateOffer,
+  waitingOnApproval,
 } from '@/domain/hiring/offers'
-import { dbHolidays, offersFor, outcomeReasonLabel } from '@/domain/hiring/util'
+import { dbHolidays, desiredPayOf, offersFor, outcomeReasonLabel } from '@/domain/hiring/util'
 import { hirePreview } from '@/domain/lifecycle'
 import { personNameById } from '@/domain/people'
 import { ThresholdPreview } from '@/features/compliance'
 import type { ID, Offer } from '@/domain/types'
-import { fmtDay, nowISO, today } from '@/lib/dates'
+import { addBusinessDays, fmtDay, type ISODate, nowISO, today } from '@/lib/dates'
 import { num, pct } from '@/lib/format'
 import { useDB } from '@/store/db'
 import { Badge, Button, DescriptionList, EmptyState, IconButton, Menu, type MenuItem, Money, Private } from '@/ui'
 import { act, SubPanel, copyWithToast, MoneyText, Note } from '../interviews/common'
 import { expiryPhrase } from '../interviews/logic'
 import { BandMeter } from './BandMeter'
-import { HireDetails, hireNow, WelcomeBanner } from './HireFlow'
+import { offerFocusTarget, offerTitleId } from './focus'
+import { HireDetails, hireNow, StartPassedCallout, WelcomeBanner } from './HireFlow'
 import { LetterSheet } from './LetterSheet'
-import { approvalLine, extendOptions, OFFER_STATUS, peerBases, trimPeriod } from './logic'
+import { approvalLine, bandMeterFigures, extendOptions, hasKeptOfferDraft, offerStatusLabel, peerBases, rescindReasonText, trimPeriod } from './logic'
 import { OfferBuilder } from './OfferBuilder'
+import { OfferPay } from './OfferPay'
 import { DeclineModal, RequestChangesModal, RescindModal } from './OfferDialogs'
 
 export { CandidateBackground } from './Background'
@@ -58,6 +71,25 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
   const [letterFor, setLetterFor] = useState<ID | null>(null)
   const [dialog, setDialog] = useState<Dialog>(null)
   const [welcome, setWelcome] = useState<ID | null>(null)
+  // Mark accepted on an offer whose start date has passed first asks whether they started then.
+  const [askStart, setAskStart] = useState(false)
+  const askRef = useRef<HTMLDivElement>(null)
+  // 'Yes, they started then' for this offer and start date (this visit only; the question is never a block).
+  const [startKept, setStartKept] = useState<string | null>(null)
+  // After an action that moves the offer on (Mark sent, Mark accepted, Approve, Extend and reopen, a moved
+  // start date), focus goes to the panel's next step once it renders: the pressed button is usually gone by then.
+  const focusNext = useRef(false)
+  const date = today()
+  const latest = offersFor(db, applicationId)[0]
+  const step = latest ? `${latest.id}:${latest.status}:${isLapsed(latest, date)}:${latest.startDate}` : ''
+  useEffect(() => {
+    if (!focusNext.current) return
+    focusNext.current = false
+    requestAnimationFrame(() => offerFocusTarget(applicationId)?.focus())
+  }, [step, applicationId])
+  useEffect(() => {
+    if (askStart) requestAnimationFrame(() => askRef.current?.querySelector<HTMLElement>('button')?.focus())
+  }, [askStart])
   const app = db.applications.find((a) => a.id === applicationId)
   const job = app ? db.jobs.find((j) => j.id === app.jobId) : undefined
   const cand = app ? db.candidates.find((c) => c.id === app.candidateId) : undefined
@@ -65,25 +97,26 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
 
   const offers = offersFor(db, app.id)
   const offer = offers[0]
-  const date = today()
   const isAdmin = canApproveOffer(viewer)
   const canDraft = canDraftOffer(viewer, db, app) && app.status === 'active'
   const name = `${cand.firstName} ${cand.lastName}`
   const closed = !offer || offer.status === 'declined' || offer.status === 'rescinded'
+  const returnFocus = () => offerFocusTarget(app.id)
 
   const sheets = (
     <>
-      {builder && <OfferBuilder applicationId={app.id} {...(builder.offerId ? { offerId: builder.offerId } : {})} open onClose={() => setBuilder(null)} />}
+      {builder && <OfferBuilder applicationId={app.id} {...(builder.offerId ? { offerId: builder.offerId } : {})} open onClose={() => setBuilder(null)} returnFocus={returnFocus} />}
       {letterFor && <LetterSheet offerId={letterFor} open onClose={() => setLetterFor(null)} />}
-      {dialog?.kind === 'decline' && <DeclineModal offerId={dialog.offerId} onClose={() => setDialog(null)} />}
-      {dialog?.kind === 'rescind' && <RescindModal offerId={dialog.offerId} onClose={() => setDialog(null)} />}
-      {dialog?.kind === 'changes' && <RequestChangesModal offerId={dialog.offerId} onClose={() => setDialog(null)} />}
+      {dialog?.kind === 'decline' && <DeclineModal offerId={dialog.offerId} onClose={() => setDialog(null)} returnFocus={returnFocus} />}
+      {dialog?.kind === 'rescind' && <RescindModal offerId={dialog.offerId} onClose={() => setDialog(null)} returnFocus={returnFocus} />}
+      {dialog?.kind === 'changes' && <RequestChangesModal offerId={dialog.offerId} onClose={() => setDialog(null)} returnFocus={returnFocus} />}
     </>
   )
 
   if (!offer) {
     return (
-      <SubPanel title="Offer" icon="send">
+      <SubPanel title="Offer" titleId={offerTitleId(app.id)} icon="send">
+        {canDraft && !builder && hasKeptOfferDraft(app.id, undefined, 1) && <Note>Your unsaved offer is kept for this visit. Make offer brings it back.</Note>}
         <EmptyState
           compact
           icon="send"
@@ -91,7 +124,8 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
           body={canDraft ? 'Level picks the band. Base, equity, a Monday start date and a 5-business-day expiry come prefilled.' : 'Offers show here once drafted.'}
           action={
             canDraft ? (
-              <Button variant="primary" size="lg" icon="plus" onClick={() => setBuilder({})}>
+              // The panel's next action: 'Open offer' on a pipeline card lands here (offerFocusTarget).
+              <Button variant="primary" size="lg" icon="plus" onClick={() => setBuilder({})} data-next-action={app.id}>
                 Make offer
               </Button>
             ) : undefined
@@ -102,56 +136,135 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
     )
   }
 
-  const st = OFFER_STATUS[offer.status]
+  const st = offerStatusLabel(offer, date)
+  const lapsed = isLapsed(offer, date)
+  const expired = offer.status === 'expired' || lapsed
+  const discarded = isDiscarded(offer)
   const needsApproval = approvalRequired(db, offer, date)
-  const blockers = offer.status === 'draft' || offer.status === 'approved' ? sendBlockers(db, offer, date).filter((b) => !b.includes('Admin approval')) : []
+  const unsent = offer.status === 'draft' || offer.status === 'approved'
+  // An offer waiting for approval shows only a start date that has passed, so Admin can move it before approving.
+  const blockers = unsent
+    ? sendBlockerList(db, offer, date).filter((b) => b.kind !== 'approval')
+    : offer.status === 'awaiting_approval'
+      ? sendBlockerList(db, offer, date).filter((b) => b.kind === 'start')
+      : []
+  const hired = offer.personId ? db.people.find((p) => p.id === offer.personId) : undefined
+  // Pay the classification cannot carry, on an offer already past the builder (waiting, out or accepted):
+  // drafts list it among the send blockers below.
+  const classification = !unsent && (offer.status === 'awaiting_approval' || offer.status === 'sent' || (offer.status === 'accepted' && !hired)) ? classificationIssues(db, offer) : []
   const band = effectiveBand(db, offer.familyId, offer.levelId, job)
   const base = offer.payType === 'hourly' ? Math.round((offer.hourlyRate ?? 0) * 2080) : (offer.salary ?? 0)
+  // The meter in the offer's own terms: dollars an hour for an hourly offer.
+  const meter = band ? bandMeterFigures(offer, band, job, desiredPayOf(cand)) : null
   const equity = offerEquitySummary(db, offer, date)
-  const hired = offer.personId ? db.people.find((p) => p.id === offer.personId) : undefined
   const changes = [...offer.approvals].reverse().find((a) => a.decision === 'changes_requested')
   const drafter = offer.draftedById ? personNameById(db, offer.draftedById, 'someone') : undefined
+  const holidays = dbHolidays(db)
+  const editor = { role: viewer.role, personId: viewer.personId }
+  // A start date that has passed: unsent offers and extensions move to the default start (a Monday at
+  // least 14 days out); an accepted offer to the next business day.
+  const startPassed = startHasPassed(offer, date) && !hired && offer.status !== 'declined' && offer.status !== 'rescinded'
+  const startKey = `${offer.id}:${offer.startDate}`
+  const newStart = defaultStartDate(date, holidays)
+  // Unsaved builder changes kept from an earlier visit (the builder was left by a route change).
+  const builderOfferId = unsent || offer.status === 'awaiting_approval' ? offer.id : undefined
+  const keptDraft = canDraft && !builder && (closed || !!builderOfferId) && hasKeptOfferDraft(app.id, builderOfferId, builderOfferId ? undefined : offer.version + 1)
 
-  const run = (label: string, fn: Parameters<typeof act>[1]) => act(label, fn)
-  const approve = () => viewer.personId && run(`Approved the offer for ${name}`, (d) => approveOffer(d, offer.id, { approverId: viewer.personId as ID, at: nowISO() }))
-  const submit = () => run(`Sent the offer for ${name} for approval`, (d) => submitForApproval(d, offer.id, { date }))
-  const send = () => run(`Marked the offer to ${name} sent`, (d) => markSent(d, offer.id, { date }))
-  const accept = () => run(`Recorded that ${name} accepted the offer`, (d) => markAccepted(d, offer.id, { date }))
+  const run = (label: string, fn: Parameters<typeof act>[1], moveFocus = false) => {
+    const res = act(label, fn)
+    if (res && moveFocus) focusNext.current = true
+    return res
+  }
+  const approve = () => viewer.personId && run(`Approved the offer for ${name}`, (d) => approveOffer(d, offer.id, { approverId: viewer.personId as ID, at: nowISO() }), true)
+  const submit = () => run(`Sent the offer for ${name} for approval`, (d) => submitForApproval(d, offer.id, { date }), true)
+  const send = () => run(`Marked the offer to ${name} sent`, (d) => markSent(d, offer.id, { date }), true)
+  const focusAsk = () => requestAnimationFrame(() => askRef.current?.querySelector<HTMLElement>('button')?.focus())
+  const accept = () => {
+    // A start date that has passed: ask whether they started then before recording it.
+    if (startPassed && startKept !== startKey) {
+      if (askStart) focusAsk()
+      else setAskStart(true)
+      return
+    }
+    run(`Recorded that ${name} accepted the offer`, (d) => markAccepted(d, offer.id, { date }), true)
+  }
+  const acceptStarted = () => {
+    setStartKept(startKey)
+    setAskStart(false)
+    run(`Recorded that ${name} accepted the offer`, (d) => markAccepted(d, offer.id, { date }), true)
+  }
+  const acceptMovingStart = (to: ISODate) => {
+    setAskStart(false)
+    run(
+      `Recorded that ${name} accepted the offer, starting ${fmtDay(to)}`,
+      (d) => {
+        const r = markAccepted(d, offer.id, { date })
+        return r.ok ? moveOfferStart(d, offer.id, to, { date, editor }) : r
+      },
+      true,
+    )
+  }
+  const moveStart = (to: ISODate) => run(`Moved the start date for ${name} to ${fmtDay(to)}`, (d) => moveOfferStart(d, offer.id, to, { date, editor }), true)
+  const keepStart = () => {
+    setStartKept(startKey)
+    requestAnimationFrame(() => offerFocusTarget(app.id)?.focus())
+  }
+  const expiryDays = db.settings.offerExpiryBusinessDays
+  const resetExpiry = () =>
+    run(`Moved the offer expiry for ${name} to ${fmtDay(addBusinessDays(date, expiryDays, holidays))}`, (d) => updateOffer(d, offer.id, { expiresOn: addBusinessDays(date, expiryDays, holidays) }, { date, editor }))
+  // Before it goes out, an offer follows its job's work location: the job may have moved (say to remote).
+  const drift = unsent || offer.status === 'awaiting_approval' ? offerLocationDrift(db, offer) : null
+  const takeJobLocation = () => {
+    if (!drift) return
+    const res = run(`Moved the offer for ${name} to the job's work location`, (d) => updateOffer(d, offer.id, { workMode: drift.workMode, locationId: drift.locationId }, { date, editor }))
+    // The note and its button go away: focus moves on to the panel's next step.
+    if (res) requestAnimationFrame(() => offerFocusTarget(app.id)?.focus())
+  }
   const nudge = () => {
-    const m = offerNudgeMessage(db, offer.id, viewer.personId ? { senderId: viewer.personId } : {})
+    const m = offerNudgeMessage(db, offer.id, { ...(viewer.personId ? { senderId: viewer.personId } : {}), date })
     if (m) void copyWithToast(`Subject: ${m.subject}\n\n${m.body}`, `a nudge for ${cand.firstName}`)
   }
-  const extendItems: MenuItem[] = extendOptions(offer.expiresOn, date, dbHolidays(db)).map((o) => ({
-    label: `Extend to ${fmtDay(o.date)}`,
+  // While the start date has passed, an extension moves the start too (extendOffer refuses otherwise).
+  const extendItems: MenuItem[] = extendOptions(offer.expiresOn, date, holidays).map((o) => ({
+    label: startPassed ? `Extend to ${fmtDay(o.date)}, start ${fmtDay(newStart)}` : `Extend to ${fmtDay(o.date)}`,
     hint: `+${o.days} business days`,
     icon: 'clock',
-    onSelect: () => run(`Extended the offer for ${name} to ${fmtDay(o.date)}`, (d) => extendOffer(d, offer.id, o.date, { date })),
+    onSelect: () =>
+      run(
+        startPassed ? `Extended the offer for ${name} to ${fmtDay(o.date)} and moved the start to ${fmtDay(newStart)}` : `Extended the offer for ${name} to ${fmtDay(o.date)}`,
+        (d) => extendOffer(d, offer.id, o.date, { date, ...(startPassed ? { startDate: newStart } : {}) }),
+        expired,
+      ),
   }))
+  // The first primary action of each state carries data-next-action: focus lands there after the state changes.
+  const next = { 'data-next-action': app.id }
 
   const primary: ReactNode[] = []
   const more: MenuItem[] = []
-  const letterBtn = (
+  // Admin approves before an offer goes out: until then only Admin opens the letter (marked as a draft).
+  const letterBtn = waitingOnApproval(db, offer, date) && !isAdmin ? null : (
     <Button key="letter" icon="file" onClick={() => setLetterFor(offer.id)}>
       Generate letter
     </Button>
   )
+  const reopen = <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button variant="primary" icon="clock" {...p} {...next}>Extend and reopen</Button>} />
   switch (offer.status) {
     case 'draft':
       if (needsApproval && isAdmin)
         primary.push(
-          <Button key="approve" variant="primary" icon="check" onClick={approve}>
+          <Button key="approve" variant="primary" icon="check" onClick={approve} {...next}>
             Approve
           </Button>,
         )
       else if (needsApproval)
         primary.push(
-          <Button key="submit" variant="primary" icon="send" onClick={submit}>
+          <Button key="submit" variant="primary" icon="send" onClick={submit} {...next}>
             Submit for approval
           </Button>,
         )
       else
         primary.push(
-          <Button key="send" variant="primary" icon="send" onClick={send}>
+          <Button key="send" variant="primary" icon="send" onClick={send} {...next}>
             Mark sent
           </Button>,
         )
@@ -166,7 +279,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
     case 'awaiting_approval':
       if (isAdmin) {
         primary.push(
-          <Button key="approve" variant="primary" size="lg" icon="check" onClick={approve}>
+          <Button key="approve" variant="primary" size="lg" icon="check" onClick={approve} {...next}>
             Approve
           </Button>,
           <Button key="changes" onClick={() => setDialog({ kind: 'changes', offerId: offer.id })}>
@@ -184,7 +297,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
       break
     case 'approved':
       primary.push(
-        <Button key="send" variant="primary" icon="send" onClick={send}>
+        <Button key="send" variant="primary" icon="send" onClick={send} {...next}>
           Mark sent
         </Button>,
         letterBtn,
@@ -195,16 +308,27 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
       if (isAdmin) more.push({ label: 'Discard offer', icon: 'trash', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
       break
     case 'sent':
-      primary.push(
-        <Button key="accept" variant="primary" icon="check" onClick={accept}>
-          Mark accepted
-        </Button>,
-        <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
-          Declined
-        </Button>,
-        <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button icon="clock" {...p}>Extend expiry</Button>} />,
-      )
-      more.push({ label: 'Copy a friendly nudge', icon: 'copy', onSelect: nudge }, { label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
+      if (lapsed) {
+        // Past its expiry: it cannot be accepted until it is extended (markAccepted refuses too).
+        primary.push(
+          reopen,
+          <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
+            Declined
+          </Button>,
+        )
+        more.push({ label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
+      } else {
+        primary.push(
+          <Button key="accept" variant="primary" icon="check" onClick={accept} {...next}>
+            Mark accepted
+          </Button>,
+          <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
+            Declined
+          </Button>,
+          <Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button icon="clock" {...p}>Extend expiry</Button>} />,
+        )
+        more.push({ label: 'Copy a friendly nudge', icon: 'copy', onSelect: nudge }, { label: 'Generate letter', icon: 'file', onSelect: () => setLetterFor(offer.id) })
+      }
       if (isAdmin) more.push({ divider: true }, { label: 'Rescind offer', icon: 'x', danger: true, onSelect: () => setDialog({ kind: 'rescind', offerId: offer.id }) })
       break
     case 'accepted':
@@ -214,29 +338,51 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
       }
       break
     case 'expired':
-      primary.push(<Menu key="extend" label="Extend expiry" items={extendItems} trigger={(p) => <Button variant="primary" icon="clock" {...p}>Extend and reopen</Button>} />)
+      primary.push(
+        reopen,
+        <Button key="decline" onClick={() => setDialog({ kind: 'decline', offerId: offer.id })}>
+          Declined
+        </Button>,
+      )
       break
     default:
       break
   }
   if (closed && canDraft) {
     primary.push(
-      <Button key="new" variant="primary" icon="plus" onClick={() => setBuilder({})}>
+      <Button key="new" variant="primary" icon="plus" onClick={() => setBuilder({})} {...next}>
         Make a new offer
       </Button>,
     )
   }
 
   const preview = offer.status === 'accepted' && !hired ? hirePreview(db, offer.id) : null
+  const closedNote = (() => {
+    if (offer.status === 'declined') {
+      return (
+        <MoneyText
+          text={`Declined${offer.decidedOn ? ` ${fmtDay(offer.decidedOn)}` : ''}: ${outcomeReasonLabel(offer.declineReason).toLowerCase()}${offer.competingNote ? `. ${trimPeriod(offer.competingNote)}` : ''}.`}
+        />
+      )
+    }
+    if (expired) return `Expired ${fmtDay(offer.expiresOn)}. Extend it to reopen, or record that they declined.`
+    if (offer.status === 'rescinded') {
+      const word = discarded ? 'Discarded' : 'Rescinded'
+      const why = offer.rescindReason ? `: ${rescindReasonText(offer.rescindReason)}` : ''
+      return <MoneyText text={`${word}${offer.decidedOn ? ` ${fmtDay(offer.decidedOn)}` : ''}${why}.${discarded ? ' The candidate never received it.' : ''}`} />
+    }
+    return null
+  })()
 
   return (
     <SubPanel
       title="Offer"
+      titleId={offerTitleId(app.id)}
       icon="send"
       subtitle={`Version ${offer.version}${drafter ? `, drafted by ${drafter}` : ''}${offer.createdOn ? ` on ${fmtDay(offer.createdOn)}` : ''}`}
       actions={
         <>
-          <Badge tone={st.tone}>{offer.status === 'sent' ? `Out, ${expiryPhrase(offer.expiresOn, date).toLowerCase()}` : st.label}</Badge>
+          <Badge tone={st.tone}>{offer.status === 'sent' && !lapsed ? `Out, ${expiryPhrase(offer.expiresOn, date, { midSentence: true })}` : st.label}</Badge>
           {more.length > 0 && <Menu label="More offer actions" items={more} trigger={(p) => <IconButton icon="more" label="More offer actions" {...p} />} />}
         </>
       }
@@ -246,7 +392,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
         {hired && !welcome && (
           <Note icon="check">
             Hired as employee #{hired.hireNumber}, starting {fmtDay(hired.startDate)}.{' '}
-            <a href={links.person(hired.id)} className="font-semibold text-accent underline">
+            <a href={links.person(hired.id)} className="-my-2 inline-flex min-h-10 items-center font-semibold text-accent underline">
               Open profile
             </a>
           </Note>
@@ -257,29 +403,17 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
             {personNameById(db, changes.approverId, 'Admin')} asked for changes: <MoneyText text={changes.note ?? ''} />
           </Note>
         )}
-        {(offer.status === 'declined' || offer.status === 'rescinded' || offer.status === 'expired') && (
-          <Note icon="info">
-            {offer.status === 'declined' ? (
-              <MoneyText
-                text={`Declined${offer.decidedOn ? ` ${fmtDay(offer.decidedOn)}` : ''}: ${outcomeReasonLabel(offer.declineReason).toLowerCase()}${offer.competingNote ? `. ${trimPeriod(offer.competingNote)}` : ''}.`}
-              />
-            )
-              : offer.status === 'expired'
-                ? `Expired ${fmtDay(offer.expiresOn)}. Extend it to reopen, or close the application.`
-                : `Rescinded${offer.decidedOn ? ` ${fmtDay(offer.decidedOn)}` : ''}.`}
+        {closedNote && <Note icon="info">{closedNote}</Note>}
+        {classification.map((c) => (
+          <Note key={c.message} icon="alert">
+            <Private>{c.message}</Private>{' '}
+            {offer.status === 'awaiting_approval' ? 'Edit the offer before it goes out.' : 'It went out like this. Rescind it and make a new offer that fixes it.'}
           </Note>
-        )}
+        ))}
         <DescriptionList
           columns={2}
           items={[
-            {
-              label: 'Base',
-              value: (
-                <>
-                  <Money value={offer.payType === 'hourly' ? offer.hourlyRate : offer.salary} /> {offer.payType === 'hourly' ? 'an hour' : 'a year'}
-                </>
-              ),
-            },
+            { label: 'Base', value: <OfferPay offer={offer} /> },
             {
               label: 'Variable and sign-on',
               value: (
@@ -305,35 +439,92 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
                 offer.equityShares > 0 ? (
                   <>
                     <Private>{num(offer.equityShares)}</Private> {offer.equityType}s, <Private>{pct(equity.pctFD)}</Private> fully diluted
+                    {capTableIsPlaceholder(db) ? ' (estimate from the placeholder cap table)' : ''}
                   </>
                 ) : (
                   'None'
                 ),
             },
-            { label: 'Start date', value: fmtDay(offer.startDate) },
-            { label: 'Expires', value: `${fmtDay(offer.expiresOn)}${offer.status === 'sent' ? ` (${expiryPhrase(offer.expiresOn, date).toLowerCase()})` : ''}` },
+            { label: 'Start date', value: `${fmtDay(offer.startDate)}${startPassed ? ' (passed)' : ''}` },
+            { label: 'Work location', value: offerWorkLocationText(db, offer) },
+            { label: 'Expires', value: `${fmtDay(offer.expiresOn)}${offer.status === 'sent' ? ` (${expiryPhrase(offer.expiresOn, date, { midSentence: true })})` : ''}` },
             {
               label: 'Classification',
-              value: offer.flsa === 'exempt' ? `Exempt${offer.exemptionBasis ? `, ${BASIS_LABEL[offer.exemptionBasis] ?? offer.exemptionBasis}` : ''}` : 'Non-exempt (2810.5 notice required)',
+              value: (
+                <>
+                  {offer.flsa === 'exempt' ? `Exempt${offer.exemptionBasis ? `, ${BASIS_LABEL[offer.exemptionBasis] ?? offer.exemptionBasis}` : ''}` : 'Non-exempt (2810.5 notice required)'}
+                  {(classification.length > 0 || blockers.some((b) => b.kind === 'classification')) && <span className="font-semibold text-warn">. The pay does not support it</span>}
+                </>
+              ),
+            },
+            {
+              label: 'Hours',
+              value: `${offer.employmentType === 'part_time' ? 'Part time' : offer.employmentType === 'intern' ? 'Internship' : 'Full time'}${offer.hoursPerWeek ? `, ${offer.hoursPerWeek} hours a week` : ''}`,
             },
             { label: 'Contingencies', value: offer.contingencies.length ? offer.contingencies.map((c) => CONTINGENCY_LABEL[c]).join(', ') : 'None' },
             { label: 'Approval', value: approvalLine(offer, needsApproval, (id) => personNameById(db, id, 'Admin')) },
             { label: 'Exception reason', value: <MoneyText text={offer.exceptionReason ?? ''} />, hidden: !offer.exceptionReason },
           ]}
         />
-        {band && base > 0 && (
-          <BandMeter compact band={band} offer={base} desired={cand.desiredPay ?? null} {...(isAdmin ? { peers: peerBases(db.people, db.comp, offer.familyId, offer.levelId, date, offer.personId ? [offer.personId] : []) } : {})} />
+        {meter && base > 0 && (
+          <BandMeter
+            compact
+            band={meter.band}
+            offer={meter.offer}
+            desired={meter.desired}
+            desiredFrom={meter.desiredFrom}
+            posted={meter.posted}
+            unit={meter.unit}
+            {...(isAdmin ? { peers: peerBases(db.people, db.comp, offer.familyId, offer.levelId, date, offer.personId ? [offer.personId] : [], meter.unit) } : {})}
+          />
         )}
         {blockers.length > 0 && (
           <ul className="flex flex-col gap-1">
             {blockers.map((b) => (
-              <li key={b}>
+              <li key={b.message} className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Note icon="alert">
-                  <Private>{b}</Private>
+                  <Private>{b.message}</Private>
                 </Note>
+                {b.kind === 'expiry' && (
+                  <Button size="sm" icon="clock" onClick={resetExpiry}>
+                    Reset expiry to {expiryDays} business days from today
+                  </Button>
+                )}
+                {b.kind === 'start' && (
+                  <>
+                    <Button size="sm" icon="calendar" onClick={() => moveStart(newStart)}>
+                      Move start to {fmtDay(newStart)}
+                    </Button>
+                    {offer.status === 'approved' && <span className="text-[13px] text-ink-3">The start date is part of the approval, so this sends the offer back to draft.</span>}
+                  </>
+                )}
               </li>
             ))}
           </ul>
+        )}
+        {drift && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Note icon="alert">{drift.message}</Note>
+            {canDraft && (
+              <>
+                <Button size="sm" icon="pin" onClick={takeJobLocation}>
+                  Use the job&apos;s location
+                </Button>
+                {offer.status === 'approved' && <span className="text-[13px] text-ink-3">The work location is part of the approval, so this sends the offer back to draft.</span>}
+              </>
+            )}
+          </div>
+        )}
+        {preview && startPassed && startKept !== startKey && (
+          <StartPassedCallout
+            offer={offer}
+            intro={
+              canDraft
+                ? 'Move the start before the hire, or keep the date if they already started (first-day tasks and the I-9 deadlines then count from it).'
+                : 'Admin or the hiring manager can move the start before the hire.'
+            }
+            {...(canDraft ? { onMove: moveStart, onKeep: keepStart } : {})}
+          />
         )}
         {preview && (
           <div className="flex flex-col gap-2 rounded-xl bg-surface-2 px-4 py-3">
@@ -343,6 +534,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
                   variant="primary"
                   size="lg"
                   icon="user-plus"
+                  {...next}
                   onClick={() => {
                     const personId = hireNow(offer.id, viewer.personId)
                     if (personId) setWelcome(personId)
@@ -362,6 +554,18 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
             {isAdmin && <HireDetails offerId={offer.id} />}
           </div>
         )}
+        {startPassed && (offer.status === 'sent' || offer.status === 'expired') && !askStart && (
+          <Note icon="alert">
+            The start date {fmtDay(offer.startDate)} has passed. Extending also moves the start to {fmtDay(newStart)}.
+            {offer.status === 'sent' && !lapsed ? ' Mark accepted asks whether they started then.' : ''}
+          </Note>
+        )}
+        {askStart && offer.status === 'sent' && startPassed && (
+          <div ref={askRef}>
+            <StartPassedCallout offer={offer} intro="Pick one to record the acceptance." onMove={acceptMovingStart} onKeep={acceptStarted} />
+          </div>
+        )}
+        {keptDraft && <Note>Your unsaved changes to this offer are kept for this visit. {closed ? 'Make a new offer' : 'Edit'} brings them back.</Note>}
         {primary.length > 0 && <div className="flex flex-wrap gap-2">{primary}</div>}
         {offers.length > 1 && (
           <p className="text-[12.5px] text-ink-3">
@@ -369,7 +573,7 @@ export function CandidateOffer({ applicationId }: { applicationId: ID }) {
             <MoneyText
               text={offers
                 .slice(1)
-                .map((o) => `v${o.version} ${OFFER_STATUS[o.status].label.toLowerCase()}${o.declineReason ? ` (${outcomeReasonLabel(o.declineReason).toLowerCase()})` : ''}`)
+                .map((o) => `v${o.version} ${offerStatusLabel(o, date).label.toLowerCase()}${o.declineReason ? ` (${outcomeReasonLabel(o.declineReason).toLowerCase()})` : ''}`)
                 .join(', ')}
             />
           </p>

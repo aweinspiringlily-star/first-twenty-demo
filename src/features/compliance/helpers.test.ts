@@ -127,6 +127,35 @@ describe('rule cards', () => {
     const r = evaluateRule(db, RULE_BY_ID['sb294-annual-notice'], D)
     expect(cycleLine(r)).toBe('Next due Feb 1, 2027; last done Jan 30, 2026.')
   })
+
+  it('says a yearly employee notice waits for someone other than an unpaid owner', () => {
+    const db = makeDB('2026-01-01')
+    const r = evaluateRule(db, RULE_BY_ID['sb294-annual-notice'], D)
+    expect(statusLine(r)).toBe('Nothing is due yet: it starts once someone other than an unpaid owner works here.')
+    expect(cycleLine(r)).toBe('Due each Feb 1 once someone other than an unpaid owner works here.')
+    expect(needsAction(r)).toBe(false)
+    // It applies from the first paid hire, not from the founding date.
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    const hired = evaluateRule(db, RULE_BY_ID['sb294-annual-notice'], '2026-11-02')
+    expect(statusLine(hired)).toBe('Applies since Nov 2, 2026. 0 of 2 done.')
+    expect(cycleLine(hired)).toBe('Next due Feb 1, 2027.')
+  })
+
+  it('says a law that covers contracts from a later date is preparation, not in force since founding', () => {
+    const db = ledgerlarkLite()
+    const r = evaluateRule(db, RULE_BY_ID['stay-or-pay-ban'], D)
+    expect(statusLine(r)).toBe('Applies to contracts from Jan 1, 2027: prepare now. 0 of 2 done.')
+    expect(whyText(r)).toBe('This covers every California employer, whatever the size, for contracts entered on or after Jan 1, 2027. Get ready before then.')
+    expect(statusLine(evaluateRule(db, RULE_BY_ID['stay-or-pay-ban'], '2027-01-04'))).toBe('Applies since Jan 1, 2027. 0 of 2 done.')
+  })
+
+  it('writes an estimated DE 1 due date as about, until the first payroll date is saved', () => {
+    const db = ledgerlarkLite()
+    const est = evaluateRule(db, RULE_BY_ID['edd-registration'], D)
+    expect(statusLine(est)).toBe('Applies since May 12, 2025; due about May 27, 2025. 0 of 2 done.')
+    db.company.firstPayrollOn = '2025-05-15'
+    expect(statusLine(evaluateRule(db, RULE_BY_ID['edd-registration'], D))).toBe('Applies since May 15, 2025; due May 30, 2025. 0 of 2 done.')
+  })
 })
 
 describe('next threshold lead', () => {

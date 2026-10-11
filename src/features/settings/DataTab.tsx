@@ -4,10 +4,9 @@
 // Connected to a First Twenty server, Import and Start fresh go through replaceWorkspace() (they replace
 // the server's workspace for every device, after a clear confirmation) and Reset to sample is blocked:
 // the sample never syncs (docs/SYNC.md).
-import { produce } from 'immer'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { links, navigate, replaceRoute, useRoute } from '@/app/router'
-import { daysBetween, fmtDate, fmtDateTime, fmtDay, getClockOverride, nowISO, parseDate, toISODate, today } from '@/lib/dates'
+import { daysBetween, fmtDate, fmtDateTime, fmtDay, getClockOverride, parseDate, toISODate, today } from '@/lib/dates'
 import {
   buildGraduationPack,
   GRADUATION_HEADCOUNT,
@@ -18,9 +17,10 @@ import {
   graduationCount,
 } from '@/domain/graduation'
 import { copyText, downloadFile, readFileText } from '@/lib/files'
+import { backupJSON, downloadBackupFile, markExported } from '@/store/backup'
 import { getDB, loadSample, migrate, STORAGE_KEY, useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
-import { replaceWorkspace, useSyncStatus } from '@/sync'
+import { connect, replaceWorkspace, useSyncStatus } from '@/sync'
 import {
   Badge,
   Button,
@@ -41,7 +41,6 @@ import {
 } from '@/ui'
 import { ButtonLink, DateField, pastPresets, Row, RowList } from './kit'
 import {
-  backupFileName,
   buildFreshDB,
   dataWeDontKeep,
   type DBDiff,
@@ -50,41 +49,25 @@ import {
   type FreshInput,
   fmtBytes,
   HQ_CITIES,
+  normalizeWebsite,
   packFileName,
   parseBackup,
+  storageLabel,
   storageUsage,
+  suggestedWorkEmail,
+  urlProblem,
+  workEmailProblem,
 } from './logic'
 import { focusPanelTitle } from './serverFocus'
 import { statusView } from './serverLogic'
 import type { DB } from '@/domain/types'
 
 // ---------------------------------------------------------------------------------------------
-// Backup helpers
+// Backup helpers (the file itself comes from @/store/backup, shared with the Home inbox)
 // ---------------------------------------------------------------------------------------------
 
-/**
- * Records the backup time without adding an Undo step: the timestamp is stamped on the current
- * workspace and on every snapshot in the undo history, so Undo never rolls the backup age back
- * and never undoes the backup instead of the change the person meant.
- */
-function markExported(): string {
-  const at = nowISO()
-  const stamp = (db: DB) =>
-    produce(db, (d) => {
-      d.meta.lastExportedOn = at
-    })
-  useDB.setState((s) => ({ db: stamp(s.db), past: s.past.map((p) => ({ ...p, db: stamp(p.db) })) }))
-  return at
-}
-
-function backupJSON(): string {
-  return JSON.stringify(getDB(), null, 2)
-}
-
 export function downloadBackup(): boolean {
-  markExported()
-  const db = getDB()
-  const ok = downloadFile(backupFileName(db.company.name, today()), backupJSON(), 'application/json;charset=utf-8')
+  const { ok } = downloadBackupFile()
   toast(
     ok
       ? { text: 'Backup downloaded' }
@@ -468,7 +451,7 @@ function ImportPanel() {
                   icon="upload"
                   disabled={diff.identical || sampleBlocked}
                   aria-disabled={sending ? true : undefined}
-                  confirmLabel="Click again to replace the server's workspace"
+                  confirmLabel="Press again to replace the server's workspace"
                   onConfirm={() => void replaceNow()}
                 >
                   {sending ? 'Importing' : "Replace the server's workspace with this backup"}
@@ -510,27 +493,14 @@ function StoragePanel() {
     } catch {
       /* storage unavailable; the in-memory size still tells the story */
     }
+    // Every collection (an array) and every document (an object, such as settings): the parts that take room.
     const parts = Object.entries(db as unknown as Record<string, unknown>)
-      .filter(([, v]) => Array.isArray(v))
+      .filter(([, v]) => !!v && typeof v === 'object')
       .map(([k, v]) => ({ key: k, size: JSON.stringify(v).length }))
       .sort((a, b) => b.size - a.size)
       .slice(0, 3)
     return { usage: storageUsage(stored), biggest: parts }
   }, [db])
-  const label: Record<string, string> = {
-    activity: 'activity log',
-    candidates: 'candidates',
-    applications: 'applications',
-    checklists: 'checklists',
-    checklistTemplates: 'checklist templates',
-    emailTemplates: 'email templates',
-    people: 'people',
-    comp: 'pay history',
-    interviews: 'interviews',
-    scorecards: 'scorecards',
-    settings: 'settings',
-    jobs: 'jobs',
-  }
   return (
     <Panel title="Storage" icon="layers" subtitle="Browsers give each site about 5 MB. The meter warns at 70%.">
       <div className="flex flex-col gap-3">
@@ -552,7 +522,7 @@ function StoragePanel() {
         </div>
         <Meter value={usage.used} max={usage.quota} tone={usage.tone} label={`Storage used: ${usage.text}`} />
         <p className="text-[13.5px] text-ink-3">
-          Largest: {biggest.map((b) => `${label[b.key] ?? b.key} (${fmtBytes(b.size)})`).join(', ')}.
+          Largest: {biggest.map((b) => `${storageLabel(b.key)} (${fmtBytes(b.size)})`).join(', ')}.
         </p>
         {usage.tone !== 'good' && (
           <Callout tone="warn" title="Storage is getting full">
@@ -628,7 +598,7 @@ function StartOverPanel({ openFresh }: { openFresh: boolean }) {
             ) : (
             <ConfirmButton
               icon="rotate-ccw"
-              confirmLabel="Click again to reset"
+              confirmLabel="Press again to reset"
               onConfirm={() => {
                 useDB.getState().replace(loadSample(), 'Reset to the sample company')
                 usePrefs.getState().setViewAs('admin', null)
@@ -648,19 +618,27 @@ function StartOverPanel({ openFresh }: { openFresh: boolean }) {
 
 const STEPS = ['Back up first', 'Company', 'Headquarters', 'You'] as const
 
+/** What Settings, Server knows about the server at this address, for a browser that is not connected. */
+export type FreshServer = { signedIn: boolean; empty?: boolean }
+
 /**
  * Start fresh as a solo founder: a backup first, then 3 screens. Connected to a server, the new
  * workspace replaces the server's (replaceWorkspace, no Undo) after the last screen's two-click confirm.
- * onDone runs after it finished (default: go home).
+ * Not connected, `server` (from Settings, Server) says a server answers here: signed in to an empty one,
+ * the last button also uploads the new company there; otherwise the last screen says the company lives
+ * in this browser only, and what comes next. onDone runs after it finished (default: go home).
  */
-export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDone?: () => void }) {
+export function StartFreshSheet({ onClose, onDone, server }: { onClose: () => void; onDone?: () => void; server?: FreshServer | null }) {
   const connected = useSyncStatus((s) => s.mode === 'server')
+  // Signed in to a server that is still empty: the new company goes there right after it is made.
+  const uploadAfter = !connected && !!server?.signedIn && server.empty === true
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<{ message: string; n: number } | null>(null)
   const [step, setStep] = useState(0)
   const [backedUp, setBackedUp] = useState(false)
   const [f, setF] = useState<FreshInput>({
     companyName: '',
+    website: '',
     hqStreet: '',
     hqCity: 'San Jose',
     hqState: 'CA',
@@ -668,9 +646,15 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
     firstName: '',
     lastName: '',
     title: 'Founder and CEO',
+    workEmail: '',
     startDate: today(),
   })
   const set = (patch: Partial<FreshInput>) => setF((x) => ({ ...x, ...patch }))
+  // Optional fields show their problem once the field is left, not while typing.
+  const [left, setLeft] = useState<{ website?: boolean; workEmail?: boolean }>({})
+  const websiteProblem = urlProblem(normalizeWebsite(f.website))
+  const emailProblem = workEmailProblem(f.workEmail)
+  const emailSuggestion = !f.workEmail?.trim() ? suggestedWorkEmail(f.firstName, f.website) : null
   const bodyRef = useRef<HTMLFormElement>(null)
   const formId = `fresh${useId().replace(/:/g, '')}`
   useEffect(() => {
@@ -682,11 +666,15 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
   const problem =
     step === 1 && !f.companyName.trim()
       ? 'Add the company name.'
-      : step === 2 && (!f.hqCity.trim() || !/^[A-Za-z]{2}$/.test(f.hqState.trim()) || !/^\d{5}$/.test(f.hqZip.trim()))
-        ? 'Add the city, a two-letter state and a 5-digit ZIP.'
-        : step === 3 && (!f.firstName.trim() || !f.lastName.trim())
-          ? 'Add your first and last name.'
-          : null
+      : step === 1 && websiteProblem
+        ? `Website: ${websiteProblem} Or leave it blank.`
+        : step === 2 && (!f.hqCity.trim() || !/^[A-Za-z]{2}$/.test(f.hqState.trim()) || !/^\d{5}$/.test(f.hqZip.trim()))
+          ? 'Add the city, a two-letter state and a 5-digit ZIP.'
+          : step === 3 && (!f.firstName.trim() || !f.lastName.trim())
+            ? 'Add your first and last name.'
+            : step === 3 && emailProblem
+              ? emailProblem
+              : null
 
   const confirmId = `${formId}-confirm`
   const finish = async () => {
@@ -703,6 +691,21 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
     if (!connected) {
       // Not connected: an ordinary replace in this browser (one Undo step), done before this returns.
       void replaceWorkspace(db, label)
+      if (uploadAfter) {
+        // Then to the empty server. On failure the company stays in this browser, and Settings, Server
+        // still offers Upload.
+        setSending(true)
+        setSendError(null)
+        const res = await connect.uploadLocal()
+        setSending(false)
+        after()
+        toast(
+          res.ok
+            ? { text: `${label}. Your server now has this workspace.` }
+            : { text: `${label} in this browser only. The upload did not work: ${res.message} Upload it from Settings, Server.`, tone: 'bad' },
+        )
+        return
+      }
       after()
       undoToast(label)
       return
@@ -746,11 +749,15 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
               icon="check"
               disabled={!!problem}
               aria-disabled={sending ? true : undefined}
-              confirmLabel="Click again to replace the server's workspace"
+              confirmLabel="Press again to replace the server's workspace"
               onConfirm={() => void finish()}
             >
               {sending ? 'Starting fresh' : `Start fresh as ${f.companyName.trim() || 'my company'} on your server`}
             </ConfirmButton>
+          ) : uploadAfter ? (
+            <Button type="submit" form={formId} variant="primary" size="lg" icon="upload" disabled={!!problem} aria-disabled={sending ? true : undefined}>
+              {sending ? 'Starting fresh' : 'Start fresh and upload to your server'}
+            </Button>
           ) : (
             <Button type="submit" form={formId} variant="primary" size="lg" icon="check" disabled={!!problem}>
               Start fresh as {f.companyName.trim() || 'my company'}
@@ -838,6 +845,23 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
                 <TextInput id={id} aria-describedby={hint} autoComplete="organization" value={f.companyName} onChange={(e) => set({ companyName: e.target.value })} />
               )}
             </Field>
+            <Field
+              label="Company website (optional)"
+              hint="Like example.com. Shows in Settings > Company, and new hires get work emails on its domain."
+              error={left.website && websiteProblem ? websiteProblem : undefined}
+            >
+              {(id, hint) => (
+                <TextInput
+                  id={id}
+                  aria-describedby={hint}
+                  inputMode="url"
+                  autoComplete="url"
+                  value={f.website ?? ''}
+                  onChange={(e) => set({ website: e.target.value })}
+                  onBlur={() => setLeft((x) => ({ ...x, website: true }))}
+                />
+              )}
+            </Field>
             <p className="text-[14px] text-ink-2">
               Stages, checklists, time off, holidays, levels and email templates start filled in with sensible defaults.
             </p>
@@ -895,6 +919,32 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
                 {(id) => <TextInput id={id} value={f.title} onChange={(e) => set({ title: e.target.value })} />}
               </Field>
             </div>
+            <div className="flex flex-col gap-2">
+              <Field
+                label="Your work email (optional)"
+                hint="Interview invites and emails to candidates use it as your address. Leave it blank to add it later on your profile."
+                error={left.workEmail && emailProblem ? emailProblem : undefined}
+              >
+                {(id, hint) => (
+                  <TextInput
+                    id={id}
+                    type="email"
+                    aria-describedby={hint}
+                    autoComplete="email"
+                    value={f.workEmail ?? ''}
+                    onChange={(e) => set({ workEmail: e.target.value })}
+                    onBlur={() => setLeft((x) => ({ ...x, workEmail: true }))}
+                  />
+                )}
+              </Field>
+              {emailSuggestion && (
+                <div>
+                  <Button size="sm" icon="mail" onClick={() => set({ workEmail: emailSuggestion })}>
+                    Use {emailSuggestion}
+                  </Button>
+                </div>
+              )}
+            </div>
             <DateField
               label="Your start date (also the founding date)"
               value={f.startDate}
@@ -906,7 +956,18 @@ export function StartFreshSheet({ onClose, onDone }: { onClose: () => void; onDo
         )}
         {problem && step > 0 && <p className="text-[13.5px] text-ink-3">{problem}</p>}
         {step === 3 && connected && !problem && (
-          <p className="text-[13.5px] text-ink-2">The last button asks for a second click, then replaces the workspace on your server.</p>
+          <p className="text-[13.5px] text-ink-2">The last button asks you to press it again, then replaces the workspace on your server.</p>
+        )}
+        {step === 3 && !connected && server && (
+          <p className="text-[13.5px] text-ink-2">
+            {uploadAfter
+              ? 'Your server is empty: the new company goes there right away, and every change syncs from then on.'
+              : !server.signedIn
+                ? 'This company lives only in this browser. Next, sign in to your server and upload it, so it is kept there.'
+                : server.empty === false
+                  ? 'This company lives only in this browser. Your server already has a workspace: choose which one to keep in Settings, Server.'
+                  : 'This company lives only in this browser until you upload it in Settings, Server.'}
+          </p>
         )}
         <div role="alert" key={sendError?.n ?? 0} className={sendError ? undefined : 'sr-only'}>
           {sendError && (
@@ -985,7 +1046,7 @@ function ClockPanel() {
         </div>
         <div className="flex flex-wrap gap-2">
           {confirmPause ? (
-            <ConfirmButton variant="primary" icon="clock" confirmLabel="Click again to pause syncing" onConfirm={() => setDemoClock(target)}>
+            <ConfirmButton variant="primary" icon="clock" confirmLabel="Press again to pause syncing" onConfirm={() => setDemoClock(target)}>
               Pretend today is {fmtDay(pick)}
             </ConfirmButton>
           ) : (
@@ -995,7 +1056,7 @@ function ClockPanel() {
           )}
           {override &&
             (connected ? (
-              <ConfirmButton icon="rotate-ccw" confirmLabel="Click again to take the server's copy" onConfirm={() => setDemoClock(null)}>
+              <ConfirmButton icon="rotate-ccw" confirmLabel="Press again to take the server's copy" onConfirm={() => setDemoClock(null)}>
                 Reset to real date
               </ConfirmButton>
             ) : (

@@ -12,6 +12,14 @@ export type ICSEvent = {
   /** All-day event: 'YYYY-MM-DD' (end is exclusive; defaults to the next day). */
   date?: string
   endDate?: string
+  /** A link for the event (a video meeting room). */
+  url?: string
+  /** Revision of the event: a calendar applies a file for the same UID only when it is higher (0 when left out). */
+  sequence?: number
+  /** STATUS line; a cancellation file sets CANCELLED. */
+  status?: 'CONFIRMED' | 'CANCELLED'
+  /** People without an email address are left out (a calendar cannot invite them). */
+  organizer?: { name: string; email: string }
   attendees?: Array<{ name: string; email: string }>
 }
 
@@ -48,11 +56,17 @@ function fold(line: string): string {
   return parts.join('\r\n')
 }
 
-export function buildICS(events: ICSEvent[], calendarName = 'First Twenty'): string {
+/**
+ * A calendar file. `method` 'CANCEL' takes events off the calendars that have them: give each event the
+ * UID of the invite it cancels, a higher `sequence` and `status: 'CANCELLED'`.
+ */
+export function buildICS(events: ICSEvent[], calendarName = 'First Twenty', opts: { method?: 'PUBLISH' | 'CANCEL' } = {}): string {
   const stamp = utc(new Date().toISOString())
-  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//First Twenty//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', `X-WR-CALNAME:${esc(calendarName)}`]
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//First Twenty//EN', 'CALSCALE:GREGORIAN', `METHOD:${opts.method ?? 'PUBLISH'}`, `X-WR-CALNAME:${esc(calendarName)}`]
   for (const e of events) {
     lines.push('BEGIN:VEVENT', `UID:${e.uid}@first-twenty`, `DTSTAMP:${stamp}`, `SUMMARY:${esc(e.title)}`)
+    if (e.sequence != null) lines.push(`SEQUENCE:${Math.max(0, Math.round(e.sequence))}`)
+    if (e.status) lines.push(`STATUS:${e.status}`)
     if (e.date) {
       lines.push(`DTSTART;VALUE=DATE:${ymd(e.date)}`, `DTEND;VALUE=DATE:${ymd(e.endDate ?? nextDay(e.date))}`)
     } else if (e.start) {
@@ -60,7 +74,9 @@ export function buildICS(events: ICSEvent[], calendarName = 'First Twenty'): str
     }
     if (e.description) lines.push(`DESCRIPTION:${esc(e.description)}`)
     if (e.location) lines.push(`LOCATION:${esc(e.location)}`)
-    for (const a of e.attendees ?? []) lines.push(`ATTENDEE;CN=${esc(a.name)};RSVP=TRUE:mailto:${a.email}`)
+    if (e.url?.trim()) lines.push(`URL:${e.url.trim()}`)
+    if (e.organizer?.email.trim()) lines.push(`ORGANIZER;CN=${esc(e.organizer.name)}:mailto:${e.organizer.email.trim()}`)
+    for (const a of e.attendees ?? []) if (a.email.trim()) lines.push(`ATTENDEE;CN=${esc(a.name)};RSVP=TRUE:mailto:${a.email.trim()}`)
     lines.push('END:VEVENT')
   }
   lines.push('END:VCALENDAR')

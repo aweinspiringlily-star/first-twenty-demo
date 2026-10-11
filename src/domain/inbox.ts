@@ -7,7 +7,8 @@
 // - admin: the whole company's queue (approvals, compliance, onboarding, contractors, backup), with items
 //   other people own shown as 'waiting on them' only when they are overdue or close.
 // - manager: their own tasks, scorecards, candidates in jobs they manage, Admin's answer on offers they
-//   drafted or manage (changes asked, approved and ready to send), time off from direct reports,
+//   drafted or manage (changes asked, approved and ready to send; an Admin's draft needs no answer, so it
+//   is ready to send once saved), time off from direct reports,
 //   manager-owned tasks for their reports and their team's overdue trainings. Never pay, equity or
 //   compliance.
 // - personal: one person's own tasks (Employee view and Me > My tasks): their checklist tasks, trainings,
@@ -20,14 +21,16 @@ import type { Draft } from 'immer'
 import { href, links } from '@/app/router'
 import { canApproveTimeOff, canSeeTimeOffDetail, hiringManagerModeAvailable, isInReportingLine } from '@/domain/access'
 import { ACK_TASK_POLICY, closeAckTasks, setTaskStatus } from '@/domain/checklists/actions'
-import { dueLabel, fileBy, holidayDates } from '@/domain/checklists/generate'
+import { dueLabel, fileBy, holidayDates, taskFileBy } from '@/domain/checklists/generate'
 import { HARASSMENT_TASK_KINDS, TASK_IDS } from '@/domain/checklists/templates'
 import {
   complianceCalendar,
   evaluateAll,
   type CalendarItem,
+  hasPerPersonTasks,
   NOT_LEGAL_ADVICE,
   RULE_BY_ID,
+  ruleDeadlineBesideTasks,
   type RuleResult,
 } from '@/domain/compliance'
 import {
@@ -37,11 +40,13 @@ import {
   recordTrainingCompletion,
   setRuleActionDone,
   setRuleStatus,
+  trainingsRecordedBy,
 } from '@/domain/compliance/actions'
 import { boardConsentQueue, consentTableText } from '@/domain/equity'
 import { GRADUATION_HEADCOUNT, GRADUATION_OUTGROW_AT, graduationCount } from '@/domain/graduation'
 import { hasHolidaysIn, rolloverHolidays } from '@/domain/holidays'
 import {
+  approvalRequired,
   attentionReasons,
   businessDaysBetween,
   candidateName,
@@ -60,7 +65,7 @@ import {
 } from '@/domain/hiring'
 import { markDesignationSent } from '@/domain/lifecycle'
 import { employedOn, firstName, fullName, getPerson, headcountSeries, incomingOn, isEmployedOn, welcomeEmail } from '@/domain/people'
-import { approveRequest, hoursLabel, isConfidentialKind, pendingApprovals } from '@/domain/timeoff'
+import { approveAsUnpaid, approveRequest, hoursLabel, isConfidentialKind, pendingApprovals, serviceWait } from '@/domain/timeoff'
 import { trainingRequirements, TRAINING_LABELS, CRD_COURSE_URL } from '@/domain/trainings'
 import type {
   Checklist,
@@ -123,6 +128,8 @@ export type InboxOp =
   | { type: 'decline_requisition'; jobId: ID }
   | { type: 'extend_offer'; offerId: ID; businessDays: number }
   | { type: 'approve_timeoff'; requestId: ID }
+  /** Sick leave held before the service wait: approve it as unpaid leave instead of waiving the wait. */
+  | { type: 'approve_timeoff_unpaid'; requestId: ID }
   | { type: 'leave_notice_sent'; leaveCaseId: ID }
   | { type: 'rule_action_done'; ruleId: string; actionId: string }
   | { type: 'rule_not_applicable'; ruleId: string; note: string }
@@ -440,10 +447,16 @@ function makeCtx(db: DB, viewer: Viewer, date: ISODate, opts: InboxOptions): Ctx
   }
 }
 
-function dueNoteFor(ctx: Ctx, dueOn: ISODate | undefined, extra?: string): string | undefined {
+/**
+ * 'Due Sun Nov 15, file by Fri Nov 13.' when a filing due on a weekend or holiday should go in earlier, plus
+ * `extra`. Checklist tasks pass `by` from taskFileBy (agency filings only, never a day before the checklist
+ * itself, so final pay on a Saturday last day stays on its date); other rows (compliance calendar filings)
+ * use the plain filing rule.
+ */
+function dueNoteFor(ctx: Ctx, dueOn: ISODate | undefined, extra?: string, by?: ISODate | null): string | undefined {
   if (!dueOn) return extra
-  const by = fileBy(dueOn, ctx.holidays)
-  const parts = [by ? `${dueLabel(dueOn, ctx.holidays).replace(/^due/, 'Due')}.` : '', extra ?? ''].filter(Boolean)
+  const fileOn = by === undefined ? fileBy(dueOn, ctx.holidays) : by
+  const parts = [fileOn ? `${dueLabel(dueOn, ctx.holidays, fileOn).replace(/^due/, 'Due')}.` : '', extra ?? ''].filter(Boolean)
   return parts.length ? parts.join(' ') : undefined
 }
 
@@ -522,14 +535,50 @@ function taskPhrase(ctx: Ctx, checklist: Checklist, task: ChecklistTask, person:
       return { title: `Return-to-work check-in with ${name}` }
     case 'lv-coverage':
       return { title: `Agree a coverage plan for ${possessive(first)} time away` }
-    case 'ch-payroll':
-      return { title: `Update payroll for ${possessive(name)} change by ${day}` }
+    case 'ch-payroll': {
+      // Two changes for one person read differently: name what changed (never the amount, so the title
+      // stays safe while screen sharing), from the job and pay row the checklist was made for.
+      const what = person ? changeWords(ctx.db, person.id, checklist.anchorDate) : undefined
+      return { title: what ? `Update payroll for ${name}: ${what}, effective ${fmtShort(checklist.anchorDate)}, by ${day}` : `Update payroll for ${possessive(name)} change by ${day}` }
+    }
     case 'ch-wage-notice':
       return { title: `Give ${name} the Labor Code 2810.5 change notice` }
   }
   if (checklist.kind === 'leave' && ctx.scope !== 'admin') return { title: `${name}: leave checklist task` }
   if (youAreThePerson) return { title: task.title }
   return { title: `${name}: ${lowerFirst(task.title)}` }
+}
+
+/**
+ * What a job or pay change on a date was, in words with no amounts: 'promotion to L4', 'manager change to
+ * Tomas Herrera', 'merit raise'. Reads the person's job and pay row effective that day (the newest one).
+ */
+export function changeWords(db: DB, personId: ID, on: ISODate): string | undefined {
+  const rec = db.comp.filter((r) => r.personId === personId && r.effectiveOn === on).pop()
+  if (!rec) return undefined
+  const manager = rec.managerId ? getPerson(db, rec.managerId) : undefined
+  switch (rec.reason) {
+    case 'promotion': {
+      const level = db.levels.find((l) => l.id === rec.levelId)
+      return `promotion to ${level?.code ?? rec.title}`
+    }
+    case 'manager_change':
+      return manager ? `manager change to ${fullName(manager)}` : 'manager change'
+    case 'merit':
+      return 'merit raise'
+    case 'market':
+      return 'market adjustment'
+    case 'title_only':
+      return `title change to ${rec.title}`
+    case 'transfer': {
+      const dept = db.departments.find((d) => d.id === rec.departmentId)
+      return dept ? `transfer to ${dept.name}` : 'transfer'
+    }
+    case 'correction':
+      return 'pay record correction'
+    case 'hire':
+      return 'new hire'
+  }
 }
 
 function taskItems(ctx: Ctx): InboxItem[] {
@@ -626,7 +675,7 @@ function taskItems(ctx: Ctx): InboxItem[] {
         title: phrase.title,
         detail: task.why && (scope === 'admin' || checklist.kind !== 'leave') ? task.why : undefined,
         dueOn: task.dueOn,
-        dueNote: dueNoteFor(ctx, task.dueOn, task.dueRuleText ? `${task.dueRuleText}.` : undefined),
+        dueNote: dueNoteFor(ctx, task.dueOn, task.dueRuleText ? `${task.dueRuleText}.` : undefined, taskFileBy(task, checklist, ctx.holidays)),
         group,
         statutory: task.statutory,
         waitingOn,
@@ -662,7 +711,10 @@ function taskItems(ctx: Ctx): InboxItem[] {
     const name = person ? fullName(person) : 'Someone'
     const firstDay = checklist.kind === 'onboarding' && dueOn === checklist.anchorDate
     const statutory = list.some((i) => i.statutory)
-    const tasks = list.map((i) => checklist.tasks.find((t) => t.id === i.refs.taskId)?.title ?? i.title)
+    const grouped = list.map((i) => checklist.tasks.find((t) => t.id === i.refs.taskId))
+    const tasks = list.map((i, n) => grouped[n]?.title ?? i.title)
+    // The tasks share a due date: an earlier day to file by shows only when one of them is an agency filing.
+    const by = grouped.map((t) => (t ? taskFileBy(t, checklist, ctx.holidays) : null)).find(Boolean) ?? null
     out.push({
       key: `tasks:${checklistId}:${dueOn}`,
       kind: 'task_group',
@@ -671,7 +723,7 @@ function taskItems(ctx: Ctx): InboxItem[] {
         : `${name}: ${list.length} tasks due ${dayText(dueOn)}`,
       detail: `${listJoin(tasks.slice(0, 4))}${tasks.length > 4 ? `, and ${tasks.length - 4} more` : ''}.`,
       dueOn,
-      dueNote: dueNoteFor(ctx, dueOn),
+      dueNote: dueNoteFor(ctx, dueOn, undefined, by),
       group: groupFor(dueOn, date),
       statutory,
       waitingOn: 'you',
@@ -875,6 +927,25 @@ function offerItems(ctx: Ctx): InboxItem[] {
       })
       continue
     }
+    // A draft that needs no approval (an Admin drafted it) is ready to go out as soon as it is saved.
+    if (offer.status === 'draft') {
+      if (!sender || approvalRequired(db, offer)) continue
+      const by = offer.draftedById === me ? 'You' : offer.draftedById && getPerson(db, offer.draftedById) ? ctx.name(offer.draftedById) : 'Admin'
+      out.push({
+        key: `offer-send:${offer.id}:v${offer.version}`,
+        kind: 'offer_send',
+        title: `Send the offer to ${cand} (${offer.title})`,
+        detail: `${by} drafted it ${dayText(offer.createdOn)}. Generate the letter, send it, then mark it sent on the candidate page.`,
+        group: 'this_week',
+        statutory: false,
+        waitingOn: 'you',
+        href: links.candidate(offer.candidateId),
+        primary: { kind: 'navigate', label: 'Open offer', href: links.candidate(offer.candidateId) },
+        minutes: 5,
+        refs: { offerId: offer.id, candidateId: offer.candidateId, applicationId: offer.applicationId, jobId: offer.jobId },
+      })
+      continue
+    }
     if (offer.status === 'approved') {
       if (!sender) continue
       const approval = [...offer.approvals].reverse().find((a) => a.decision === 'approved')
@@ -894,37 +965,58 @@ function offerItems(ctx: Ctx): InboxItem[] {
       })
       continue
     }
-    if (offer.status !== 'sent') continue
+    // An expired offer (closed at load, or still 'sent' past its date) waits on you to extend it or close
+    // it out, while the application is still open; a nudge would quote a date that has passed.
+    const expired = offer.status === 'expired' || (offer.status === 'sent' && !!offer.expiresOn && offer.expiresOn < date)
+    if (offer.status !== 'sent' && !expired) continue
     if (scope === 'manager' && !managed) continue
-    const left = offer.expiresOn < date ? -1 : businessDaysBetween(date, offer.expiresOn, holidays)
+    const newExpiry = addBusinessDays(offer.expiresOn < date ? date : offer.expiresOn, 3, holidays)
+    const extend: InboxAction = {
+      kind: 'mutate',
+      label: 'Extend 3 days',
+      op: { type: 'extend_offer', offerId: offer.id, businessDays: 3 },
+      toast: `Extended the offer for ${cand} to ${dayText(newExpiry)}`,
+    }
+    const open: InboxAction = { kind: 'navigate', label: 'Open offer', href: links.candidate(offer.candidateId) }
+    const refs = { offerId: offer.id, candidateId: offer.candidateId, applicationId: offer.applicationId, jobId: offer.jobId }
+    if (expired) {
+      if (offer.status === 'expired' && db.applications.find((a) => a.id === offer.applicationId)?.status !== 'active') continue
+      out.push({
+        key: `offer-expired:${offer.id}:${offer.expiresOn}`,
+        kind: 'offer_expiring',
+        title: `${possessive(cand)} offer expired ${dayText(offer.expiresOn)}`,
+        detail: 'Extend it to reopen, or record that they declined.',
+        dueOn: offer.expiresOn,
+        group: groupFor(offer.expiresOn, date),
+        statutory: false,
+        waitingOn: 'you',
+        href: links.candidate(offer.candidateId),
+        primary: extend,
+        more: [open],
+        minutes: 2,
+        refs,
+      })
+      continue
+    }
+    const left = businessDaysBetween(date, offer.expiresOn, holidays)
     if (left > OFFER_EXPIRY_BUSINESS_DAYS) continue
     const nudge = offerNudgeMessage(db, offer.id, { senderId: me ?? undefined })
     const candFirst = db.candidates.find((c) => c.id === offer.candidateId)?.firstName ?? 'the candidate'
-    const newExpiry = addBusinessDays(offer.expiresOn < date ? date : offer.expiresOn, 3, holidays)
     out.push({
       key: `offer-expiring:${offer.id}:${offer.expiresOn}`,
       kind: 'offer_expiring',
-      title: offer.expiresOn < date ? `${possessive(cand)} offer expired ${dayText(offer.expiresOn)}` : `${possessive(cand)} offer expires ${dayText(offer.expiresOn)}`,
-      detail: offer.expiresOn < date ? 'Extend it, or mark it expired or declined on the offer.' : 'A short, warm check-in usually helps. Offer to walk through the equity.',
+      title: `${possessive(cand)} offer expires ${dayText(offer.expiresOn)}`,
+      detail: 'A short, warm check-in usually helps. Offer to walk through the equity.',
       dueOn: offer.expiresOn,
       group: groupFor(offer.expiresOn, date),
       statutory: false,
       waitingOn: 'them',
       waitingOnName: candFirst,
       href: links.candidate(offer.candidateId),
-      primary: nudge
-        ? { kind: 'copy', label: 'Copy nudge', text: `Subject: ${nudge.subject}\n\n${nudge.body}`, toast: `Copied an offer nudge for ${cand}` }
-        : { kind: 'navigate', label: 'Open offer', href: links.candidate(offer.candidateId) },
-      more: [
-        {
-          kind: 'mutate',
-          label: 'Extend 3 days',
-          op: { type: 'extend_offer', offerId: offer.id, businessDays: 3 },
-          toast: `Extended the offer for ${cand} to ${dayText(newExpiry)}`,
-        },
-      ],
+      primary: nudge ? { kind: 'copy', label: 'Copy nudge', text: `Subject: ${nudge.subject}\n\n${nudge.body}`, toast: `Copied an offer nudge for ${cand}` } : open,
+      more: [extend],
       minutes: 2,
-      refs: { offerId: offer.id, candidateId: offer.candidateId, jobId: offer.jobId },
+      refs,
     })
   }
   return out
@@ -999,28 +1091,45 @@ function timeOffItems(ctx: Ctx): InboxItem[] {
     if (!person) continue
     const manager = getPerson(db, person.managerId)
     const managerHere = !!manager && isEmployedOn(manager, date)
+    const policy = db.timeOffPolicies.find((p) => p.id === r.policyId)
+    // A pending request on an auto-approved policy (sick leave held before the 90-day wait) is Admin's
+    // to decide (canApproveTimeOff), so it never waits on the manager.
+    const adminOnly = !!policy?.autoApprove
     let waitingOn: 'you' | 'them' = 'you'
-    if (scope === 'admin' && managerHere && manager.id !== me) {
+    if (scope === 'admin' && managerHere && manager.id !== me && !adminOnly) {
       // Another manager approves; Admin sees it only when it starts within a week.
       if (r.startDate > addDays(date, WEEK_DAYS)) continue
       waitingOn = 'them'
     }
-    const policy = db.timeOffPolicies.find((p) => p.id === r.policyId)
     const showType = !!policy && canSeeTimeOffDetail(viewer, db, r) && (scope === 'admin' || !isConfidentialKind(policy.kind))
     const started = r.startDate < date
+    // Sick leave held before the service wait: the same choice as the Time off tab, never a plain Approve that
+    // silently pays it as sick leave.
+    const wait = adminOnly ? serviceWait(db, r) : null
+    const who = possessive(fullName(person))
+    const range = rangeText(r.startDate, r.endDate)
+    const detail = [showType ? policy?.name : 'Time off', hoursLabel(r.hours, person.hoursPerWeek / 5 || 8)].filter(Boolean).join(', ')
+    const waitText = wait ? `Starts before ${showType && policy ? policy.name.toLowerCase() : 'it'} is usable (${dayText(wait.usableFrom)}, the ${wait.days}-day wait).` : ''
     out.push({
       key: `timeoff:${r.id}`,
       kind: 'timeoff',
-      title: `${fullName(person)} requested ${rangeText(r.startDate, r.endDate)} off`,
-      detail: [showType ? policy?.name : 'Time off', hoursLabel(r.hours, person.hoursPerWeek / 5 || 8)].filter(Boolean).join(', '),
+      title: `${fullName(person)} requested ${range} off`,
+      detail: wait ? `${detail}. ${waitText} Waive the wait to pay it as sick leave, or record it as unpaid.` : detail,
       chip: started ? `Started ${dayText(r.startDate)}` : `Starts ${dayText(r.startDate)}`,
       group: started ? 'overdue' : 'this_week',
       statutory: false,
       waitingOn,
       waitingOnName: waitingOn === 'them' ? manager?.firstName : undefined,
       href: links.people('timeoff'),
-      primary: { kind: 'mutate', label: 'Approve', op: { type: 'approve_timeoff', requestId: r.id }, toast: `Approved ${possessive(fullName(person))} time off, ${rangeText(r.startDate, r.endDate)}` },
-      more: [{ kind: 'navigate', label: 'Open in Time off', href: links.people('timeoff') }],
+      primary: wait
+        ? { kind: 'mutate', label: 'Waive the wait', op: { type: 'approve_timeoff', requestId: r.id }, toast: `Waived the wait and approved ${who} time off, ${range}` }
+        : { kind: 'mutate', label: 'Approve', op: { type: 'approve_timeoff', requestId: r.id }, toast: `Approved ${who} time off, ${range}` },
+      more: [
+        ...(wait
+          ? [{ kind: 'mutate' as const, label: 'Record as unpaid', op: { type: 'approve_timeoff_unpaid' as const, requestId: r.id }, toast: `Recorded ${who} time off as unpaid, ${range}` }]
+          : []),
+        { kind: 'navigate', label: 'Open in Time off', href: links.people('timeoff') },
+      ],
       minutes: 1,
       refs: { requestId: r.id, personId: r.personId },
     })
@@ -1151,39 +1260,84 @@ function isBaselineRule(r: RuleResult): boolean {
   return t.kind === 'always' || (t.kind === 'headcount' && t.method !== 'weeks_20' && t.n <= 1)
 }
 
-function ruleItem(ctx: Ctx, r: RuleResult): InboxItem {
+/**
+ * One rule's next open step. `setup`: a step to set up once whose deadlines live elsewhere (the per-person
+ * checklist tasks under the DE 34, I-9, SB 294 and 2810.5 rules), so it carries no date and is not a legal deadline.
+ */
+function ruleItem(ctx: Ctx, r: RuleResult, setup = false): InboxItem {
   const open = ruleOpenActions(r)
   const next = open[0]
   const t = r.rule.trigger
+  // A clock that rests on an estimate (EDD DE 1 with no first payroll date saved) is never a red legal
+  // deadline: while its first step (the one the clock is for) is open, the step is to add the real date,
+  // and the estimate reads 'about'; later steps carry no date at all.
+  if (r.dueEstimated && r.dueOn && next.id === r.rule.actions[0]?.id) return estimatedRuleItem(ctx, r, r.dueOn)
   const threshold = t.kind === 'site' || (t.kind === 'headcount' && t.method !== 'weeks_20' && t.n > 1)
-  const dueOn = r.dueOn ?? (threshold ? r.firstAppliedOn : undefined)
+  const dueOn = setup ? undefined : ((r.dueEstimated ? undefined : r.dueOn) ?? (threshold ? r.firstAppliedOn : undefined))
   // A threshold rule that applies now is already owed, even when the crossing date cannot be dated.
   const group: InboxGroup = dueOn ? groupFor(dueOn, ctx.date) : threshold ? 'overdue' : 'this_week'
-  const title =
-    r.rule.id === 'wvpp'
-      ? `${r.count} people are at the office at once on busy days, so a workplace violence prevention plan applies: none on file`
-      : `${r.rule.title}: ${lowerFirst(next.title)}`
+  // SB 553 says what is missing while there is no plan; once it is written, the row names the next step.
+  const noPlan = r.rule.id === 'wvpp' && open.some((a) => a.id === 'write-plan')
+  const title = noPlan
+    ? `${r.count} people are at the office at once on busy days, so a workplace violence prevention plan applies: none on file`
+    : `${r.rule.title}: ${lowerFirst(next.title)}`
   return {
     key: `rule:${r.rule.id}:${next.id}`,
     kind: 'rule',
     title,
-    detail: `${r.rule.id === 'wvpp' ? `Next: ${next.title}. ` : ''}${open.length > 1 ? `${plural(open.length - 1, 'more step')} after this. ` : ''}${r.rule.summary} ${NOT_LEGAL_ADVICE}`,
+    detail: `${noPlan ? `Next: ${next.title}. ` : ''}${open.length > 1 ? `${plural(open.length - 1, 'more step')} after this. ` : ''}${r.rule.summary} ${NOT_LEGAL_ADVICE}`,
     dueOn,
-    dueNote: dueOn && r.firstAppliedOn && dueOn === r.firstAppliedOn ? `This has applied since ${fmtDate(r.firstAppliedOn)}.` : undefined,
+    // An agency filing due on a weekend or holiday (the DE 1) gets its file-by day, as the DE 34 task does.
+    dueNote:
+      dueOn && r.fileBy && dueOn === r.dueOn
+        ? dueNoteFor(ctx, dueOn, undefined, r.fileBy)
+        : dueOn && r.firstAppliedOn && dueOn === r.firstAppliedOn
+          ? `This has applied since ${fmtDate(r.firstAppliedOn)}.`
+          : undefined,
     chip: !dueOn && threshold ? 'Applies now' : undefined,
     group,
-    statutory: r.rule.statutory,
+    statutory: !setup && r.rule.statutory && !r.dueEstimated,
     waitingOn: 'you',
     href: links.rule(r.rule.id),
-    primary: {
-      kind: 'mutate',
-      label: 'Mark step done',
-      op: { type: 'rule_action_done', ruleId: r.rule.id, actionId: next.id },
-      toast: `Done: ${next.title}`,
-    },
+    primary: stepDone(ctx, r, next),
     more: [{ kind: 'navigate', label: 'Open the rule', href: links.rule(r.rule.id) }],
     notApplicable: { op: 'rule', ruleId: r.rule.id },
     minutes: 5,
+    citation: r.rule.citation,
+    externalLink: next.link ? { label: 'Official page', url: next.link } : undefined,
+    refs: { ruleId: r.rule.id },
+  }
+}
+
+/** 'Mark step done' for a rule step. SB 553 'Train everyone' also records training, so its toast says for how many. */
+function stepDone(ctx: Ctx, r: RuleResult, step: { id: string; title: string }): InboxAction {
+  const trained = trainingsRecordedBy(ctx.db, r.rule.id, step.id, ctx.date)
+  return {
+    kind: 'mutate',
+    label: 'Mark step done',
+    op: { type: 'rule_action_done', ruleId: r.rule.id, actionId: step.id },
+    toast: trained ? `Recorded WVPP training for ${plural(trained, 'person', 'people')} today` : `Done: ${step.title}`,
+  }
+}
+
+/** A rule whose due date is an estimate: ask for the date that makes it exact, without a red deadline. */
+function estimatedRuleItem(ctx: Ctx, r: RuleResult, about: ISODate): InboxItem {
+  const next = ruleOpenActions(r)[0]
+  return {
+    key: `rule:${r.rule.id}:estimated`,
+    kind: 'rule',
+    title: `${r.rule.title}: add your first payroll date in Settings, Company`,
+    detail: `Due about ${dayText(about)}, ${r.rule.dueDaysAfterTrigger ?? 15} days after the first payroll. ${r.howCounted} Then ${lowerFirst(next.title)}. ${NOT_LEGAL_ADVICE}`,
+    chip: `About ${fmtShort(about)}`,
+    // Never overdue on an estimate; it waits with this week's work until the date is in.
+    group: about < ctx.date ? 'this_week' : groupFor(about, ctx.date),
+    statutory: false,
+    waitingOn: 'you',
+    href: links.rule(r.rule.id),
+    primary: { kind: 'navigate', label: 'Add the date', href: links.settings('company') },
+    more: [stepDone(ctx, r, next), { kind: 'navigate', label: 'Open the rule', href: links.rule(r.rule.id) }],
+    notApplicable: { op: 'rule', ruleId: r.rule.id },
+    minutes: 2,
     citation: r.rule.citation,
     externalLink: next.link ? { label: 'Official page', url: next.link } : undefined,
     refs: { ruleId: r.rule.id },
@@ -1196,21 +1350,33 @@ function ruleItems(ctx: Ctx, kitShown: boolean): InboxItem[] {
   const results = evaluateAll(db, date)
   const out: InboxItem[] = []
   const baseline: RuleResult[] = []
+  let inKit = 0
   for (const r of results) {
     if (r.state !== 'applies' || r.rule.upcoming) continue
     if (!ruleOpenActions(r).length) continue
     // The First hire kit on Home lists these while headcount is 1, so they are not repeated here.
-    if (kitShown && KIT_RULE_IDS.includes(r.rule.id)) continue
-    if (isBaselineRule(r) && !r.dueOn) baseline.push(r)
+    if (kitShown && KIT_RULE_IDS.includes(r.rule.id)) {
+      inKit += 1
+      continue
+    }
+    // The DE 34, I-9, SB 294 and 2810.5 deadlines are each hire's checklist tasks, which have rows of their
+    // own: the rule's company steps wait with the set-up steps, undated, unless the rule has a deadline of
+    // its own (one recorded on the card, or a clock for a hire with no such task).
+    if (hasPerPersonTasks(r.rule.id)) {
+      const own = ruleDeadlineBesideTasks(db, r)
+      if (own) out.push(ruleItem(ctx, own === r.dueOn ? r : { ...r, dueOn: own, fileBy: undefined }))
+      else baseline.push(r)
+    } else if (isBaselineRule(r) && !r.dueOn) baseline.push(r)
     else out.push(ruleItem(ctx, r))
   }
-  if (baseline.length <= 2) out.push(...baseline.map((r) => ruleItem(ctx, r)))
+  if (baseline.length <= 2) out.push(...baseline.map((r) => ruleItem(ctx, r, hasPerPersonTasks(r.rule.id))))
   else {
     out.push({
       key: `rules-baseline:${baseline.map((r) => r.rule.id).sort().join(',')}`,
       kind: 'rules_group',
-      title: `${plural(baseline.length, 'rule')} that apply at any size ${baseline.length === 1 ? 'has' : 'have'} open steps`,
-      detail: `${listJoin(baseline.slice(0, 4).map((r) => r.rule.title))}${baseline.length > 4 ? `, and ${baseline.length - 4} more` : ''}. ${NOT_LEGAL_ADVICE}`,
+      // The kit's rules are left out of this count, so say so: Compliance lists them all.
+      title: `${plural(baseline.length, inKit ? 'more rule' : 'rule', inKit ? 'more rules' : 'rules')} that apply at any size ${baseline.length === 1 ? 'has' : 'have'} open steps`,
+      detail: `${inKit ? `Besides the ${inKit} in the First hire kit. ` : ''}${listJoin(baseline.slice(0, 4).map((r) => r.rule.title))}${baseline.length > 4 ? `, and ${baseline.length - 4} more` : ''}. ${NOT_LEGAL_ADVICE}`,
       group: 'this_week',
       statutory: false,
       waitingOn: 'you',
@@ -1321,7 +1487,8 @@ function calendarItems(ctx: Ctx): InboxItem[] {
       title: c.date < date && !/due$/.test(c.title) ? `${c.title} (was due ${dayText(c.date)})` : c.title,
       detail: c.detail,
       dueOn: c.date,
-      dueNote: dueNoteFor(ctx, c.date),
+      // A legal deadline on a weekend gets a file-by day; a contract end or a company target happens on its date.
+      dueNote: dueNoteFor(ctx, c.date, undefined, c.statutory ? undefined : null),
       group: groupFor(c.date, date),
       statutory: c.statutory,
       waitingOn,
@@ -1797,6 +1964,10 @@ export function applyInboxOp(draft: Draft<DB>, op: InboxOp, ctx: { date: ISODate
     }
     case 'approve_timeoff':
       return approveRequest(draft, op.requestId, { date, ...(actorId ? { approverId: actorId } : {}) })
+        ? { ok: true }
+        : { ok: false, reason: 'This request was already decided.' }
+    case 'approve_timeoff_unpaid':
+      return approveAsUnpaid(draft, op.requestId, { date, ...(actorId ? { approverId: actorId } : {}) })
         ? { ok: true }
         : { ok: false, reason: 'This request was already decided.' }
     case 'leave_notice_sent': {

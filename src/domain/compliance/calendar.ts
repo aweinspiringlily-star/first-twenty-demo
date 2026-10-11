@@ -10,8 +10,8 @@ import type { DB, ID, RecurringItem } from '@/domain/types'
 import { addDays, addMonths, fmtDate, type ISODate, isWeekday, isWithin, nextQuarter, quarterEnd, quarterOf } from '@/lib/dates'
 import { money, plural } from '@/lib/format'
 import { type ICSEvent, buildICS } from '@/lib/ics'
-import { contractors1099, estimatePaidInYear, form1099ThresholdFor } from './counting'
-import { cycleDoneOn, evaluateAll } from './engine'
+import { contractors1099, estimatePaidInYear, form1099ThresholdFor, paidEmployeesOn } from './counting'
+import { cycleDoneOn, evaluateAll, type RuleResult } from './engine'
 import { annualDoneKey, RULE_BY_ID, SOC2_ACCESS_REVIEW_ID } from './rules'
 
 // Re-exported so callers can keep importing them from the calendar.
@@ -43,6 +43,8 @@ export type CalendarItem = {
   contractorId?: ID
   /** Legal deadline: shows red when overdue and cannot be snoozed past its date. */
   statutory: boolean
+  /** An agency filing due on a weekend or holiday (the DE 1): the business day before, to file by. */
+  fileBy?: ISODate
   done?: boolean
   link?: string
   detail?: string
@@ -214,15 +216,16 @@ function yearDone(db: DB, ruleId: string, year: number): ISODate | undefined {
   return rule ? cycleDoneOn(db, rule, year) : db.complianceStatus[ruleId]?.actionsDone?.[annualDoneKey(year)]
 }
 
-function hasEmployeesOn(db: DB, d: ISODate): boolean {
-  return db.people.some((p) => isEmployedOn(p, d))
-}
-
+/**
+ * The Feb 1 employee notices (SB 294, survivors of violence leave). A Feb 1 counts only when someone other
+ * than an owner with no pay is employed then: a solo founder working unpaid owes nothing, and a first hire
+ * gets the notice at hire (the onboarding task), so the first yearly one is the next Feb 1.
+ */
 function annualNoticeItems(db: DB, from: ISODate, to: ISODate, skip: Set<string>): CalendarItem[] {
   const out: CalendarItem[] = []
   for (const y of yearsIn(from, to)) {
     const feb1 = `${y}-02-01`
-    if (!isWithin(feb1, from, to) || !hasEmployeesOn(db, feb1)) continue
+    if (!isWithin(feb1, from, to) || paidEmployeesOn(db, feb1).length === 0) continue
     if (y >= 2026 && !skip.has('sb294-annual-notice')) {
       out.push({
         id: `sb294-${y}`,
@@ -354,19 +357,33 @@ function leaveItems(db: DB, from: ISODate, to: ISODate): CalendarItem[] {
     })
 }
 
+/**
+ * '<rule>: <what is due>': the rule's dueLabel ('First stock option grant: file the 25102(o) notice with the
+ * DFPI'), else 'due'. A date that comes from people's overdue tasks (followUps) says whose it is ('New hire
+ * reporting (DE 34): due for Maria Gonzalez'). An estimated clock (no first payroll date saved) is a guide.
+ */
+function deadlineTitle(db: DB, r: RuleResult): string {
+  if (r.dueEstimated) return `${r.rule.title}: estimated due date`
+  const people = r.status?.dueOn === r.dueOn ? [] : [...new Set((r.followUps ?? []).filter((f) => f.dueOn === r.dueOn).map((f) => f.personId))]
+  if (!people.length) return `${r.rule.title}: ${r.rule.dueLabel ?? 'due'}`
+  const person = people.length === 1 ? db.people.find((p) => p.id === people[0]) : undefined
+  return `${r.rule.title}: due for ${person ? fullName(person) : plural(people.length, 'person', 'people')}`
+}
+
 function ruleDeadlineItems(db: DB, from: ISODate, to: ISODate): CalendarItem[] {
   return evaluateAll(db, to)
     .filter((r) => r.dueOn && r.state !== 'not_applicable' && isWithin(r.dueOn, from, to))
     .map((r) => ({
       id: `rule-${r.rule.id}-${r.dueOn}`,
       date: r.dueOn as ISODate,
-      title: `${r.rule.title}: due`,
+      title: deadlineTitle(db, r),
       kind: 'rule_deadline' as const,
       ruleId: r.rule.id,
-      statutory: r.rule.statutory,
+      statutory: r.rule.statutory && !r.dueEstimated,
+      ...(r.fileBy ? { fileBy: r.fileBy } : {}),
       done: r.state === 'done',
       link: r.rule.citation.url,
-      detail: r.status?.dueOn ? (r.status.note ?? 'Deadline you recorded.') : r.rule.summary,
+      detail: r.status?.dueOn ? (r.status.note ?? 'Deadline you recorded.') : r.dueEstimated ? `${r.howCounted} ${r.rule.summary}` : r.rule.summary,
     }))
 }
 
@@ -398,7 +415,7 @@ export function calendarICS(items: CalendarItem[], calendarName = 'First Twenty 
     uid: i.id.replace(/[^A-Za-z0-9-]/g, '-'),
     title: `${i.done ? 'Done: ' : ''}${i.title}`,
     date: i.date,
-    description: [i.detail, i.statutory ? 'Legal deadline.' : '', i.link ?? '', 'Not legal advice; confirm with counsel or your PEO.']
+    description: [i.fileBy ? `File by ${fmtDate(i.fileBy)}.` : '', i.detail, i.statutory ? 'Legal deadline.' : '', i.link ?? '', 'Not legal advice; confirm with counsel or your PEO.']
       .filter(Boolean)
       .join('\n'),
   }))

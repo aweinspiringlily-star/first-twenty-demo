@@ -9,13 +9,14 @@ import { leaveEligibility } from '@/domain/lifecycle'
 import { employedOn, firstName, fullName, reportingLine } from '@/domain/people'
 import { type BalanceRow, balances, hoursPerDayFor, isConfidentialKind, pendingApprovals, whoIsOut } from '@/domain/timeoff'
 import type { DB, LeaveCase, Person, TimeOffRequest, Viewer } from '@/domain/types'
-import { fmtDate, fmtDay, fmtRelative, isWeekday, today } from '@/lib/dates'
+import { fmtDate, fmtDay, fmtRelative, fmtShort, isWeekday, today } from '@/lib/dates'
 import { copyText, downloadFile, toCSV } from '@/lib/files'
 import { hoursWithDays, listJoin, plural } from '@/lib/format'
 import { useDB } from '@/store/db'
 import { Badge, Button, type Column, DataTable, DescriptionList, EmptyState, Icon, Panel, Segmented, toast } from '@/ui'
-import { approveTimeOff, cancelTimeOff, declineTimeOff, markBack, markNoticeSent } from './actions'
+import { approveTimeOff, cancelTimeOff, declineTimeOff, earlyWait, markBack, markNoticeSent, recordUnpaidTimeOff } from './actions'
 import {
+  approvalGroups,
   designationState,
   entryView,
   holidaysForYear,
@@ -83,7 +84,8 @@ function Summary({ db, viewer, onRequest, onRecord, onStartLeave }: { db: DB; vi
   const isAdmin = viewer.role === 'admin'
   const outToday = whoIsOut(db, t, t).filter((e) => e.status !== 'pending' && entryView(db, viewer, e).visible)
   const names = [...new Set(outToday.map((e) => e.personId))].map((id) => db.people.find((p) => p.id === id)).filter((p): p is Person => !!p)
-  const waiting = pendingApprovals(db).filter((r) => canApproveTimeOff(viewer, db, r))
+  // Only what waits on the viewer: another manager's approvals are theirs (Admin sees them under the requests).
+  const waiting = approvalGroups(db, viewer, pendingApprovals(db).filter((r) => canApproveTimeOff(viewer, db, r)), t)[0].requests
   const nextHoliday = [...db.holidays].filter((h) => h.date >= t).sort((a, b) => a.date.localeCompare(b.date))[0]
   const noticesDue = isAdmin ? db.leaveCases.filter((l) => !l.designationNoticeSentOn && l.designationNoticeDueOn) : []
   const isWeekend = !isWeekday(t)
@@ -154,7 +156,9 @@ function typeFor(db: DB, viewer: Viewer, req: TimeOffRequest): string {
 }
 
 function RequestsPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
-  const waiting = pendingApprovals(db).filter((r) => canApproveTimeOff(viewer, db, r))
+  // Grouped by who approves, as the inbox routes them; one flat list keeps the focus handling below simple.
+  const groups = approvalGroups(db, viewer, pendingApprovals(db).filter((r) => canApproveTimeOff(viewer, db, r)), today())
+  const waiting = groups.flatMap((g) => g.requests)
   const mine = db.timeOffRequests.filter((r) => r.personId === viewer.personId && r.status === 'pending' && !waiting.includes(r))
   const auto = new Set(db.timeOffPolicies.filter((p) => p.autoApprove).map((p) => p.id))
   const recent = db.timeOffRequests
@@ -187,22 +191,30 @@ function RequestsPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
   return (
     <Panel title="Requests" icon="inbox" padded={false} subtitle={approver ? 'Approve or decline in one tap. Undo is in the toast.' : undefined}>
       {approver && (
-        <section ref={waitingRef} aria-label="Waiting for you" className="border-b border-line">
-          <h3 tabIndex={-1} className="px-5 pt-3 text-[13px] font-bold text-ink-3 outline-none">
-            Waiting for you ({waiting.length})
-          </h3>
-          {waiting.length === 0 ? (
-            <p className="flex items-center gap-2 px-5 pt-1 pb-4 text-[14px] text-ink-3">
-              <Icon name="check" size={16} className="text-good" />
-              Nothing to approve.
-            </p>
-          ) : (
-            <ul>
-              {waiting.map((r, i) => (
-                <PendingRow key={r.id} req={r} db={db} viewer={viewer} onDecide={(run) => decide('waiting', i, run)} />
-              ))}
-            </ul>
-          )}
+        <section ref={waitingRef} aria-label="Requests to approve" className="border-b border-line">
+          {groups.map((g, gi) => {
+            if (gi > 0 && g.requests.length === 0) return null
+            const offset = groups.slice(0, gi).reduce((n, x) => n + x.requests.length, 0)
+            return (
+              <div key={g.key}>
+                <h3 tabIndex={-1} className="px-5 pt-3 text-[13px] font-bold text-ink-3 outline-none">
+                  {g.label} ({g.requests.length})
+                </h3>
+                {g.requests.length === 0 ? (
+                  <p className="flex items-center gap-2 px-5 pt-1 pb-4 text-[14px] text-ink-3">
+                    <Icon name="check" size={16} className="text-good" />
+                    {waiting.length === 0 ? 'Nothing to approve.' : 'Nothing waits on you.'}
+                  </p>
+                ) : (
+                  <ul>
+                    {g.requests.map((r, i) => (
+                      <PendingRow key={r.id} req={r} db={db} viewer={viewer} forManager={g.manager} onDecide={(run) => decide('waiting', offset + i, run)} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )
+          })}
         </section>
       )}
       {mine.length > 0 && (
@@ -255,9 +267,24 @@ function RequestsPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
   )
 }
 
-function PendingRow({ req, db, viewer, onDecide }: { req: TimeOffRequest; db: DB; viewer: Viewer; onDecide: (run: () => void) => void }) {
+function PendingRow({
+  req,
+  db,
+  viewer,
+  forManager,
+  onDecide,
+}: {
+  req: TimeOffRequest
+  db: DB
+  viewer: Viewer
+  /** The manager this request waits on, when Admin acts for them. */
+  forManager?: Person
+  onDecide: (run: () => void) => void
+}) {
   const p = db.people.find((x) => x.id === req.personId)
   if (!p) return null
+  const wait = earlyWait(db, req)
+  const forWhom = forManager ? ` for ${firstName(forManager)}` : ''
   // Who else is out then (approved only), so the approver sees coverage at a glance.
   const others = whoIsOut(db, req.startDate, req.endDate)
     .filter((e) => e.personId !== req.personId && e.status !== 'pending' && entryView(db, viewer, e).visible)
@@ -273,26 +300,56 @@ function PendingRow({ req, db, viewer, onDecide }: { req: TimeOffRequest; db: DB
       <p className="text-[14px] font-semibold text-ink">{rangeText(req.startDate, req.endDate)}</p>
       {req.note && <p className="text-[13.5px] text-ink-2">&ldquo;{req.note}&rdquo;</p>}
       <p className="text-[12.5px] text-ink-3">{uniq.length ? `Also out then: ${listJoin(uniq.map((o) => fullName(o)))}` : 'Nobody else you can see is out then.'}</p>
-      <div className="flex flex-wrap gap-2">
-        <Button
-          variant="primary"
-          size="lg"
-          icon="check"
-          data-row-primary
-          onClick={() => onDecide(() => approveTimeOff(req, viewer))}
-          aria-label={`Approve ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
-        >
-          Approve
-        </Button>
-        <Button
-          variant="secondary"
-          size="lg"
-          onClick={() => onDecide(() => declineTimeOff(req, viewer))}
-          aria-label={`Decline ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
-        >
-          Decline
-        </Button>
-      </div>
+      {forManager && <p className="text-[12.5px] text-ink-3">{firstName(forManager)} approves this. You can act for them as Admin.</p>}
+      {wait ? (
+        <>
+          <p className="text-[13px] text-ink-2">
+            Starts before sick leave is usable ({fmtDate(wait.usableFrom)}, the {wait.days}-day wait). Waive the wait to pay it as sick leave, or record it as
+            unpaid leave.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="primary"
+              size="lg"
+              icon="check"
+              data-row-primary
+              onClick={() => onDecide(() => approveTimeOff(req, viewer))}
+              aria-label={`Waive the wait for ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
+            >
+              Waive the wait
+            </Button>
+            <Button
+              variant="secondary"
+              size="lg"
+              onClick={() => onDecide(() => recordUnpaidTimeOff(req, viewer))}
+              aria-label={`Record as unpaid for ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
+            >
+              Record as unpaid
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="primary"
+            size="lg"
+            icon="check"
+            data-row-primary
+            onClick={() => onDecide(() => approveTimeOff(req, viewer))}
+            aria-label={`Approve${forWhom} ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
+          >
+            Approve{forWhom}
+          </Button>
+          <Button
+            variant="secondary"
+            size="lg"
+            onClick={() => onDecide(() => declineTimeOff(req, viewer))}
+            aria-label={`Decline${forWhom} ${fullName(p)}, ${rangeText(req.startDate, req.endDate)}`}
+          >
+            Decline{forWhom}
+          </Button>
+        </div>
+      )}
     </li>
   )
 }
@@ -384,7 +441,10 @@ function BalancesPanel({ db, viewer }: { db: DB; viewer: Viewer }) {
       align: 'right',
       cell: (l) =>
         l.sick ? (
-          <BalanceHours hours={l.sick.available} person={l.person} />
+          <span className="flex flex-col items-end">
+            <BalanceHours hours={l.sick.available} person={l.person} />
+            {l.sick.usableFrom && <span className="text-[12px] whitespace-nowrap text-ink-3">usable from {fmtShort(l.sick.usableFrom)}</span>}
+          </span>
         ) : (
           <span className="text-ink-3">Not CA</span>
         ),

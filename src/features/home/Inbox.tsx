@@ -24,7 +24,8 @@ import { getPerson } from '@/domain/people'
 import type { DB, ID, Viewer } from '@/domain/types'
 import { ScorecardSheet } from '@/features/hiring/interviews'
 import { fmtDay, type ISODate, today } from '@/lib/dates'
-import { copyText, downloadFile } from '@/lib/files'
+import { copyText } from '@/lib/files'
+import { downloadBackupFile } from '@/store/backup'
 import { useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
 import {
@@ -50,6 +51,12 @@ import {
 // ---------------------------------------------------------------------------------------------
 
 const MONEY_RE = /-?\$\s?\d[\d,]*(?:\.\d+)?(?:\s?[KkMm](?![a-z]))?/g
+
+/**
+ * The longest not-applicable note a row takes. It lands on the checklist or in the rules' status, which sync
+ * as single records of at most 256 KB (docs/SYNC.md), so it stays short.
+ */
+const NOTE_MAX = 2_000
 
 /** Item text with every dollar amount in <Private>, so notes people typed (an Admin's offer note) follow the blur. */
 function ItemText({ text }: { text: string }) {
@@ -98,7 +105,8 @@ function previewSuffix(viewer: Viewer): string {
   return ` (recorded as ${viewer.person.preferredName || viewer.person.firstName} ${viewer.person.lastName}, preview)`
 }
 
-type CopyFallback = { title: string; text: string } | null
+/** Text to copy by hand when the browser blocked the clipboard or a download (`note` says which, and what to do). */
+type CopyFallback = { title: string; text: string; note?: string } | null
 type OpenSheet = { sheet: 'scorecard'; id: ID } | null
 
 /** Runs a row action. Returns true when the item is likely gone (so focus can move to the next row). */
@@ -122,15 +130,21 @@ async function runAction(
     else setFallback({ title: action.label, text: action.text })
     return false
   }
-  const date = today()
   if (action.op.type === 'backup_downloaded') {
-    const json = JSON.stringify(useDB.getState().db, null, 2)
-    const ok = downloadFile(`first-twenty-backup-${date}.json`, json, 'application/json')
-    if (!ok) {
-      setFallback({ title: 'Copy your backup', text: json })
-      return false
+    // The same file as Settings, Data, and no Undo step: the backup time is stamped on every snapshot, so
+    // Ctrl Z stays with the last real edit. Stamped either way, the row goes; a blocked download opens Copy.
+    const { ok, json } = downloadBackupFile()
+    if (ok) toast('Backup downloaded')
+    else {
+      setFallback({
+        title: 'Copy your backup',
+        text: json,
+        note: 'This browser blocked the download. The backup is selected below: press Ctrl C (or Cmd C) to copy it, then paste it into a file you keep somewhere safe.',
+      })
     }
+    return true
   }
+  const date = today()
   let result: ReturnType<typeof applyInboxOp> = { ok: false, reason: 'Nothing changed.' }
   const label = `${action.toast}${previewSuffix(viewer)}`
   useDB.getState().mutate(label, (draft) => {
@@ -188,6 +202,7 @@ function NotApplicableModal({
   if (!item?.notApplicable) return null
   const na = item.notApplicable
   const needsNote = item.statutory || na.op === 'rule'
+  const count = note.length >= NOTE_MAX - 200 ? ` ${note.length.toLocaleString('en-US')} of ${NOTE_MAX.toLocaleString('en-US')} characters.` : ''
   const save = () => {
     if (needsNote && !note.trim()) return
     const op =
@@ -217,10 +232,10 @@ function NotApplicableModal({
       <div className="mt-3">
         <Field
           label={needsNote ? 'Why it does not apply (required)' : 'Note (optional)'}
-          hint={needsNote ? 'Legal items need a reason so the record explains itself later. Tip: Win+H or macOS dictation works here.' : 'Tip: Win+H or macOS dictation works here.'}
+          hint={`${needsNote ? 'Legal items need a reason so the record explains itself later. ' : ''}Tip: Win+H or macOS dictation works here.${count}`}
         >
           {(id, describedBy) => (
-            <TextArea id={id} aria-describedby={describedBy} rows={3} value={note} onChange={(e) => setNote(e.target.value)} data-autofocus />
+            <TextArea id={id} aria-describedby={describedBy} rows={3} maxLength={NOTE_MAX} value={note} onChange={(e) => setNote(e.target.value)} data-autofocus />
           )}
         </Field>
       </div>
@@ -236,7 +251,9 @@ function CopyFallbackModal({ fallback, onClose }: { fallback: CopyFallback; onCl
   if (!fallback) return null
   return (
     <Modal open onClose={onClose} title={fallback.title} footer={<Button onClick={onClose}>Done</Button>}>
-      <p className="text-[14px] text-ink-2">This browser blocked the clipboard. The text is selected below: press Ctrl C (or Cmd C) to copy it.</p>
+      <p className="text-[14px] text-ink-2">
+        {fallback.note ?? 'This browser blocked the clipboard. The text is selected below: press Ctrl C (or Cmd C) to copy it.'}
+      </p>
       <textarea
         ref={ref}
         readOnly

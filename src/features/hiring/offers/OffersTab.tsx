@@ -1,10 +1,13 @@
 // Hiring > Offers: drafts, waiting for approval, ready to send, out (with expiry countdown), accepted
-// (with Hire when not yet hired), declined (reason), expired and rescinded. Admin approves inline.
+// (with Hire when not yet hired), declined (reason), expired (including sent offers past their expiry
+// date, with Extend and reopen on the profile), rescinded and discarded (drafts that never went out,
+// kept apart from rescinded offers). Admin approves inline. An accepted offer whose start date has
+// passed hires from the profile, which first asks whether they started then.
 import { useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { canApproveOffer, canSeeOffer } from '@/domain/access'
-import { approveOffer } from '@/domain/hiring/offers'
+import { approveOffer, isDiscarded, isLapsed, startHasPassed } from '@/domain/hiring/offers'
 import { candidateName, outcomeReasonLabel } from '@/domain/hiring/util'
 import { hirePreview } from '@/domain/lifecycle'
 import { personNameById } from '@/domain/people'
@@ -12,11 +15,12 @@ import type { ID, Offer } from '@/domain/types'
 import { addDays, fmtDay, nowISO, today } from '@/lib/dates'
 import { listJoin, num, plural } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Badge, Button, EmptyState, Money, Panel, Private } from '@/ui'
+import { Badge, Button, EmptyState, Panel, Private } from '@/ui'
 import { act, MoneyText } from '../interviews/common'
 import { expiryPhrase } from '../interviews/logic'
 import { hireNow, WelcomeBanner } from './HireFlow'
-import { checkCleared, groupOffers, type OfferGroupKey, OFFER_STATUS, trimPeriod } from './logic'
+import { OfferPay } from './OfferPay'
+import { checkCleared, groupOffers, type OfferGroupKey, offerStatusLabel, rescindReasonText, trimPeriod } from './logic'
 
 const GROUPS: Array<{ key: OfferGroupKey; title: string; short: string }> = [
   { key: 'awaiting_approval', title: 'Waiting for approval', short: 'waiting for approval' },
@@ -27,6 +31,7 @@ const GROUPS: Array<{ key: OfferGroupKey; title: string; short: string }> = [
   { key: 'declined', title: 'Declined', short: 'declined' },
   { key: 'expired', title: 'Expired', short: 'expired' },
   { key: 'rescinded', title: 'Rescinded', short: 'rescinded' },
+  { key: 'discarded', title: 'Discarded drafts', short: 'discarded' },
 ]
 
 /** Hiring > Offers tab: drafts, awaiting approval, out with expiry, accepted, declined with reason. */
@@ -40,7 +45,7 @@ export function OffersTab() {
     return !!app && canSeeOffer(viewer, db, app)
   })
   const since = addDays(date, -120)
-  const { groups, earlier } = groupOffers(visible, since, db.people, addDays(date, -30))
+  const { groups, earlier } = groupOffers(visible, since, db.people, addDays(date, -30), date)
   const isAdmin = canApproveOffer(viewer)
   const shown = GROUPS.filter((g) => groups[g.key].length > 0)
   const notHired = groups.accepted.filter((o) => !o.personId).length
@@ -81,12 +86,15 @@ function OfferRow({ offer, isAdmin: admin, onHire }: { offer: Offer; isAdmin: bo
   const viewer = useViewer()
   const date = today()
   const name = candidateName(db, offer.candidateId)
-  const st = OFFER_STATUS[offer.status]
+  const st = offerStatusLabel(offer, date)
+  const lapsed = isLapsed(offer, date)
   const hired = offer.personId ? db.people.find((p) => p.id === offer.personId) : undefined
   let detail = ''
   switch (offer.status) {
     case 'sent':
-      detail = `Sent ${offer.sentOn ? fmtDay(offer.sentOn) : ''}. ${expiryPhrase(offer.expiresOn, date)} (${fmtDay(offer.expiresOn)}).`
+      detail = lapsed
+        ? `Sent ${offer.sentOn ? fmtDay(offer.sentOn) : ''}. Expired ${fmtDay(offer.expiresOn)}. Extend it to reopen, or record that they declined.`
+        : `Sent ${offer.sentOn ? fmtDay(offer.sentOn) : ''}. ${expiryPhrase(offer.expiresOn, date)} (${fmtDay(offer.expiresOn)}).`
       break
     case 'awaiting_approval':
     case 'draft':
@@ -104,14 +112,20 @@ function OfferRow({ offer, isAdmin: admin, onHire }: { offer: Offer; isAdmin: bo
       detail = `Declined ${offer.decidedOn ? fmtDay(offer.decidedOn) : ''}: ${outcomeReasonLabel(offer.declineReason).toLowerCase()}${offer.competingNote ? `. ${trimPeriod(offer.competingNote)}` : ''}.`
       break
     case 'expired':
-      detail = `Expired ${fmtDay(offer.expiresOn)}.`
+      // Same next step as a sent offer past its date, while the application is still open.
+      detail =
+        db.applications.find((a) => a.id === offer.applicationId)?.status === 'active'
+          ? `Expired ${fmtDay(offer.expiresOn)}. Extend it to reopen, or record that they declined.`
+          : `Expired ${fmtDay(offer.expiresOn)}.`
       break
     case 'rescinded':
-      detail = `Rescinded ${offer.decidedOn ? fmtDay(offer.decidedOn) : ''}.`
+      detail = `${isDiscarded(offer) ? 'Discarded before it went out' : 'Rescinded'} ${offer.decidedOn ? fmtDay(offer.decidedOn) : ''}${offer.rescindReason ? `: ${rescindReasonText(offer.rescindReason)}` : ''}.`
       break
   }
   const preview = admin && offer.status === 'accepted' && !hired ? hirePreview(db, offer.id) : null
-  if (preview) detail += ` This hire takes you to ${preview.headcountAfter}.`
+  // A start date that has passed is settled on the profile (did they start then, or does it move?) before the hire.
+  const startPassed = !!preview && startHasPassed(offer, date)
+  if (preview) detail += startPassed ? ` The start date has passed: open the profile to confirm it, then hire.` : ` This hire takes you to ${preview.headcountAfter}.`
   return (
     <li className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
       <div className="min-w-0 flex-1">
@@ -119,13 +133,12 @@ function OfferRow({ offer, isAdmin: admin, onHire }: { offer: Offer; isAdmin: bo
           <a href={links.candidate(offer.candidateId)} className="-my-2 inline-flex min-h-10 items-center text-[15px] font-bold text-ink hover:text-accent">
             {name}
           </a>
-          <Badge tone={offer.status === 'sent' && offer.expiresOn <= addDays(date, 2) ? 'warn' : offer.status === 'accepted' && !hired ? 'accent' : st.tone}>
-            {offer.status === 'sent' ? expiryPhrase(offer.expiresOn, date) : offer.status === 'accepted' ? (hired ? 'Hired' : 'Ready to hire') : st.label}
+          <Badge tone={offer.status === 'sent' && !lapsed && offer.expiresOn <= addDays(date, 2) ? 'warn' : offer.status === 'accepted' && !hired ? 'accent' : st.tone}>
+            {offer.status === 'sent' && !lapsed ? expiryPhrase(offer.expiresOn, date) : offer.status === 'accepted' ? (hired ? 'Hired' : 'Ready to hire') : st.label}
           </Badge>
         </div>
         <p className="text-[13.5px] text-ink-2">
-          {offer.title}. <Money value={offer.payType === 'hourly' ? offer.hourlyRate : offer.salary} />
-          {offer.payType === 'hourly' ? ' an hour' : ''}
+          {offer.title}. <OfferPay offer={offer} />
           {offer.equityShares > 0 && (
             <>
               , <Private>{num(offer.equityShares)}</Private> options
@@ -151,7 +164,7 @@ function OfferRow({ offer, isAdmin: admin, onHire }: { offer: Offer; isAdmin: bo
             Approve
           </Button>
         )}
-        {preview && (
+        {preview && !startPassed && (
           <Button variant="primary" icon="user-plus" onClick={onHire} aria-label={`Hire ${name}. This hire takes you to ${preview.headcountAfter}.`}>
             Hire
           </Button>
@@ -160,7 +173,7 @@ function OfferRow({ offer, isAdmin: admin, onHire }: { offer: Offer; isAdmin: bo
           href={links.candidate(offer.candidateId)}
           data-offer-open={offer.id}
           className="inline-flex h-11 items-center rounded-lg px-3 text-[14px] font-semibold text-accent hover:bg-accent-soft"
-          aria-label={offer.status === 'approved' ? `Open ${name} to send the approved offer` : `Open ${name}`}
+          aria-label={offer.status === 'approved' ? `Open ${name} to send the approved offer` : startPassed ? `Open ${name} to confirm the start date` : `Open ${name}`}
         >
           Open
         </a>

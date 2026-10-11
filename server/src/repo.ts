@@ -22,10 +22,17 @@ import { WORKSPACE_ID } from './sqlgen'
 import { LIMITS, type ValidChange, type ValidWorkspace } from './validate'
 
 export type Change = { seq: number; collection: string; id: string; op: 'upsert' | 'delete'; version: number; data?: unknown }
-export type Applied = { collection: string; id: string; version: number }
-export type Conflict = { collection: string; id: string; serverVersion: number | null; serverData: unknown | null }
+/** existing: the server already held exactly this data, so nothing was written (a retried push). */
+export type Applied = { collection: string; id: string; version: number; existing?: true }
+/**
+ * byYou: the server's copy (or, when it has none, the delete that removed it) was written by the user who
+ * pushed. landed: the change log holds this exact upsert after baseVersion (an earlier attempt landed).
+ */
+export type Conflict = { collection: string; id: string; serverVersion: number | null; serverData: unknown | null; byYou?: true; landed?: true }
 
 export type Snapshot = { workspaceId: string; historyId: string; seq: number; db: Record<string, unknown>; versions: Record<string, number> }
+/** Whether the server holds a workspace, without its data (GET /api/workspace/status). */
+export type WorkspaceStatus = { empty: true } | { empty: false; workspaceId: string; historyId: string; seq: number }
 export type ReplaceResult = { historyId: string; seq: number; versions: Record<string, number> }
 export type ChangesResult = { historyId: string; seq: number; changes: Change[]; more?: true } | { resync: true }
 export type ApplyResult = { historyId: string; seq: number; applied: Applied[]; conflicts: Conflict[] }
@@ -68,6 +75,13 @@ async function lockWorkspace(q: Queryable, workspaceId: string): Promise<Workspa
 
 export async function isInitialized(db: Queryable, workspaceId = WORKSPACE_ID): Promise<boolean> {
   return (await readWorkspace(db, workspaceId, false))?.initialized ?? false
+}
+
+/** Whether a workspace was uploaded, and its history and seq: one row read, no records. */
+export async function workspaceStatus(db: Queryable, workspaceId = WORKSPACE_ID): Promise<WorkspaceStatus> {
+  const ws = await readWorkspace(db, workspaceId, false)
+  if (!ws?.initialized) return { empty: true }
+  return { empty: false, workspaceId, historyId: ws.historyId, seq: ws.lastSeq }
 }
 
 /** The whole workspace in the shape of src/domain/types.ts DB, or null before the first upload. */
@@ -217,17 +231,48 @@ export async function changesSince(db: Db, since: number, options: ChangesOption
   )
 }
 
-type CurrentRow = { version: unknown; data: unknown; same: boolean | null }
+type CurrentRow = { version: unknown; data: unknown; same: boolean | null; by_you: boolean }
 
-async function lastLogged(q: Queryable, workspaceId: string, collection: string, id: string): Promise<{ op: string; version: number } | null> {
-  const r = await q.query<{ op: string; version: unknown }>(
-    `SELECT op, version FROM change_log
+/** The record's newest change-log row; byYou: `userId` wrote it. */
+async function lastLogged(
+  q: Queryable,
+  workspaceId: string,
+  collection: string,
+  id: string,
+  userId: string | null,
+): Promise<{ op: string; version: number; byYou: boolean } | null> {
+  const r = await q.query<{ op: string; version: unknown; by_you: boolean }>(
+    `SELECT op, version, coalesce(user_id = $4::uuid, false) AS by_you FROM change_log
       WHERE workspace_id = $1 AND collection = $2 AND record_id = $3
       ORDER BY seq DESC LIMIT 1`,
-    [workspaceId, collection, id],
+    [workspaceId, collection, id, userId],
   )
   const row = r.rows[0]
-  return row ? { op: row.op, version: Number(row.version) } : null
+  return row ? { op: row.op, version: Number(row.version), byYou: row.by_you === true } : null
+}
+
+/**
+ * True when the change log holds an upsert of exactly this change's data for its record after `since`:
+ * an earlier attempt of this change landed (its answer never reached the client). The log keeps upserts
+ * until the record is deleted or the rows are pruned, so a false answer proves nothing.
+ */
+async function loggedAfter(q: Queryable, workspaceId: string, c: ValidChange, since: number): Promise<boolean> {
+  if (c.op !== 'upsert' || c.json === null) return false
+  const r = await q.query<{ found: boolean }>(
+    `SELECT EXISTS (
+        SELECT 1 FROM change_log
+         WHERE workspace_id = $1 AND collection = $2 AND record_id = $3 AND op = 'upsert' AND seq > $4 AND data = $5::jsonb
+      ) AS found`,
+    [workspaceId, c.collection, c.id, since, c.json],
+  )
+  return r.rows[0]?.found === true
+}
+
+function conflict(c: ValidChange, serverVersion: number | null, serverData: unknown, flags: { byYou?: boolean; landed?: boolean } = {}): Conflict {
+  const out: Conflict = { collection: c.collection, id: c.id, serverVersion, serverData }
+  if (flags.byYou) out.byYou = true
+  if (flags.landed) out.landed = true
+  return out
 }
 
 export type ApplyOptions = {
@@ -238,10 +283,15 @@ export type ApplyOptions = {
 
 /**
  * Applies client changes in one transaction, each accepted or rejected on its own:
- * - accepted when baseVersion equals the current version, or the record does not exist and
- *   baseVersion is null or the record was deleted (re-create);
- * - an upsert whose data already equals the server copy is reported as applied (a retried push);
- * - otherwise a conflict carrying the server's current copy (null when it does not exist).
+ * - accepted when baseVersion equals the current version, or the record does not exist and baseVersion
+ *   is null, or the record was deleted and baseVersion is at least the delete's version (a re-create by a
+ *   client that saw the delete). An edit made on a copy from before the delete is a conflict: it would
+ *   bring back a record another device removed. A missing document is always recreated;
+ * - an upsert whose data already equals the server copy is reported as applied with `existing` (a
+ *   retried push), and nothing is written;
+ * - otherwise a conflict carrying the server's current copy (null when it does not exist), with `byYou`
+ *   when the pushing user wrote that copy (or the delete), and `landed` when an earlier attempt of this
+ *   very upsert is in the log after baseVersion (the client may then take the newer copy quietly).
  * Every accepted write takes the next change_log seq as its version.
  * Deletes are hard deletes plus a 'delete' row in the change log; the record's earlier log rows go.
  */
@@ -270,18 +320,22 @@ export async function applyChanges(db: Db, changes: ValidChange[], userId: strin
     }
 
     for (const c of changes) {
-      const sameExpr = c.json === null ? 'NULL::boolean' : 'data = $3::jsonb'
-      const params = c.json === null ? [workspaceId, c.id] : [workspaceId, c.id, c.json]
+      const sameExpr = c.json === null ? 'NULL::boolean' : 'data = $4::jsonb'
+      const params = c.json === null ? [workspaceId, c.id, userId] : [workspaceId, c.id, userId, c.json]
+      const columns = `version, data, ${sameExpr} AS same, coalesce(updated_by = $3::uuid, false) AS by_you`
       const current: CurrentRow | undefined =
         c.table === null
-          ? (await q.query<CurrentRow>(`SELECT version, data, ${sameExpr} AS same FROM workspace_docs WHERE workspace_id = $1 AND key = $2 FOR UPDATE`, params)).rows[0]
-          : (await q.query<CurrentRow>(`SELECT version, data, ${sameExpr} AS same FROM ${c.table} WHERE workspace_id = $1 AND id = $2 FOR UPDATE`, params)).rows[0]
+          ? (await q.query<CurrentRow>(`SELECT ${columns} FROM workspace_docs WHERE workspace_id = $1 AND key = $2 FOR UPDATE`, params)).rows[0]
+          : (await q.query<CurrentRow>(`SELECT ${columns} FROM ${c.table} WHERE workspace_id = $1 AND id = $2 FOR UPDATE`, params)).rows[0]
 
       if (current) {
         const version = Number(current.version)
         if (c.baseVersion !== version) {
-          if (c.op === 'upsert' && current.same === true) applied.push({ collection: c.collection, id: c.id, version })
-          else conflicts.push({ collection: c.collection, id: c.id, serverVersion: version, serverData: current.data })
+          if (c.op === 'upsert' && current.same === true) applied.push({ collection: c.collection, id: c.id, version, existing: true })
+          else {
+            const landed = await loggedAfter(q, workspaceId, c, c.baseVersion ?? 0)
+            conflicts.push(conflict(c, version, current.data, { byYou: current.by_you === true, landed }))
+          }
           continue
         }
         const next = await log(c, c.op)
@@ -310,15 +364,18 @@ export async function applyChanges(db: Db, changes: ValidChange[], userId: strin
       }
 
       // Not on the server.
-      const last = await lastLogged(q, workspaceId, c.collection, c.id)
+      const last = await lastLogged(q, workspaceId, c.collection, c.id, userId)
       if (c.op === 'delete') {
         // Already gone: nothing to do, the client's intent holds.
         applied.push({ collection: c.collection, id: c.id, version: last?.version ?? 0 })
         continue
       }
-      // Documents always exist after an upload; a missing one is simply recreated.
-      if (c.baseVersion !== null && last?.op !== 'delete' && c.table !== null) {
-        conflicts.push({ collection: c.collection, id: c.id, serverVersion: null, serverData: null })
+      // Documents always exist after an upload; a missing one is simply recreated. A record comes back
+      // only from a client that believes it is new, or that saw it deleted (a base at least as new as the
+      // delete): an edit made on a copy from before the delete loses to it, as to any newer change.
+      const deleted = last?.op === 'delete' ? last : null
+      if (c.table !== null && c.baseVersion !== null && !(deleted && c.baseVersion >= deleted.version)) {
+        conflicts.push(conflict(c, null, null, { byYou: deleted?.byYou === true }))
         continue
       }
       const next = await log(c, 'upsert')

@@ -21,6 +21,7 @@ import {
 } from './profile'
 import { stateName, US_STATES } from './states'
 import {
+  availabilityText,
   coveredByTasks,
   daysAwayText,
   equityHeadline,
@@ -28,6 +29,7 @@ import {
   isDueSoon,
   myPay,
   myTaskItems,
+  payrollProviderName,
   myTodos,
   nextAnniversary,
   nextStarter,
@@ -188,6 +190,20 @@ describe('my tasks', () => {
     expect(rows[0].owed).toBe(true)
   })
 
+  it('treats the confidentiality agreement acknowledgement and the signed PIIA as one document', () => {
+    const piiaOf = (d: DB) => d.checklists.find((c) => c.personId === 'p-lucas' && c.kind === 'onboarding')?.tasks.find((t) => t.templateTaskId === 'on-piia')
+    const next = produce(db, (d) => {
+      const piia = piiaOf(d as DB)
+      if (!piia) throw new Error('no PIIA task')
+      piia.status = 'open'
+      delete piia.doneOn
+      delete piia.doneById
+      d.acks = d.acks.filter((a) => !(a.personId === 'p-lucas' && a.policyId === 'pl-confidentiality'))
+      expect(acknowledgePolicy(d, 'pl-confidentiality', 'p-lucas', D)).not.toBeNull()
+    })
+    expect(piiaOf(next)).toMatchObject({ status: 'done', doneOn: D })
+  })
+
   it('acknowledges the current version and closes the matching onboarding item', () => {
     const lucasTask = () => db.checklists.find((c) => c.personId === 'p-lucas')?.tasks.find((t) => t.templateTaskId === 'on-ack-handbook')
     const next = produce(db, (d) => {
@@ -217,7 +233,10 @@ describe('time off on the summary', () => {
     expect(sick?.value).toBe('40 hours')
     expect(sick?.days).toBe('5 days')
     expect(sick?.text).toBe('40 hours (5 days)')
-    expect(sick?.note).toMatch(/Usable from Dec 6, 2026/)
+    // Granted but not usable before the 90-day wait ends, so never called available
+    expect(sick?.usableFrom).toBe('2026-12-06')
+    expect(sick && availabilityText(sick)).toBe('5 days, usable from Dec 6, 2026')
+    expect(vacation && availabilityText(vacation)).toMatch(/ available$/)
   })
 
   it('writes balances as hours to one decimal with days, the same way as the rest of the app', () => {
@@ -281,6 +300,13 @@ describe('equity headline', () => {
     expect(equityHeadline(db, 'p-tomas', D)?.title).toBe('Next vest in 3 days')
   })
 
+  it('says when vesting stops for someone whose last day is ahead', () => {
+    const leaving = produce(db, (d) => {
+      d.people.find((p) => p.id === 'p-tomas')!.endDate = '2026-11-30'
+    })
+    expect(equityHeadline(leaving, 'p-tomas', D)).toMatchObject({ status: 'leaving', title: 'Vesting stops Mon, Nov 30' })
+  })
+
   it('has nothing to say without a grant', () => {
     expect(equityHeadline(db, 'p-founder', D)).toBeNull()
     expect(equityHeadline(db, 'p-luis', D)).toBeNull()
@@ -306,7 +332,7 @@ describe('pay and printable summary', () => {
     expect(text).toContain('employee #15')
     expect(text).toContain('Base: $140,000 a year, plus 10% variable at target')
     expect(text).toContain('Grant awaiting board consent')
-    expect(text).toContain('Sick leave: 40 hours (5 days) available. Usable from Dec 6, 2026.')
+    expect(text).toContain('Sick leave: 40 hours (5 days), usable from Dec 6, 2026.')
     expect(text).toContain('Tunde Bello (Sibling)')
     expect(text).toContain('notify if I am arrested or detained at work')
     const hidden = summaryText(m, { hideAmounts: true })
@@ -315,6 +341,20 @@ describe('pay and printable summary', () => {
     const html = summaryHTML(m)
     expect(html).toContain('<h1>My summary: Aisha Bello</h1>')
     expect(html).not.toMatch(/<script/i)
+  })
+
+  it('names the payroll provider only when one is set', () => {
+    const named = (name: string) =>
+      payrollProviderName(
+        produce(db, (d) => {
+          d.company.payrollProvider.name = name
+        }),
+      )
+    expect(named('Justworks')).toBe('Justworks')
+    expect(named('  Gusto ')).toBe('Gusto')
+    // Start fresh leaves the name empty; older workspaces kept the form placeholder as the name
+    expect(named('')).toBeNull()
+    expect(named('Your payroll or PEO provider')).toBeNull()
   })
 
   it('escapes names in the print view', () => {

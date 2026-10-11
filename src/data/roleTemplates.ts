@@ -6,7 +6,9 @@
 // questions. Users edit these in Hiring > Interview kits.
 //
 // Copy rules: sentence case, no em dashes, no age-coded words, no 'rockstar' language, and nothing
-// that asks about pay history or criminal history.
+// that asks about pay history or criminal history. A name becomes the job title, the offer letter's
+// position and the hire's title, so posting qualifiers ('CPA preferred') go in `hint` (shown in the
+// template pickers) and the JD, never in the name.
 import type { Attribute, JobStage, RoleTemplate } from '@/domain/types'
 
 /** Default pipeline (matches DEFAULT_STAGES in src/data/defaults.ts). */
@@ -568,7 +570,8 @@ export const DEFAULT_ROLE_TEMPLATES: RoleTemplate[] = [
   },
   {
     id: 'rt-csm',
-    name: 'Customer success manager (CPA preferred)',
+    name: 'Customer success manager',
+    hint: 'CPA preferred',
     familyId: 'f-gtm',
     levelId: 'lv-l2',
     departmentId: 'd-gtm',
@@ -598,7 +601,8 @@ export const DEFAULT_ROLE_TEMPLATES: RoleTemplate[] = [
   },
   {
     id: 'rt-accounting-lead',
-    name: 'Accounting lead (CPA)',
+    name: 'Accounting lead',
+    hint: 'CPA',
     familyId: 'f-acct',
     levelId: 'lv-l4',
     departmentId: 'd-ops',

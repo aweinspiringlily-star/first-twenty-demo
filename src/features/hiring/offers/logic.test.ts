@@ -3,16 +3,27 @@ import type { BackgroundCheck, CompRecord, Offer, Person } from '@/domain/types'
 import {
   approvalLine,
   backgroundStep,
+  bandMeterFigures,
   bandMeterGeometry,
   bandWords,
   checkCleared,
   contingenciesCleared,
   declineReasonChoices,
+  dropOfferDraft,
   expiryPresets,
   extendOptions,
   groupOffers,
+  hasKeptOfferDraft,
+  keepOfferDraft,
+  keptOfferDraft,
   latestPerApplication,
+  offerDisplayStatus,
+  offerStatusLabel,
+  otherOffersText,
+  postedRangeAnnual,
   peerBases,
+  rescindReasonText,
+  restoreOfferDraft,
   rulesAtThreshold,
   startDatePresets,
   trimPeriod,
@@ -29,6 +40,13 @@ describe('band meter', () => {
     expect(g.clipped(100_000)).toBe(true)
     expect(g.at(400_000)).toBe(1)
     expect(g.clipped(260_000)).toBe(false)
+  })
+
+  it('widens the scale to fit the posted range too', () => {
+    const g = bandMeterGeometry(band, [200_000, 280_000])
+    expect(g.clipped(200_000)).toBe(false)
+    expect(g.at(200_000)).toBeGreaterThan(0)
+    expect(g.at(200_000)).toBeLessThan(g.at(band.min))
   })
 
   it('describes the position in plain words', () => {
@@ -146,12 +164,45 @@ describe('offers tab groups', () => {
     expect(groups.declined.map((o) => o.id)).toEqual(['o8'])
     expect(earlier).toBe(2)
   })
+
+  it('files a sent offer past its expiry under Expired, and a never-sent rescind under Discarded', () => {
+    const list = [
+      offer('o1', 'a1', 'sent', { expiresOn: '2026-10-14', sentOn: '2026-10-07' }),
+      offer('o2', 'a2', 'sent', { expiresOn: '2026-10-19', sentOn: '2026-10-12' }),
+      offer('o3', 'a3', 'rescinded', { decidedOn: '2026-10-10' }),
+      offer('o4', 'a4', 'rescinded', { sentOn: '2026-10-05', decidedOn: '2026-10-08' }),
+    ]
+    const { groups } = groupOffers(list, '2026-06-11', [], '2026-09-09', '2026-10-19')
+    expect(groups.sent.map((o) => o.id)).toEqual(['o2'])
+    expect(groups.expired.map((o) => o.id)).toEqual(['o1'])
+    expect(groups.discarded.map((o) => o.id)).toEqual(['o3'])
+    expect(groups.rescinded.map((o) => o.id)).toEqual(['o4'])
+    // Without a date, status alone decides (expireOffers has not run).
+    expect(groupOffers(list, '2026-06-11', []).groups.sent.map((o) => o.id).sort()).toEqual(['o1', 'o2'])
+  })
+
+  it('labels lapsed offers Expired and unsent rescinds Discarded', () => {
+    expect(offerStatusLabel({ status: 'sent', expiresOn: '2026-10-14' }, '2026-10-19')).toEqual({ label: 'Expired', tone: 'neutral' })
+    expect(offerStatusLabel({ status: 'sent', expiresOn: '2026-10-19' }, '2026-10-19').label).toBe('Out')
+    expect(offerStatusLabel({ status: 'rescinded', expiresOn: '2026-10-19' }).label).toBe('Discarded')
+    expect(offerStatusLabel({ status: 'rescinded', expiresOn: '2026-10-19', sentOn: '2026-10-12' }).label).toBe('Rescinded')
+    expect(offerDisplayStatus({ status: 'draft', expiresOn: '2026-10-01' }, '2026-10-19')).toBe('draft')
+  })
 })
 
 describe('copy helpers', () => {
   it('trims trailing periods so sentences end once', () => {
     expect(trimPeriod('Big-tech counteroffer.')).toBe('Big-tech counteroffer')
     expect(trimPeriod(undefined)).toBe('')
+  })
+
+  it('reads a rescind reason with one colon at most, old or new', () => {
+    // The dialog joins the reason chip and the details with a period.
+    expect(rescindReasonText('Offer made in error. Hours were wrong: the role is 30 hours a week.')).toBe('Offer made in error. Hours were wrong: the role is 30 hours a week')
+    // Saved before that with a colon: read the same way.
+    expect(rescindReasonText('Offer made in error: Hours were wrong: the role is 30 hours a week')).toBe('Offer made in error. Hours were wrong: the role is 30 hours a week')
+    expect(rescindReasonText('Budget changed')).toBe('Budget changed')
+    expect(rescindReasonText('Rescinded after the Fair Chance review')).toBe('Rescinded after the Fair Chance review')
   })
 
   it('includes a competing offer among decline reasons', () => {
@@ -187,5 +238,110 @@ describe('approval line', () => {
     expect(approvalLine({ status: 'awaiting_approval', approvals: [] }, true, nameOf)).toBe('Waiting for Admin approval')
     expect(approvalLine({ status: 'draft', approvals: [] }, false, nameOf)).toBe('Drafted by Admin, no separate approval')
     expect(approvalLine({ status: 'sent', approvals: [] }, true, nameOf)).toBe('No approval on record')
+  })
+})
+
+describe('hire preview wording', () => {
+  it('says still out only for a sent offer, and names drafts, approvals and accepted offers for what they are', () => {
+    expect(otherOffersText([])).toBeNull()
+    expect(otherOffersText([{ status: 'sent' }])).toBe('Keeps the job open, because another offer on it is still out.')
+    expect(otherOffersText([{ status: 'draft' }])).toBe('Keeps the job open, because another offer on it is in draft.')
+    expect(otherOffersText([{ status: 'approved' }])).toBe('Keeps the job open, because another offer on it is in draft.')
+    expect(otherOffersText([{ status: 'awaiting_approval' }])).toBe('Keeps the job open, because another offer on it is waiting for approval.')
+    expect(otherOffersText([{ status: 'accepted' }])).toBe('Keeps the job open, because another offer on it is accepted and not hired yet.')
+    expect(otherOffersText([{ status: 'sent' }, { status: 'draft' }])).toBe('Keeps the job open, because other offers on it are still out or in draft.')
+  })
+})
+
+describe('posted range for the band meter', () => {
+  it('annualizes an hourly posted range and skips a job without one', () => {
+    expect(postedRangeAnnual({ payMin: 175_000, payMax: 215_000 })).toEqual({ min: 175_000, max: 215_000 })
+    expect(postedRangeAnnual({ payMin: 20, payMax: 25 })).toEqual({ min: 41_600, max: 52_000 })
+    expect(postedRangeAnnual({ payMin: null, payMax: 25 })).toBeNull()
+    expect(postedRangeAnnual(undefined)).toBeNull()
+  })
+})
+
+describe('band meter figures in the offer terms', () => {
+  const l1 = { min: 60_000, mid: 70_000, max: 80_000 }
+
+  it('reads a salary in annual base, with an hourly posted range at 2,080 hours', () => {
+    expect(bandMeterFigures({ payType: 'salary', salary: 72_000 }, l1, { payMin: 24, payMax: 28 }, 65_000)).toEqual({
+      unit: 'year',
+      band: l1,
+      offer: 72_000,
+      posted: { min: 49_920, max: 58_240 },
+      desired: 65_000,
+    })
+  })
+
+  it('reads an hourly offer in dollars an hour, the posted hourly range as posted', () => {
+    expect(bandMeterFigures({ payType: 'hourly', hourlyRate: 26 }, l1, { payMin: 24, payMax: 28 }, 52_000)).toEqual({
+      unit: 'hour',
+      band: { min: 28.85, mid: 33.65, max: 38.46 },
+      offer: 26,
+      posted: { min: 24, max: 28 },
+      desired: 25,
+      desiredFrom: 'year',
+    })
+    // An annual posted range is divided by 2,080 hours too; no rate or range reads as null.
+    expect(bandMeterFigures({ payType: 'hourly' }, l1, { payMin: 52_000, payMax: 62_400 })).toMatchObject({ offer: null, posted: { min: 25, max: 30 }, desired: null })
+    expect(bandMeterFigures({ payType: 'hourly', hourlyRate: 30 }, l1, undefined).posted).toBeNull()
+  })
+
+  it('uses an hourly desired pay as given on an hourly meter, and converts it only for a salary', () => {
+    const hourlyWant = { amount: 27, unit: 'hour' as const }
+    const rate = bandMeterFigures({ payType: 'hourly', hourlyRate: 26 }, l1, { payMin: 24, payMax: 28 }, hourlyWant)
+    expect(rate).toMatchObject({ unit: 'hour', desired: 27 })
+    expect(rate.desiredFrom).toBeUndefined()
+    expect(bandMeterFigures({ payType: 'salary', salary: 72_000 }, l1, { payMin: 24, payMax: 28 }, hourlyWant)).toMatchObject({ unit: 'year', desired: 56_160, desiredFrom: 'hour' })
+    expect(bandMeterFigures({ payType: 'salary', salary: 72_000 }, l1, undefined, { amount: 65_000, unit: 'year' }).desiredFrom).toBeUndefined()
+  })
+
+  it('gives peer rates for an hourly meter', () => {
+    const people = [
+      { id: 'p1', familyId: 'f-ops', levelId: 'lv-l1', startDate: '2025-01-01', endDate: null, hoursPerWeek: 24 },
+      { id: 'p2', familyId: 'f-ops', levelId: 'lv-l1', startDate: '2025-01-01', endDate: null, hoursPerWeek: 40 },
+    ] as Person[]
+    const rows = [
+      { id: 'c1', personId: 'p1', effectiveOn: '2025-01-01', payType: 'hourly', hourlyRate: 27, title: 't', levelId: 'lv-l1', reason: 'hire' },
+      { id: 'c2', personId: 'p2', effectiveOn: '2025-01-01', payType: 'salary', salary: 62_400, title: 't', levelId: 'lv-l1', reason: 'hire' },
+    ] as CompRecord[]
+    expect(peerBases(people, rows, 'f-ops', 'lv-l1', '2026-10-09', [], 'hour')).toEqual([27, 30])
+    expect(peerBases(people, rows, 'f-ops', 'lv-l1', '2026-10-09')).toEqual([27 * 24 * 52, 62_400])
+  })
+})
+
+describe('unsaved offer builder drafts', () => {
+  type F = { salary: number | null; startDate: string; contingencies: string[] }
+  const base: F = { salary: 205_000, startDate: '2026-10-26', contingencies: ['i9'] }
+
+  it('keeps a draft per application and offer until it is dropped', () => {
+    const form: F = { ...base, salary: 200_000, startDate: '2026-11-02' }
+    keepOfferDraft<F>('a-1', undefined, { base, form, version: 1 })
+    keepOfferDraft<F>('a-1', 'o-9', { base, form: { ...base, salary: 1 } })
+    expect(keptOfferDraft<F>('a-1', undefined, 1)).toEqual({ base, form, version: 1 })
+    expect(keptOfferDraft<F>('a-1', 'o-9')?.form.salary).toBe(1)
+    expect(hasKeptOfferDraft('a-1', undefined, 1)).toBe(true)
+    expect(hasKeptOfferDraft('a-2')).toBe(false)
+    // A new offer's draft never comes back on a later version.
+    expect(keptOfferDraft<F>('a-1', undefined, 2)).toBeUndefined()
+    // What comes back is a copy: editing it leaves the kept draft alone.
+    keptOfferDraft<F>('a-1', undefined, 1)!.form.contingencies.push('piia')
+    expect(keptOfferDraft<F>('a-1', undefined, 1)?.form.contingencies).toEqual(['i9'])
+    dropOfferDraft('a-1')
+    expect(keptOfferDraft<F>('a-1', undefined, 1)).toBeUndefined()
+    expect(hasKeptOfferDraft('a-1', 'o-9')).toBe(true)
+    dropOfferDraft('a-1', 'o-9')
+    expect(hasKeptOfferDraft('a-1', 'o-9')).toBe(false)
+  })
+
+  it('brings back only what the user changed, and lets a change made elsewhere since win', () => {
+    const kept = { base, form: { ...base, salary: 200_000, startDate: '2026-11-02' } }
+    // Nothing changed elsewhere: both edits come back.
+    expect(restoreOfferDraft(kept, base)).toEqual({ form: kept.form, restored: ['salary', 'startDate'], dropped: [] })
+    // The start date was changed elsewhere since: the saved value wins there; the salary edit still comes back.
+    const now = { ...base, startDate: '2026-11-09', contingencies: ['i9', 'piia'] }
+    expect(restoreOfferDraft(kept, now)).toEqual({ form: { salary: 200_000, startDate: '2026-11-09', contingencies: ['i9', 'piia'] }, restored: ['salary'], dropped: ['startDate'] })
   })
 })

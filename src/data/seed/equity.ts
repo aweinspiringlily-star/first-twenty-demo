@@ -127,6 +127,8 @@ function equitySetup(): EquitySetup {
     ],
     firstIssuanceOn: '2025-05-28',
     filing25102oOn: '2025-06-10',
+    // Copied from the cap table tool after the seed close, so offer letters state the % of fully diluted shares.
+    capTableConfirmedOn: '2026-02-24',
   }
 }
 

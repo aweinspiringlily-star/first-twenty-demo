@@ -7,6 +7,7 @@ import {
   differenceInCalendarDays,
   differenceInCalendarMonths,
   format,
+  isValid,
   isWeekend,
   parseISO,
 } from 'date-fns'
@@ -35,6 +36,26 @@ export function parseDate(d: ISODate | ISODateTime): Date {
 
 export function toISODate(d: Date): ISODate {
   return format(d, 'yyyy-MM-dd')
+}
+
+/** Earliest and latest years a date field accepts (a browser's year box takes up to 6 digits). */
+export const MIN_YEAR = 1900
+export const MAX_YEAR = 2100
+
+/**
+ * True for a real calendar date written 'YYYY-MM-DD' with a year from MIN_YEAR to MAX_YEAR: what a date
+ * field passes on. '20266-03-16', '0002-03-16' (a year still being typed) and '2026-02-31' are not.
+ */
+export function isUsableDate(d: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return false
+  const year = Number(d.slice(0, 4))
+  return year >= MIN_YEAR && year <= MAX_YEAR && toISODate(parseDate(d)) === d
+}
+
+/** The date or timestamp as a Date, or null when it is not a real one (formatters show '' then, never throw). */
+function validDate(d: ISODate | ISODateTime): Date | null {
+  const date = parseDate(d)
+  return isValid(date) ? date : null
 }
 
 export function today(): ISODate {
@@ -115,45 +136,58 @@ export function isWeekday(d: ISODate): boolean {
   return !isWeekend(parseDate(d.slice(0, 10)))
 }
 
+// The formatters return '' for a value that is not a real date (a year typed with 5 digits), so one bad
+// value never takes the page down.
+
 /** "Oct 9, 2026" */
 export function fmtDate(d: ISODate | ISODateTime | null | undefined): string {
-  if (!d) return ''
-  return format(parseDate(d), 'MMM d, yyyy')
+  const date = d ? validDate(d) : null
+  return date ? format(date, 'MMM d, yyyy') : ''
 }
 
 /** "Oct 9" */
 export function fmtShort(d: ISODate | ISODateTime | null | undefined): string {
-  if (!d) return ''
-  return format(parseDate(d), 'MMM d')
+  const date = d ? validDate(d) : null
+  return date ? format(date, 'MMM d') : ''
 }
 
 /** "Fri, Oct 9" */
 export function fmtDay(d: ISODate | ISODateTime | null | undefined): string {
-  if (!d) return ''
-  return format(parseDate(d), 'EEE, MMM d')
+  const date = d ? validDate(d) : null
+  return date ? format(date, 'EEE, MMM d') : ''
+}
+
+/**
+ * "Fri, Oct 9" in the reference year (today's by default), "Sat, Oct 9, 2027" in any other, so a date a
+ * year out never reads like this year's.
+ */
+export function fmtDayAnyYear(d: ISODate | ISODateTime | null | undefined, ref: ISODate = today()): string {
+  const date = d ? validDate(d) : null
+  if (!date) return ''
+  return format(date, date.getFullYear() === parseDate(ref).getFullYear() ? 'EEE, MMM d' : 'EEE, MMM d, yyyy')
 }
 
 /** "Fri, Oct 9, 10:30 AM" */
 export function fmtDateTime(d: ISODateTime | null | undefined): string {
-  if (!d) return ''
-  return format(parseISO(d), 'EEE, MMM d, h:mm a')
+  const date = d ? parseISO(d) : null
+  return date && isValid(date) ? format(date, 'EEE, MMM d, h:mm a') : ''
 }
 
 /** "10:30 AM" */
 export function fmtTime(d: ISODateTime | null | undefined): string {
-  if (!d) return ''
-  return format(parseISO(d), 'h:mm a')
+  const date = d ? parseISO(d) : null
+  return date && isValid(date) ? format(date, 'h:mm a') : ''
 }
 
 /** "Oct 2026" */
 export function fmtMonth(d: ISODate | null | undefined): string {
-  if (!d) return ''
-  return format(parseDate(d), 'MMM yyyy')
+  const date = d ? validDate(d) : null
+  return date ? format(date, 'MMM yyyy') : ''
 }
 
 /** Relative phrasing against today(): "today", "tomorrow", "in 5 days", "3 days ago", else a date. */
 export function fmtRelative(d: ISODate | ISODateTime | null | undefined): string {
-  if (!d) return ''
+  if (!d || !validDate(d)) return ''
   const n = daysBetween(today(), localDateOf(d))
   if (n === 0) return 'today'
   if (n === 1) return 'tomorrow'

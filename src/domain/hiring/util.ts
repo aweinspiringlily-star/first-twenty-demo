@@ -2,7 +2,7 @@
 // conversion, medians, names and small draft utilities. Pure: this file never imports the store, so
 // its constants are always initialized before any module that logs activity runs.
 import { format } from 'date-fns'
-import type { Application, DB, ID, Offer, OutcomeReason } from '@/domain/types'
+import type { Application, Candidate, DB, ID, Offer, OutcomeReason } from '@/domain/types'
 import { addDays, addMonths, type ISODate, type ISODateTime, isPacificDaylight, isWeekday, pacificDateOf, pacificOffsetHours, parseDate } from '@/lib/dates'
 
 /** A citation chip: label plus an official source link when there is one. */
@@ -81,6 +81,27 @@ export function median(values: number[]): number | null {
 
 export function snapTo(n: number, step: number): number {
   return Math.round(n / step) * step
+}
+
+/** A candidate's desired pay in its own unit: dollars a year, or an hourly rate (hourly and part-time jobs). */
+export type DesiredPay = { amount: number; unit: 'year' | 'hour' }
+
+/** The candidate's desired pay with its unit (a year when no unit is stored), or undefined when not asked. */
+export function desiredPayOf(c: Pick<Candidate, 'desiredPay' | 'desiredPayUnit'> | undefined): DesiredPay | undefined {
+  if (!c || c.desiredPay == null) return undefined
+  return { amount: c.desiredPay, unit: c.desiredPayUnit === 'hour' ? 'hour' : 'year' }
+}
+
+/** Desired pay as a yearly figure for band comparisons: an hourly rate at 2,080 hours (full-time equivalent). */
+export function desiredAnnual(d: DesiredPay | undefined): number | undefined {
+  if (!d) return undefined
+  return d.unit === 'hour' ? Math.round(d.amount * 2080) : d.amount
+}
+
+/** Desired pay as an hourly rate: an hourly figure as given, a yearly one over 2,080 hours (unrounded). */
+export function desiredHourly(d: DesiredPay | undefined): number | undefined {
+  if (!d) return undefined
+  return d.unit === 'hour' ? d.amount : d.amount / 2080
 }
 
 /** "Mon Jan 11" (no comma), used in planning lines. */

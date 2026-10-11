@@ -34,7 +34,8 @@ import { API_CSP, appCsp, inlineScriptHashes } from './csp'
 import type { Db } from './db'
 import { badRequest, HttpError } from './errors'
 import { unappliedMigrations } from './migrate'
-import { applyChanges, changesSince, replaceWorkspace, snapshot } from './repo'
+import { markServed, SERVICE_WORKER_CSP, SERVICE_WORKER_JS, SERVICE_WORKER_PATH } from './offline'
+import { applyChanges, changesSince, replaceWorkspace, snapshot, workspaceStatus } from './repo'
 import { isPlainObject, parseHistoryId, parsePush, parseSince, parseWorkspace } from './validate'
 import { serverVersion } from './version'
 
@@ -90,7 +91,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   // The served app is read once: its inline scripts are allowed by hash, and serving the same bytes
   // that were hashed keeps the two in step even while a deploy rebuilds the file (it restarts after).
-  const appHtml = config.serveApp ? readFileSync(config.appFile) : null
+  // It carries the served mark, so the app registers the offline worker (offline.ts) only here.
+  const appHtml = config.serveApp ? Buffer.from(markServed(readFileSync(config.appFile, 'utf8')), 'utf8') : null
   const appPolicy = appHtml ? appCsp(inlineScriptHashes(appHtml.toString('utf8'))) : null
 
   // A build started before its migrations ran (MIGRATE_ON_START=false and no server:migrate yet) would
@@ -215,17 +217,21 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // The API
   // ------------------------------------------------------------------------------------------
 
-  /** onRequest hook: runs before the body is read, so anonymous requests are refused unparsed. */
-  async function requireAuth(request: FastifyRequest, reply: FastifyReply) {
+  /** The session's user, or null. A cookie that names no live session is cleared. */
+  async function sessionUser(request: FastifyRequest, reply: FastifyReply): Promise<SessionUser | null> {
     const { session } = authCookies(isSecure(request))
     const token = request.cookies[session.name]
     const user = await findSession(db, token, config)
-    if (!user) {
-      // Two cookies of this name mean another host planted one (a browser sends one per domain and path,
-      // and the parser keeps the first): clearing would delete the real one, not the planted one.
-      if (token && cookieCount(request.headers.cookie, session.name) === 1) reply.clearCookie(session.name, session.options)
-      throw new HttpError(401, 'unauthorized', 'Sign in first.')
-    }
+    // Two cookies of this name mean another host planted one (a browser sends one per domain and path,
+    // and the parser keeps the first): clearing would delete the real one, not the planted one.
+    if (!user && token && cookieCount(request.headers.cookie, session.name) === 1) reply.clearCookie(session.name, session.options)
+    return user
+  }
+
+  /** onRequest hook: runs before the body is read, so anonymous requests are refused unparsed. */
+  async function requireAuth(request: FastifyRequest, reply: FastifyReply) {
+    const user = await sessionUser(request, reply)
+    if (!user) throw new HttpError(401, 'unauthorized', 'Sign in first.')
     request.user = user
   }
 
@@ -385,11 +391,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
     api.get('/auth/me', authed, async (request) => ({ user: currentUser(request) }))
 
+    // Who is signed in, for the app's checks on every page load: nobody is an answer here ({user: null}),
+    // not a 401, which browsers log as an error. GET and no body, so it needs no guard of its own.
+    api.get('/auth/session', async (request, reply) => ({ user: await sessionUser(request, reply) }))
+
+    // 404 {error: 'empty'} before the first upload, by protocol (older apps rely on it).
     api.get('/workspace', authed, async (_request, reply) => {
       const snap = await snapshot(db)
       if (!snap) return reply.code(404).send({ error: 'empty' })
       return snap
     })
+
+    // Whether the server holds a workspace, for the app's "is it empty?" checks: an empty server is an
+    // answer here ({empty: true}), not a 404, which browsers log as an error. No records are read.
+    api.get('/workspace/status', authed, async () => workspaceStatus(db))
 
     api.put('/workspace', { ...authed, bodyLimit: WORKSPACE_BODY_LIMIT }, async (request) => {
       const input = parseWorkspace(request.body)
@@ -423,6 +438,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       reply.header('Cache-Control', 'no-cache').header('Content-Security-Policy', appPolicy).type('text/html; charset=utf-8').send(appHtml)
     app.get('/', sendApp)
     app.get('/index.html', sendApp)
+    // The offline worker (offline.ts), from memory. no-cache: the browser checks it for updates on every
+    // visit. Its own policy (a worker obeys the CSP of its script) allows only fetches to this origin.
+    app.get(SERVICE_WORKER_PATH, (_request, reply) =>
+      reply
+        .header('Cache-Control', 'no-cache')
+        .header('Content-Security-Policy', SERVICE_WORKER_CSP)
+        .type('application/javascript; charset=utf-8')
+        .send(SERVICE_WORKER_JS),
+    )
   }
 
   return app

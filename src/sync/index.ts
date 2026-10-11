@@ -4,6 +4,7 @@
 //
 //   initSync()                       call once at startup, before the first edit (main.tsx); a no-op in a
 //                                    local-only install
+//   isServedPage()                   was this page served by a First Twenty server (its meta tag)?
 //   useSyncStatus((s) => s.status)   'local' | 'synced' | 'syncing' | 'offline' | 'signed_out' | 'error'
 //   connect.checkServer()            is a server answering at this origin, and are we signed in?
 //   connect.signIn(email, password, {remember?})   remember: "Keep me signed in" (7 days instead of
@@ -13,27 +14,32 @@
 //   connect.useServerCopy({discardPending?})                 server's workspace -> this browser
 //   replaceWorkspace(db, label)      Import and Start fresh: use this instead of useDB.replace, so a
 //                                    connected browser replaces the server's workspace as a whole
-//   signOut()                        ends the session; this browser keeps an offline copy. Resolves
-//                                    {confirmed, message}: confirmed false means the server could not be
-//                                    reached; the browser stays signed out and ends the session later
+//   signOut()                        sends queued changes (a few seconds at most), then ends the session;
+//                                    this browser keeps an offline copy. Resolves {confirmed, waiting,
+//                                    message}: confirmed false means the server could not be reached; the
+//                                    browser stays signed out and ends the session later. waiting: changes
+//                                    not sent yet (the message says so)
 //   signOut({forgetThisBrowser: true, discardPending?, keepServerSession?})   "Sign out and remove data
 //                                    from this browser"; kind 'session_open' when the server could not end
 //                                    the session (nothing removed) unless keepServerSession
 //   disconnect({discardPending?})    resolves {confirmed, message} like signOut
 //   syncNow(), clearRefreshed(), retryRejected()
+//   discardRejected(refs?)           drops refused changes and puts the server's copy back (no Undo step)
 //   getReplacedBackup(), clearReplacedRemotely()   the workspace shown before another computer replaced
 //                                    the server's (status.replacedRemotely), for a backup download
+//   clearRestoredRemotely()          dismisses status.restoredRemotely (the server's copy was replaced by
+//                                    another copy of this workspace)
+//   takeReloadNotice()               a notice the page before a reload left (Sign out and remove data), once
 // Other tabs: removing this browser's data or disconnecting in one tab stops the engine in the others
 // (storage events plus a BroadcastChannel), so no tab writes the workspace or the connection back.
-import { produce } from 'immer'
-import { applyDueHandoffs } from '@/domain/handoff'
-import { applyScheduledChanges } from '@/domain/lifecycle'
 import type { DB } from '@/domain/types'
-import { getClockOverride, today } from '@/lib/dates'
-import { loadSample, migrate, stopPersisting, STORAGE_KEY, useDB } from '@/store/db'
+import { getClockOverride } from '@/lib/dates'
+import { applyLoadChanges, loadSample, migrate, stopPersisting, STORAGE_KEY, useDB } from '@/store/db'
 import { createApi, type LoginOptions } from './api'
-import { createSyncEngine, type SignOutOptions, type SyncEngine, type UploadOptions } from './engine'
+import { createSyncEngine, type FlowResult, type SignOutOptions, type SyncEngine, type UploadOptions } from './engine'
+import { SERVED_MARKER } from './protocol'
 import { defaultStorage, LOGOUT_PENDING_KEY, loadConnection, readLogoutPending, type StorageLike, SYNC_STORAGE_KEY } from './state'
+import type { RecordRef } from './status'
 
 export type { ApiErrorKind, ApiFailure, ApiResult, LoginOptions, SyncApi } from './api'
 export { describeFailure } from './api'
@@ -53,6 +59,8 @@ export {
   CLOCK_MESSAGE,
   DISCONNECTED_MESSAGE,
   DISCONNECTED_PENDING_MESSAGE,
+  FORGOTTEN_MESSAGE,
+  FORGOTTEN_OPEN_MESSAGE,
   LEAVING_CLOCK_MESSAGE,
   LOGOUT_PENDING_MESSAGE,
   SAMPLE_MESSAGE,
@@ -64,11 +72,25 @@ export {
 } from './engine'
 export type { SyncUser } from './protocol'
 export type { HoldReason, SyncMode } from './state'
-export type { ReplacedRemotely, SyncStatus, SyncStatusState } from './status'
-export { useSyncStatus } from './status'
+export type { RecordRef, RefreshedRef, RejectedRef, ReplacedRemotely, RestoredRemotely, SyncStatus, SyncStatusState } from './status'
+export { useSyncStatus, waitingCount } from './status'
 
 /** Every key this app keeps in localStorage starts with this. */
 export const APP_STORAGE_PREFIX = 'first-twenty:'
+
+/**
+ * True on a page the First Twenty server served: it adds the SERVED_MARKER meta tag to the app page.
+ * Never for the one-file build opened from disk, the claude.ai artifact viewer or the Vite dev server, so
+ * a check that only a served page should make (the offline worker, asking whether the server is here)
+ * never probes /api elsewhere.
+ */
+export function isServedPage(): boolean {
+  try {
+    return typeof document !== 'undefined' && document.querySelector(`meta[name="${SERVED_MARKER}"]`) !== null
+  } catch {
+    return false
+  }
+}
 
 let engine: SyncEngine | null = null
 
@@ -86,13 +108,11 @@ export function readSavedDB(storage: StorageLike | null): DB | null {
   }
 }
 
-/** What db.ts does to a workspace when it loads: effective-dated changes and hand-offs due by today. */
-export function applyLoadChanges(db: DB): DB {
-  return produce(db, (d) => {
-    applyScheduledChanges(d, today())
-    applyDueHandoffs(d, today())
-  })
-}
+/**
+ * What db.ts does to a workspace when it loads (effective-dated changes and hand-offs due by today, then
+ * offer expiry): the store's own function, so the two can never drift apart.
+ */
+export { applyLoadChanges }
 
 /**
  * Removes every key of this app from localStorage (the workspace, the sync state, preferences), except
@@ -110,6 +130,49 @@ export function wipeAppStorage(storage?: Pick<Storage, 'length' | 'key' | 'remov
     for (const k of keys) s.removeItem(k)
   } catch {
     /* storage blocked: nothing was saved there either */
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A notice across a reload
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * sessionStorage key for a notice the page shows once after it reloads (Sign out and remove data reloads
+ * before its toast could be read). sessionStorage, not localStorage: removing this browser's data clears
+ * every first-twenty: key there, and this belongs to this tab's next page only.
+ */
+export const RELOAD_NOTICE_KEY = 'first-twenty-reload-notice'
+
+type SessionLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
+
+function sessionStore(storage?: SessionLike | null): SessionLike | null {
+  if (storage !== undefined) return storage
+  try {
+    return typeof sessionStorage === 'undefined' ? null : sessionStorage
+  } catch {
+    return null
+  }
+}
+
+/** Leaves a notice for the page after the next reload. A browser that refuses just shows none. */
+export function leaveReloadNotice(text: string, storage?: SessionLike | null): void {
+  try {
+    sessionStore(storage)?.setItem(RELOAD_NOTICE_KEY, text)
+  } catch {
+    /* storage blocked: no notice after the reload */
+  }
+}
+
+/** The notice the page before the reload left, once (it is removed as it is read), or null. */
+export function takeReloadNotice(storage?: SessionLike | null): string | null {
+  try {
+    const s = sessionStore(storage)
+    const text = s?.getItem(RELOAD_NOTICE_KEY) ?? null
+    if (text !== null) s?.removeItem(RELOAD_NOTICE_KEY)
+    return text || null
+  } catch {
+    return null
   }
 }
 
@@ -232,7 +295,9 @@ export function getSyncEngine(): SyncEngine {
     },
     // What a browser that never opened the app shows, until the reload.
     freshDB: loadSample,
-    reload: () => {
+    // The toast saying what happened would go with this page: the next one shows it (Shell).
+    reload: (notice) => {
+      if (notice) leaveReloadNotice(notice)
       if (typeof window !== 'undefined') window.location.reload()
     },
   })
@@ -300,6 +365,15 @@ export function retryRejected(): void {
 }
 
 /**
+ * Drops changes the server refused (or that are too large to sync), all or the ones named, and puts the
+ * server's copy back in this browser. Resolves with what went wrong when the server's copy is needed and
+ * cannot be fetched (nothing changes then).
+ */
+export function discardRejected(refs?: RecordRef[]): Promise<FlowResult> {
+  return getSyncEngine().discardRejected(refs)
+}
+
+/**
  * The workspace this browser showed before another computer replaced the server's (useSyncStatus
  * replacedRemotely), or null. Kept in memory only, until clearReplacedRemotely() or the tab closes.
  */
@@ -310,4 +384,9 @@ export function getReplacedBackup(): DB | null {
 /** Dismisses the replaced-from-another-computer notice and forgets the copy it offered. */
 export function clearReplacedRemotely(): void {
   engine?.clearReplacedRemotely()
+}
+
+/** Dismisses the notice that the server's copy was replaced by another copy of this workspace. */
+export function clearRestoredRemotely(): void {
+  engine?.clearRestoredRemotely()
 }

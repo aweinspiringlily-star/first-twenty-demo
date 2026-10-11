@@ -3,13 +3,13 @@
 // effective-date chips, cliff wording, combined vesting points, the comp CSV and the board print.
 import { cliffDate, holderName, poolSummary, upcomingCliffs, vestingPoints } from '@/domain/equity'
 import { daysOpen } from '@/domain/hiring/pipeline'
-import { compTable, type CompTableRow, exemptFlags, outstandingOffers, peopleCostSummary, candidateName } from '@/domain/pay'
+import { compTable, type CompTableRow, exemptFlags, outstandingOffers, peopleCostSummary, candidateName, type RunRate } from '@/domain/pay'
 import { employedOn, fullName, headcountOn, incomingOn } from '@/domain/people'
 import { budgetVariance, headcountProjection, planRollup, planSummary } from '@/domain/plan'
-import type { Band, Company, CompReason, DB, EquityGrant, ExemptionBasis, FLSA, ID, Level, PlanSlot } from '@/domain/types'
+import type { Band, Company, CompReason, CompRecord, DB, EquityGrant, ExemptionBasis, FLSA, ID, Level, PlanSlot } from '@/domain/types'
 import { addDays, addMonths, daysBetween, fmtDate, fmtDay, fmtQuarter, fmtShort, type ISODate, parseDate, toISODate } from '@/lib/dates'
 import { escapeHTML, toCSV } from '@/lib/files'
-import { money, moneyShort, num, pct } from '@/lib/format'
+import { listJoin, money, money2, moneyShort, num, pct, plural } from '@/lib/format'
 
 // ---------------------------------------------------------------------------------------------
 // Labels
@@ -72,6 +72,44 @@ export function equityGuidelineLabel(band: Pick<Band, 'equityMinPct' | 'equityMa
 /** Rounds to the nearest $1,000 (offer and change amounts snap to $1K). */
 export function snapTo1K(n: number): number {
   return Math.round(n / 1000) * 1000
+}
+
+// ---------------------------------------------------------------------------------------------
+// Note length (sync limit)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The longest note a comp box accepts (maxLength): a job or pay change note, a plan line's reason, a 409A
+ * note. Each is saved inside one record, which syncs as at most 256 KB (docs/SYNC.md), and they run a few
+ * sentences, so the cap sits well below that.
+ */
+export const NOTE_MAX_CHARS = 5_000
+
+/** '4,600 of 5,000 characters' once a note gets near the limit (90% of it), else null. */
+export function noteCountText(text: string): string | null {
+  return text.length >= NOTE_MAX_CHARS * 0.9 ? `${num(text.length)} of ${num(NOTE_MAX_CHARS)} characters` : null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pay limits
+// ---------------------------------------------------------------------------------------------
+
+/** Upper limits that catch a mistyped amount, such as digits typed onto a prefilled one. An exception reason never lifts them. */
+export const PAY_LIMITS = { hourly: 1_000, salary: 5_000_000, multiple: 5 } as const
+
+/**
+ * Why a new pay amount looks mistyped, or null: over $1,000 an hour, a salary over $5M a year, or (at full
+ * time) more than 5 times the band maximum, or with no band, more than 5 times current pay. The text names
+ * no amount of this person's pay: it also goes in a toast, which the privacy blur does not cover.
+ */
+export function payLimitProblem(p: { hourly: boolean; pay: number; fte: number; currentFte: number; bandMax?: number }): string | null {
+  if (p.hourly && p.pay > PAY_LIMITS.hourly) return `Check the amount: the new rate is over ${money(PAY_LIMITS.hourly)} an hour.`
+  if (!p.hourly && p.pay > PAY_LIMITS.salary) return `Check the amount: the new salary is over ${moneyShort(PAY_LIMITS.salary)} a year.`
+  if (p.bandMax != null && p.bandMax > 0) {
+    return p.fte > p.bandMax * PAY_LIMITS.multiple ? `Check the amount: the new pay is more than ${PAY_LIMITS.multiple} times the band maximum.` : null
+  }
+  if (p.currentFte > 0 && p.fte > p.currentFte * PAY_LIMITS.multiple) return `Check the amount: the new pay is more than ${PAY_LIMITS.multiple} times current pay.`
+  return null
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -138,6 +176,38 @@ export function quarterStartPresets(date: ISODate): Array<{ label: string; date:
 }
 
 // ---------------------------------------------------------------------------------------------
+// Scheduled changes
+// ---------------------------------------------------------------------------------------------
+
+export type ChangePart = { kind: 'manager' | 'title' | 'level' | 'department' | 'flsa' | 'pay' | 'variable'; text: string }
+
+/**
+ * What a job or pay record changes against the record before it, as short phrases: 'reports to Caleb
+ * Washington', 'title Senior engineer', 'level L3', 'Product team', 'non-exempt', and the pay ('base
+ * $192,000', 'variable 10%'), which the UI shows inside <Private> and only to viewers who may see pay.
+ */
+export function changeParts(db: Pick<DB, 'people' | 'levels' | 'departments'>, rec: CompRecord, prev: CompRecord | undefined): ChangePart[] {
+  if (!prev) return []
+  const out: ChangePart[] = []
+  if (rec.managerId !== undefined && (rec.managerId ?? null) !== (prev.managerId ?? null)) {
+    const m = rec.managerId ? db.people.find((p) => p.id === rec.managerId) : undefined
+    out.push({ kind: 'manager', text: rec.managerId ? `reports to ${m ? fullName(m) : 'a new manager'}` : 'no manager' })
+  }
+  if (rec.title !== prev.title) out.push({ kind: 'title', text: `title ${rec.title}` })
+  if (rec.levelId !== prev.levelId) out.push({ kind: 'level', text: `level ${db.levels.find((l) => l.id === rec.levelId)?.code ?? 'changed'}` })
+  if (rec.departmentId && rec.departmentId !== prev.departmentId) {
+    const dept = db.departments.find((d) => d.id === rec.departmentId)?.name
+    out.push({ kind: 'department', text: dept ? `${dept} team` : 'new team' })
+  }
+  if (rec.flsa && rec.flsa !== prev.flsa) out.push({ kind: 'flsa', text: rec.flsa === 'exempt' ? 'exempt' : 'non-exempt' })
+  if (rec.payType !== prev.payType || rec.salary !== prev.salary || rec.hourlyRate !== prev.hourlyRate) {
+    out.push({ kind: 'pay', text: rec.payType === 'hourly' ? `${money2(rec.hourlyRate ?? 0)} an hour` : `base ${money(rec.salary ?? 0)}` })
+  }
+  if ((rec.variablePct ?? 0) !== (prev.variablePct ?? 0)) out.push({ kind: 'variable', text: rec.variablePct ? `variable ${pct(rec.variablePct)}` : 'no variable' })
+  return out
+}
+
+// ---------------------------------------------------------------------------------------------
 // Privacy: blur amounts inside domain sentences
 // ---------------------------------------------------------------------------------------------
 
@@ -181,10 +251,13 @@ export function cliffCountdown(cliff: ISODate, vestingMonths: number, date: ISOD
 
 export type VestPoint = { date: ISODate; vested: number }
 
-/** Cumulative vested shares across grants at every vest date (each grant's curve from vestingPoints, summed). */
-export function combinedVesting(grants: EquityGrant[]): VestPoint[] {
+/**
+ * Cumulative vested shares across grants at every vest date (each grant's curve from vestingPoints, summed).
+ * `stopOf` gives the day a grant stops vesting (vestingStop: the holder's last day), so a leaver's line goes flat there.
+ */
+export function combinedVesting(grants: EquityGrant[], stopOf?: (g: EquityGrant) => ISODate | undefined): VestPoint[] {
   if (!grants.length) return []
-  const curves = grants.map((g) => vestingPoints(g))
+  const curves = grants.map((g) => vestingPoints(g, stopOf?.(g)))
   const dates = [...new Set(curves.flatMap((c) => c.map((p) => p.date)))].sort()
   const at = (curve: VestPoint[], d: ISODate) => {
     let v = 0
@@ -203,16 +276,23 @@ export function combinedVesting(grants: EquityGrant[]): VestPoint[] {
   return out
 }
 
-/** Yearly milestones for a vesting table view: the cliff, each anniversary and the fully vested date. */
-export function vestingMilestones(points: VestPoint[], start: ISODate): VestPoint[] {
+/**
+ * Yearly milestones for a vesting table view: the cliff, each anniversary and the fully vested date. With
+ * `lastDay` (a leaver), anniversaries after it are left out and the last row is the last day itself.
+ */
+export function vestingMilestones(points: VestPoint[], start: ISODate, lastDay?: ISODate): VestPoint[] {
   if (!points.length) return []
   const end = points[points.length - 1].date
+  const at = (d: ISODate) => points.filter((p) => p.date <= d).pop()?.vested ?? 0
   const out: VestPoint[] = []
   for (let y = 1; ; y++) {
     const d = addMonths(start, 12 * y)
-    const v = points.filter((p) => p.date <= d).pop()?.vested ?? 0
-    out.push({ date: d, vested: v })
-    if (d >= end) break
+    if (lastDay && d > lastDay) {
+      out.push({ date: lastDay, vested: at(lastDay) })
+      break
+    }
+    out.push({ date: d, vested: at(d) })
+    if (d >= end || d === lastDay) break
     if (y > 10) break
   }
   return out
@@ -277,6 +357,21 @@ export function mlPremium(
   return { min: Math.min(...ps), max: Math.max(...ps), byLevel }
 }
 
+/**
+ * How one family's midpoints compare with another's, for "machine learning midpoints run ___ software
+ * engineering": "5% to 10% above", "2% below to 10% above", "2% to 5% below", "10% above" or "the same as".
+ * Each end is rounded to a whole percent first.
+ */
+export function premiumRangeText(min: number, max: number): string {
+  const lo = Math.round(Math.min(min, max) * 100)
+  const hi = Math.round(Math.max(min, max) * 100)
+  const end = (n: number) => (n === 0 ? 'the same as' : `${Math.abs(n)}% ${n < 0 ? 'below' : 'above'}`)
+  if (lo === hi) return end(lo)
+  if (lo >= 0) return `${lo}% to ${hi}% above`
+  if (hi <= 0) return `${Math.abs(hi)}% to ${Math.abs(lo)}% below`
+  return `${Math.abs(lo)}% below to ${hi}% above`
+}
+
 export type BandDraft = { min: number | null; mid: number | null; max: number | null; equityMinPct: number | null; equityMaxPct: number | null; variablePct: number | null }
 
 /** Problems with a band edit, in plain words (empty when it can be saved). Equity and variable are percents here. */
@@ -319,10 +414,15 @@ export function bandFieldErrors(b: BandDraft): Partial<Record<keyof BandDraft, s
 // Comp table CSV
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * The comp table as CSV. Bands are full time, so part-time pay is compared at its full-time equivalent: the
+ * hours and that base sit next to the actual annual base, and the band columns say "(full-time)".
+ */
 export function compTableCSV(db: DB, rows: CompTableRow[], date: ISODate): string {
   const flags = new Map(exemptFlags(db, date).map((f) => [f.personId, f]))
   const levelCode = (id: ID) => db.levels.find((l) => l.id === id)?.code ?? ''
   const dept = (id: ID) => db.departments.find((d) => d.id === id)?.name ?? ''
+  const outside = (r: CompTableRow) => !!r.band && (r.fteBase < r.band.min || r.fteBase > r.band.max)
   return toCSV(rows, [
     { header: 'Name', value: (r) => r.name },
     { header: 'Title', value: (r) => r.title },
@@ -332,19 +432,58 @@ export function compTableCSV(db: DB, rows: CompTableRow[], date: ISODate): strin
     { header: 'Pay type', value: (r) => (r.payType === 'hourly' ? 'Hourly' : 'Salary') },
     { header: 'Hourly rate', value: (r) => r.hourlyRate ?? '' },
     { header: 'Annual base', value: (r) => Math.round(r.base) },
+    { header: 'Hours per week', value: (r) => r.hoursPerWeek },
+    { header: 'Full-time equivalent base', value: (r) => Math.round(r.fteBase) },
     { header: 'Variable %', value: (r) => (r.variablePct ? Math.round(r.variablePct * 1000) / 10 : 0) },
     { header: 'Variable at target', value: (r) => Math.round(r.variable) },
-    { header: 'Band min', value: (r) => r.band?.min ?? '' },
-    { header: 'Band mid', value: (r) => r.band?.mid ?? '' },
-    { header: 'Band max', value: (r) => r.band?.max ?? '' },
-    { header: 'Band position', value: (r) => r.bandLabel ?? '' },
-    { header: 'Compa-ratio', value: (r) => (r.compaRatio != null ? r.compaRatio.toFixed(2) : '') },
+    { header: 'Band min (full-time)', value: (r) => r.band?.min ?? '' },
+    { header: 'Band mid (full-time)', value: (r) => r.band?.mid ?? '' },
+    { header: 'Band max (full-time)', value: (r) => r.band?.max ?? '' },
+    { header: 'Band position (full-time)', value: (r) => r.bandLabel ?? '' },
+    { header: 'Compa-ratio (full-time)', value: (r) => (r.compaRatio != null ? r.compaRatio.toFixed(2) : '') },
     { header: 'Last change', value: (r) => r.lastChange?.effectiveOn ?? '' },
     { header: 'Reason', value: (r) => (r.lastChange ? REASON_LABEL[r.lastChange.reason] : '') },
-    { header: 'Exception reason', value: (r) => r.exceptionReason ?? '' },
+    { header: 'Exception reason', value: (r) => r.exceptionReason ?? (outside(r) ? 'No exception reason' : '') },
     { header: 'Below exempt floor', value: (r) => (flags.has(r.personId) ? 'Yes' : '') },
     { header: 'Starting soon', value: (r) => (r.incoming ? 'Yes' : '') },
   ])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cost scenarios
+// ---------------------------------------------------------------------------------------------
+
+export type ScenarioDelta = {
+  /** Monthly cost of the lines this scenario adds over the previous one (joining). */
+  added: { amount: number; names: string[] }
+  /** Monthly cost of the lines it drops (people leaving before then). */
+  removed: { amount: number; names: string[] }
+}
+
+/** What changes from one cost scenario to the next, both ways, so the head counts add up. Plan lines keep their title; people go by first name. */
+export function scenarioDelta(prev: RunRate, cur: RunRate): ScenarioDelta {
+  const name = (l: RunRate['lines'][number]) => (l.kind === 'plan' ? l.name : l.name.split(' ')[0])
+  const added = cur.lines.filter((l) => !prev.lines.some((p) => p.key === l.key))
+  const removed = prev.lines.filter((l) => !cur.lines.some((c) => c.key === l.key))
+  const sum = (ls: typeof added) => Math.round(ls.reduce((t, l) => t + l.monthly, 0))
+  return { added: { amount: sum(added), names: added.map(name) }, removed: { amount: sum(removed), names: removed.map(name) } }
+}
+
+/**
+ * The scenario card's change line, in parts so the amounts can go through <Private>:
+ * "+$45.2K" "for Lucas and Mei", "-$38.3K" "for Kofi and Elena leaving" (past 3 names, counts: "for 4 joining").
+ */
+export function scenarioDeltaParts(d: ScenarioDelta): Array<{ amount: string; text: string }> {
+  const out: Array<{ amount: string; text: string }> = []
+  if (d.added.names.length) {
+    const who = d.added.names.length <= 3 ? listJoin(d.added.names) : `${d.added.names.length} joining`
+    out.push({ amount: `+${moneyShort(d.added.amount)}`, text: `for ${who}` })
+  }
+  if (d.removed.names.length) {
+    const who = d.removed.names.length <= 3 ? `${listJoin(d.removed.names)} leaving` : `${d.removed.names.length} leaving`
+    out.push({ amount: `-${moneyShort(d.removed.amount)}`, text: `for ${who}` })
+  }
+  return out
 }
 
 /** Median of numbers (null for none). */
@@ -375,7 +514,8 @@ export type BoardSummary = {
   offersOut: Array<{ name: string; title: string; status: string; expiresOn?: ISODate }>
   cost: { now: number; withIncoming: number; withOffers: number; atPlan: number; contractors: number; runwayNow: string; runwayAtPlan: string }
   planLines: Array<{ quarter: string; title: string; status: PlanSlot['status']; targetStart: ISODate; budgetBase: number | null }>
-  variance: { budget: number; actual: number; variance: number; lines: number }
+  /** Offered or hired base vs budget; `restated` counts the lines whose part-time pay was restated at full time. */
+  variance: { budget: number; actual: number; variance: number; lines: number; restated: number }
   pool: { size: number; available: number; granted: number; awaiting: number; reserved: number }
 }
 
@@ -437,7 +577,11 @@ export function boardSummary(db: DB, date: ISODate): BoardSummary {
       targetStart: r.slot.targetStart,
       budgetBase: r.budgetBase,
     })),
-    variance: { ...variance.totals, lines: variance.rows.filter((r) => r.variance != null).length },
+    variance: {
+      ...variance.totals,
+      lines: variance.rows.filter((r) => r.variance != null).length,
+      restated: variance.rows.filter((r) => r.variance != null && r.restatedFromHours != null).length,
+    },
     pool: {
       size: pool.poolShares,
       available: pool.available,
@@ -452,12 +596,27 @@ function signedMoney(n: number): string {
   return n > 0 ? `+${money(n)}` : n < 0 ? `-${money(-n)}` : '$0'
 }
 
+/** "3 employees, 1 contractor, 0 advisors". */
+function headcountText(s: Pick<BoardSummary, 'headcount' | 'contractors' | 'advisors'>): string {
+  return `${plural(s.headcount, 'employee')}, ${plural(s.contractors, 'contractor')}, ${plural(s.advisors, 'advisor')}`
+}
+
+/** Runway today and at plan, once when the two say the same thing (both "Add cash on hand", for example). */
+function runwayText(s: Pick<BoardSummary, 'cost'>): string {
+  return s.cost.runwayNow === s.cost.runwayAtPlan ? s.cost.runwayNow : `${s.cost.runwayNow} ${s.cost.runwayAtPlan}`
+}
+
+/** " (part-time pay restated at full time)" when any variance line restated part-time pay, else "". */
+function restatedNote(s: Pick<BoardSummary, 'variance'>): string {
+  return s.variance.restated ? ' (part-time pay restated at full time)' : ''
+}
+
 /** Plain-text board update for Copy (Slack, email or a board memo). */
 export function boardText(s: BoardSummary): string {
   const lines: string[] = []
   lines.push(`${s.company} people update, ${fmtDate(s.date)}`)
   lines.push('')
-  lines.push(`Headcount: ${s.headcount} employees, ${s.contractors} contractors, ${s.advisors} advisors.`)
+  lines.push(`Headcount: ${headcountText(s)}.`)
   if (s.incoming.length) lines.push(`Starting soon: ${s.incoming.map((p) => `${p.name} (${p.title}, ${fmtShort(p.startDate)})`).join('; ')}.`)
   lines.push(`${s.planText}.`)
   lines.push('')
@@ -469,8 +628,8 @@ export function boardText(s: BoardSummary): string {
   lines.push(
     `Fully loaded run-rate: ${moneyShort(s.cost.now)} a month now, ${moneyShort(s.cost.withIncoming)} with hires starting soon, ${moneyShort(s.cost.withOffers)} with offers out, about ${moneyShort(s.cost.atPlan)} at plan. Contractors ${moneyShort(s.cost.contractors)} a month.`,
   )
-  lines.push(`${s.cost.runwayNow} ${s.cost.runwayAtPlan}`)
-  if (s.variance.lines) lines.push(`Offers vs budget on ${s.variance.lines} plan lines: ${signedMoney(s.variance.variance)} in base.`)
+  lines.push(runwayText(s))
+  if (s.variance.lines) lines.push(`Offers vs budget on ${plural(s.variance.lines, 'plan line')}: ${signedMoney(s.variance.variance)} in base${restatedNote(s)}.`)
   lines.push(`Option pool: ${num(s.pool.available)} of ${num(s.pool.size)} available.`)
   return lines.join('\n')
 }
@@ -524,7 +683,7 @@ export function boardHTML(s: BoardSummary): string {
     `<h1>${e(s.company)} people update</h1>`,
     `<p class="muted">${e(fmtDate(s.date))}. Planning figures, not payroll. Fully loaded cost includes employer taxes, benefits, PEO and tools, and workers' comp.</p>`,
     `<h2>Headcount, actual and plan</h2>`,
-    `<p>${e(`${s.headcount} employees today, ${s.contractors} contractors, ${s.advisors} advisors. ${s.planText}.`)}</p>`,
+    `<p>${e(`${plural(s.headcount, 'employee')} today, ${plural(s.contractors, 'contractor')}, ${plural(s.advisors, 'advisor')}. ${s.planText}.`)}</p>`,
     stepChartSVG(s.actual, s.plan),
     `<p class="muted">Solid line: actual. Dashed line: plan, including hires starting soon and open plan lines.</p>`,
     `<h2>Hires in ${e(s.date.slice(0, 4))}</h2>`,
@@ -552,12 +711,12 @@ export function boardHTML(s: BoardSummary): string {
       ['At plan', money(s.cost.atPlan), money(s.cost.atPlan * 12)],
       ['Contractors (separate)', money(s.cost.contractors), money(s.cost.contractors * 12)],
     ])}</table>`,
-    `<p>${e(`${s.cost.runwayNow} ${s.cost.runwayAtPlan}`)}</p>`,
+    `<p>${e(runwayText(s))}</p>`,
     `<h2>Headcount plan</h2>`,
     `<table><tr><th>Quarter</th><th>Role</th><th>Status</th><th>Target start</th><th>Budgeted base</th></tr>${rows(
       s.planLines.map((l) => [fmtQuarter(l.quarter), l.title, PLAN_STATUS_LABEL[l.status], fmtDate(l.targetStart), l.budgetBase != null ? money(l.budgetBase) : 'Not set']),
     )}</table>`,
-    s.variance.lines ? `<p>Offered or hired base vs budget on ${s.variance.lines} lines: ${e(signedMoney(s.variance.variance))}.</p>` : '',
+    s.variance.lines ? `<p>Offered or hired base vs budget on ${e(plural(s.variance.lines, 'line'))}: ${e(signedMoney(s.variance.variance))}${e(restatedNote(s))}.</p>` : '',
     `<p class="muted">Option pool: ${e(num(s.pool.available))} of ${e(num(s.pool.size))} shares available (${e(num(s.pool.granted))} granted, ${e(num(s.pool.awaiting))} awaiting board consent, ${e(num(s.pool.reserved))} reserved by offers). The cap table tool is the source of truth.</p>`,
   ].join('\n')
 }

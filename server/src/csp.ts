@@ -6,13 +6,17 @@ import { createHash } from 'node:crypto'
 /** For JSON responses and anything that is not the app. */
 export const API_CSP = "default-src 'none'; frame-ancestors 'none'"
 
-/** The app's policy: inline scripts only by hash; styles may be inline (the app sets style attributes). */
+/**
+ * The app's policy: inline scripts only by hash; styles may be inline (the app sets style attributes);
+ * workers only from this server (the offline worker, /sw.js).
+ */
 export function appCsp(scriptHashes: readonly string[]): string {
   const scripts = ["'self'", ...scriptHashes.map((h) => `'sha256-${h}'`)]
   return [
     "default-src 'self'",
     `script-src ${scripts.join(' ')}`,
     "script-src-attr 'none'",
+    "worker-src 'self'",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",

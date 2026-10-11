@@ -5,8 +5,10 @@ import {
   bandFor,
   bandLabel,
   bandPosition,
+  benefitsBasis,
   compaRatio,
   compHistory,
+  compHistoryByLastDay,
   compTable,
   contractorMonthly,
   currentComp,
@@ -15,6 +17,7 @@ import {
   exemptFlags,
   fullTimeEquivalentBase,
   hourlyRateOf,
+  lastDayOf,
   loadedCost,
   offerMonthlyImpact,
   outOfBand,
@@ -23,6 +26,10 @@ import {
   planSlotStatus,
   runRate,
   runway,
+  RUNWAY_CAP_MONTHS,
+  runwayMonthsLabel,
+  slotOffer,
+  slotPerson,
 } from '@/domain/pay'
 import { headcountProjection } from '@/domain/plan'
 import type { CompRecord, Contractor, DB, Job, Offer, Person, PlanSlot } from '@/domain/types'
@@ -331,6 +338,22 @@ describe('loaded cost', () => {
     expect(c.multiplier).toBeCloseTo(1.176, 3)
   })
 
+  it('counts no benefits when Settings records no group health plan', () => {
+    const db = baseDB()
+    expect(benefitsBasis(db.company)).toBe('assumed')
+    expect(loadedCost(db, { base: 0, state: 'CA' }).benefits).toBe(13_800)
+    db.company.groupHealthPlanStartedOn = null
+    expect(benefitsBasis(db.company)).toBe('none')
+    const none = loadedCost(db, { base: 0, state: 'CA' })
+    expect(none.benefits).toBe(0)
+    // A founder with no salary: PEO and tools only, and no multiplier on a $0 base.
+    expect(none).toMatchObject({ totalMonthly: 375, multiplier: 0 })
+    expect(runRate(db, D).breakdown.benefits).toBe(0)
+    db.company.groupHealthPlanStartedOn = '2026-01-01'
+    expect(benefitsBasis(db.company)).toBe('plan')
+    expect(loadedCost(db, { base: 0, state: 'CA' }).benefits).toBe(13_800)
+  })
+
   it('taxes variable pay and can leave out benefits', () => {
     const c = loadedCost(baseDB(), { base: 140_000, variablePct: 1, state: 'TX', benefits: false })
     expect(c.variable).toBe(140_000)
@@ -408,6 +431,26 @@ describe('run-rate', () => {
     // The slot still shows an offer until hiring marks it expired, but its cost is not lost at plan.
     const plan = runRate(db, D, { include: 'at_plan' })
     expect(plan.lines.filter((l) => l.kind === 'plan').map((l) => l.slotId).sort()).toEqual(['ps-offer', 'ps-open', 'ps-planned'])
+  })
+
+  it('leaves out employees with a known last day in every forward scenario, but not now', () => {
+    const db = richDB()
+    // Ana leaves at the end of the month; Tex's separation is recorded with no end date set yet.
+    const ana = db.people.find((p) => p.id === 'p-ana') as Person
+    ana.endDate = '2026-10-30'
+    const tex = db.people.find((p) => p.id === 'p-tex') as Person
+    tex.separation = { type: 'resigned_notice', reason: 'Test', lastDay: '2026-11-13' }
+    const ids = (include: 'now' | 'with_incoming' | 'with_offers' | 'at_plan') => runRate(db, D, { include }).lines.map((l) => l.personId ?? l.offerId ?? l.slotId)
+    expect(ids('now')).toEqual(expect.arrayContaining(['p-ana', 'p-tex']))
+    for (const s of ['with_incoming', 'with_offers', 'at_plan'] as const) {
+      expect(ids(s)).not.toContain('p-ana')
+      expect(ids(s)).not.toContain('p-tex')
+    }
+    // So each step adds up: 4 now, 2 leave and 2 join, then 1 offer, then 2 plan lines.
+    expect(runRate(db, D, { include: 'now' }).headcount).toBe(4)
+    expect(runRate(db, D, { include: 'with_incoming' }).headcount).toBe(4)
+    expect(runRate(db, D, { include: 'with_offers' }).headcount).toBe(5)
+    expect(runRate(db, D, { include: 'at_plan' }).headcount).toBe(7)
   })
 
   it('leaves out employees with a known end date at plan, matching the plan projection', () => {
@@ -494,6 +537,26 @@ describe('runway', () => {
     db.company.monthlyRevenue = 500_000
     expect(runway(db, D).months).toBe(Infinity)
   })
+
+  it('says more than 5 years instead of hundreds of months', () => {
+    // An unpaid founder, $18K a month of other spend and $15K of revenue: hundreds of months on $2.3M.
+    const db = baseDB()
+    db.comp[0].salary = 0
+    db.company.cashOnHand = 2_300_000
+    db.company.otherMonthlySpend = 18_000
+    db.company.monthlyRevenue = 15_000
+    const r = runway(db, D)
+    expect(r.months).toBeGreaterThan(300)
+    expect(r.text).toBe("More than 5 years of runway at today's burn.")
+    expect(runway(db, D, 'at_plan').text).toBe('More than 5 years of runway if the plan hires on schedule.')
+    expect(peopleCostSummary(db, D).text).toMatch(/ Runway more than 5 years at today's burn\.$/)
+    expect(runwayMonthsLabel(r.months ?? 0)).toBe('More than 5 years')
+    // Up to the cap the months show; under 2 months, to a tenth.
+    expect(runwayMonthsLabel(RUNWAY_CAP_MONTHS)).toBe('60 months')
+    expect(runwayMonthsLabel(26.737)).toBe('27 months')
+    expect(runwayMonthsLabel(0.768)).toBe('0.8 months')
+    expect(runwayMonthsLabel(Infinity)).toBe('Not shrinking')
+  })
 })
 
 describe('offers, exempt checks and band exceptions', () => {
@@ -531,8 +594,9 @@ describe('offers, exempt checks and band exceptions', () => {
     const db = richDB()
     db.people.push(mkPerson('p-found', { startDate: '2025-06-09' }))
     db.comp.push(
-      mkComp('p-found', '2025-06-09', 150_000, { exceptionReason: 'Founding, equity-heavy' }),
-      mkComp('p-found', '2026-03-01', 170_000, { reason: 'market' }),
+      mkComp('p-found', '2025-06-09', 170_000, { exceptionReason: 'Founding, equity-heavy' }),
+      // A title change leaves pay alone, so changeJobOrPay carries the reason forward onto the new row.
+      mkComp('p-found', '2026-03-01', 170_000, { reason: 'title_only', title: 'Founding engineer', exceptionReason: 'Founding, equity-heavy' }),
     )
     const rows = outOfBand(db, D)
     const found = rows.find((r) => r.personId === 'p-found')
@@ -540,7 +604,8 @@ describe('offers, exempt checks and band exceptions', () => {
     // Luis earns $30 an hour at 24 hours: $62,400 at full time, inside the $60K-$80K band.
     expect(rows.find((r) => r.personId === 'p-luis')).toBeUndefined()
     const table = compTable(db, D)
-    expect(table.find((r) => r.personId === 'p-luis')).toMatchObject({ base: 37_440, fteBase: 62_400, bandLabel: 'Low in band' })
+    expect(table.find((r) => r.personId === 'p-luis')).toMatchObject({ base: 37_440, fteBase: 62_400, hoursPerWeek: 24, bandLabel: 'Low in band' })
+    expect(table.find((r) => r.personId === 'p-ana')?.hoursPerWeek).toBe(40)
     expect(table.find((r) => r.personId === 'p-lucas')?.incoming).toBe(true)
   })
 
@@ -562,6 +627,54 @@ describe('offers, exempt checks and band exceptions', () => {
     expect(compTable(db, D).find((r) => r.personId === 'p-x')).toMatchObject({ bandLabel: 'Below band' })
     expect(compTable(db, D).find((r) => r.personId === 'p-x')?.exceptionReason).toBeUndefined()
   })
+
+  it('explains out-of-band pay only with the reason on the record in force', () => {
+    const db = richDB()
+    // Hired below band with a reason, then a market adjustment into the band with none.
+    db.people.push(mkPerson('p-kofi', { startDate: '2025-10-06' }))
+    db.comp.push(
+      mkComp('p-kofi', '2025-10-06', 178_000, { exceptionReason: 'Pre-seed offer: below band, equity-heavy' }),
+      mkComp('p-kofi', '2026-03-01', 192_000, { reason: 'market' }),
+    )
+    expect(outOfBand(db, D).find((r) => r.personId === 'p-kofi')).toBeUndefined()
+    // Editing the band to $195K-$245K puts him below it: the hire-time reason does not explain that.
+    const band = db.bands.find((b) => b.familyId === 'f-eng' && b.levelId === 'lv-l3')
+    if (band) Object.assign(band, { min: 195_000, mid: 220_000, max: 245_000 })
+    const row = outOfBand(db, D).find((r) => r.personId === 'p-kofi')
+    expect(row).toMatchObject({ direction: 'below', gap: 3_000 })
+    expect(row?.exceptionReason).toBeUndefined()
+    expect(compTable(db, D).find((r) => r.personId === 'p-kofi')).toMatchObject({ bandLabel: 'Below band' })
+    expect(compTable(db, D).find((r) => r.personId === 'p-kofi')?.exceptionReason).toBeUndefined()
+    // A pay change below band with no reason recorded does not inherit the older one either.
+    db.people.push(mkPerson('p-mo', { startDate: '2025-06-09' }))
+    db.comp.push(
+      mkComp('p-mo', '2025-06-09', 150_000, { exceptionReason: 'Founding, equity-heavy' }),
+      mkComp('p-mo', '2026-03-01', 170_000, { reason: 'market' }),
+    )
+    expect(outOfBand(db, D).find((r) => r.personId === 'p-mo')?.exceptionReason).toBeUndefined()
+    // An incoming hire's first record still explains their offer.
+    db.people.push(mkPerson('p-new', { startDate: '2026-11-02' }))
+    db.comp.push(mkComp('p-new', '2026-11-02', 185_000, { exceptionReason: 'Market data for this role' }))
+    expect(outOfBand(db, D).find((r) => r.personId === 'p-new')?.exceptionReason).toBe('Market data for this role')
+  })
+
+  it('leaves rows dated after the last day out of the history', () => {
+    const db = richDB()
+    // Ana is let go today, after a promotion was scheduled for Nov 1.
+    db.comp.push(mkComp('p-ana', '2026-11-01', 215_000, { reason: 'promotion', levelId: 'lv-l4', scheduled: true }))
+    const ana = db.people.find((p) => p.id === 'p-ana') as Person
+    expect(compHistoryByLastDay(db, ana)).toMatchObject({ afterLastDay: [] })
+    expect(compHistoryByLastDay(db, ana).history).toHaveLength(3)
+    ana.separation = { type: 'terminated', reason: 'Test', lastDay: D }
+    expect(lastDayOf(ana)).toBe(D)
+    const split = compHistoryByLastDay(db, ana)
+    expect(split.lastDay).toBe(D)
+    expect(split.history.map((r) => r.effectiveOn)).toEqual(['2025-05-12', '2026-03-01'])
+    expect(split.afterLastDay.map((r) => r.salary)).toEqual([215_000])
+    ana.endDate = '2026-11-01'
+    // A last day on the effective date: the change takes effect that day.
+    expect(compHistoryByLastDay(db, ana).afterLastDay).toEqual([])
+  })
 })
 
 describe('plan slot status and the home summary', () => {
@@ -577,12 +690,55 @@ describe('plan slot status and the home summary', () => {
 
   it('writes the people cost line', () => {
     const db = richDB()
-    db.company.cashOnHand = 13_400_000
+    db.company.cashOnHand = 9_400_000
     db.company.otherMonthlySpend = 110_000
     const s = peopleCostSummary(db, D)
     expect(s.addedNames).toEqual(['Lucas', 'Mei', 'Danielle'])
     expect(s.text).toMatch(/^Run-rate \$[\d.]+K a month fully loaded, \$[\d.]+K with Lucas, Mei and Danielle, about \$[\d.]+K at plan\./)
     expect(s.text).toMatch(/Contractors \$15\.7K a month\. Runway about \d+ months at today's burn, about \d+ at plan\.$/)
     expect(s.text).not.toMatch(/\u2014/)
+    // Past 5 years today, the line says so and still gives the months at plan.
+    db.company.cashOnHand = 13_400_000
+    expect(peopleCostSummary(db, D).text).toMatch(/Runway more than 5 years at today's burn, about \d+ at plan\.$/)
+  })
+
+  it("gives each held plan line its own person's offer when one job hires twice", () => {
+    const db = baseDB()
+    db.jobs.push(mkJob('j-fs'))
+    db.candidates.push(
+      { id: 'c-marcus', firstName: 'Marcus', lastName: 'Webb', email: 'mw@x.com', links: {}, source: 'outbound', sponsorship: 'no', tags: [], createdOn: '2026-09-01' },
+      { id: 'c-pri', firstName: 'Priyanka', lastName: 'Desai', email: 'pd@x.com', links: {}, source: 'inbound', sponsorship: 'no', tags: [], createdOn: '2026-09-01' },
+    )
+    db.people.push(
+      mkPerson('p-marcus', { startDate: '2026-10-26', fromCandidateId: 'c-marcus' }),
+      mkPerson('p-pri', { startDate: '2026-10-30', fromCandidateId: 'c-pri' }),
+      mkPerson('p-direct', { startDate: '2026-10-19' }),
+    )
+    db.offers.push(
+      mkOffer('o-marcus', { candidateId: 'c-marcus', jobId: 'j-fs', status: 'accepted', salary: 220_000, personId: 'p-marcus', createdOn: '2026-09-20' }),
+      // Linked to the hire through the candidate only.
+      mkOffer('o-pri', { candidateId: 'c-pri', jobId: 'j-fs', status: 'accepted', salary: 205_000, createdOn: '2026-09-28' }),
+      mkOffer('o-next', { candidateId: 'c-next', jobId: 'j-fs', status: 'sent', salary: 210_000 }),
+    )
+    db.plan.push(
+      mkSlot('ps-marcus', { jobId: 'j-fs', personId: 'p-marcus', status: 'filled' }),
+      mkSlot('ps-pri', { jobId: 'j-fs', personId: 'p-pri', status: 'filled' }),
+      mkSlot('ps-direct', { jobId: 'j-fs', personId: 'p-direct', status: 'filled' }),
+      mkSlot('ps-seat', { jobId: 'j-fs', status: 'open' }),
+    )
+    const slot = (id: string) => db.plan.find((s) => s.id === id) as PlanSlot
+    expect(slotOffer(db, slot('ps-marcus'))?.id).toBe('o-marcus')
+    expect(slotOffer(db, slot('ps-pri'))?.id).toBe('o-pri')
+    // Added without an offer: none, so the plan reads the hire record instead.
+    expect(slotOffer(db, slot('ps-direct'))).toBeUndefined()
+    expect(slotPerson(db, slot('ps-direct'))?.id).toBe('p-direct')
+    // The open seat skips the accepted offers the other lines' people were hired from.
+    expect(slotOffer(db, slot('ps-seat'))?.id).toBe('o-next')
+    expect(slotPerson(db, slot('ps-seat'))).toBeUndefined()
+    expect(planSlotStatus(db, slot('ps-seat'))).toBe('offer')
+    // An accepted offer nobody was hired from yet fills the open seat.
+    db.offers.push(mkOffer('o-kim', { candidateId: 'c-kim', jobId: 'j-fs', status: 'accepted', salary: 200_000 }))
+    expect(slotOffer(db, slot('ps-seat'))?.id).toBe('o-kim')
+    expect(planSlotStatus(db, slot('ps-seat'))).toBe('filled')
   })
 })

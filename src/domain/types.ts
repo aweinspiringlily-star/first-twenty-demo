@@ -34,6 +34,8 @@ export type LinkOuts = {
   training?: string
   handbook?: string
   benefits?: string
+  /** Default video meeting room, prefilled as the link when an interview is on video. */
+  videoRoom?: string
 }
 
 export type Company = {
@@ -317,6 +319,11 @@ export type EquitySetup = {
   /** First option issuance and the CA 25102(o) notice (due within 30 days of the first issuance). */
   firstIssuanceOn?: ISODate
   filing25102oOn?: ISODate
+  /**
+   * When an admin entered or confirmed the cap table numbers. Unset after Start fresh, whose numbers are
+   * placeholders: until then offer letters leave out the % of fully diluted shares.
+   */
+  capTableConfirmedOn?: ISODate
 }
 
 export type EquityGrant = {
@@ -436,7 +443,9 @@ export type InterviewStep = {
 
 export type RoleTemplate = {
   id: ID
-  name: string // 'Senior full-stack engineer'
+  name: string // 'Senior full-stack engineer' (becomes the job title, so no posting qualifiers here)
+  /** A short note shown next to the name in template pickers ('CPA preferred'); never part of the title. */
+  hint?: string
   familyId: ID
   levelId: ID
   departmentId: ID
@@ -523,6 +532,8 @@ export type Candidate = {
   otherReferrals?: Array<{ referrerId: ID; jobId: ID; on: ISODate }>
   /** Desired pay only. California bans asking about current or past pay (Labor Code 432.3). */
   desiredPay?: number
+  /** What desiredPay counts: dollars a year (the default when absent) or an hourly rate, for hourly and part-time jobs. */
+  desiredPayUnit?: 'year' | 'hour'
   sponsorship: 'yes' | 'no' | 'unknown'
   tags: string[] // 'keep warm', 'silver medalist', ...
   summary?: string // short resume highlights
@@ -579,6 +590,8 @@ export type Interview = {
   durationMin: number
   interviewerIds: ID[]
   format: 'video' | 'onsite' | 'phone'
+  /** The meeting link for a video interview (in the confirmation message and the .ics). */
+  videoLink?: string
   status: 'scheduled' | 'completed' | 'cancelled' | 'no_show'
   attributes: string[]
   icsIssuedOn?: ISODate
@@ -665,6 +678,8 @@ export type Offer = {
   decidedOn?: ISODate
   declineReason?: string
   competingNote?: string
+  /** Why the offer was rescinded, or why a draft that never went out was discarded. */
+  rescindReason?: string
   backgroundCheck?: BackgroundCheck
   /** Set when Hire converts the accepted offer into a Person. */
   personId?: ID

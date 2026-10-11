@@ -10,7 +10,7 @@ import { upcomingCliffs } from '@/domain/equity'
 import { candidateName, pacificDateOf, stageById, zoneLabel } from '@/domain/hiring'
 import { fullName, isEmployedOn } from '@/domain/people'
 import type { DB, ID, Viewer } from '@/domain/types'
-import { addDays, type ISODate, type ISODateTime, isWeekday } from '@/lib/dates'
+import { addDays, fmtDay, type ISODate, type ISODateTime, isWeekday } from '@/lib/dates'
 import { links } from '@/app/router'
 
 export type WeekEventKind = 'start' | 'interview' | 'anniversary' | 'cliff' | 'offer' | 'leave' | 'deadline' | 'holiday'
@@ -164,7 +164,9 @@ export function weekEvents(db: DB, viewer: Viewer, from: ISODate, to: ISODate, o
     // Compliance deadlines.
     for (const item of complianceCalendar(db, from, to)) {
       if (item.done) continue
-      out.push({ date: item.date, kind: 'deadline', text: item.title, statutory: item.statutory, href: links.compliance('calendar'), personId: item.personId })
+      // An agency filing due on a weekend or holiday (the DE 1) names the business day to file by.
+      const text = item.fileBy ? `${item.title}, file by ${fmtDay(item.fileBy)}` : item.title
+      out.push({ date: item.date, kind: 'deadline', text, statutory: item.statutory, href: links.compliance('calendar'), personId: item.personId })
     }
   }
 

@@ -768,6 +768,29 @@ describe('me and logout', () => {
     expect(after.statusCode).toBe(401)
   })
 
+  it('answers who is signed in without a 401 when nobody is (GET /api/auth/session, r2-48)', async () => {
+    const anon = await app.inject({ method: 'GET', url: '/api/auth/session' })
+    expect(anon.statusCode).toBe(200)
+    expect(anon.json()).toEqual({ user: null })
+    expect(anon.headers['cache-control']).toBe('no-store')
+    const cookie = await login(app)
+    const signedIn = await app.inject({ method: 'GET', url: '/api/auth/session', headers: { cookie } })
+    expect(signedIn.statusCode).toBe(200)
+    expect(signedIn.json().user).toMatchObject({ email: ADMIN.email, role: 'admin' })
+    // A session that ended is nobody too, and its cookie is cleared as /api/auth/me would.
+    await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...CSRF, cookie } })
+    const ended = await app.inject({ method: 'GET', url: '/api/auth/session', headers: { cookie } })
+    expect(ended.statusCode).toBe(200)
+    expect(ended.json()).toEqual({ user: null })
+    expect(String(ended.headers['set-cookie'])).toMatch(/ft_session=;/)
+    // A planted twin is left alone, as everywhere else.
+    const twice = await app.inject({ method: 'GET', url: '/api/auth/session', headers: { cookie: `ft_session=planted; ${cookie}` } })
+    expect(twice.json()).toEqual({ user: null })
+    expect(twice.headers['set-cookie']).toBeUndefined()
+    // /api/auth/me keeps its 401 for older clients.
+    expect((await app.inject({ method: 'GET', url: '/api/auth/me' })).statusCode).toBe(401)
+  })
+
   it('logs out with a JSON content type and an empty body', async () => {
     const cookie = await login(app)
     const out = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...CSRF, cookie, 'content-type': 'application/json' } })
@@ -821,6 +844,26 @@ describe('workspace', () => {
     // An unknown cookie counts as anonymous too.
     const stale = await app.inject({ method: 'PUT', url: '/api/workspace', headers: { ...json, cookie: 'ft_session=not-a-session' }, payload: '{x' })
     expect(stale.statusCode).toBe(401)
+  })
+
+  it('says whether it is empty without a 404 (status), and needs a session for that too', async () => {
+    const anon = await app.inject({ method: 'GET', url: '/api/workspace/status' })
+    expect(anon.statusCode).toBe(401)
+    expect(anon.json().error).toBe('unauthorized')
+    const h = await authed()
+    const empty = await app.inject({ method: 'GET', url: '/api/workspace/status', headers: h })
+    expect(empty.statusCode).toBe(200)
+    expect(empty.json()).toEqual({ empty: true })
+    expect(empty.headers['cache-control']).toBe('no-store')
+    const put = await upload(h)
+    const full = await app.inject({ method: 'GET', url: '/api/workspace/status', headers: h })
+    expect(full.statusCode).toBe(200)
+    expect(full.json()).toEqual({ empty: false, workspaceId: 'default', historyId: put.json().historyId, seq: put.json().seq })
+    // The seq follows pushes, like the snapshot's.
+    const pushed = await push(h, [{ collection: 'jobs', id: 'j-status', op: 'upsert', data: { id: 'j-status' }, baseVersion: null }])
+    const after = await app.inject({ method: 'GET', url: '/api/workspace/status', headers: h })
+    expect(after.json().seq).toBe(pushed.json().seq)
+    expect(after.json().seq).toBe((await app.inject({ method: 'GET', url: '/api/workspace', headers: h })).json().seq)
   })
 
   it('is empty (404) before the first upload', async () => {
@@ -983,22 +1026,29 @@ describe('changes', () => {
     ])
     const body = res.json()
     expect(body.applied).toEqual([])
+    // The admin wrote the copy that won (byYou); neither stale change is in the log (no landed).
     expect(body.conflicts).toEqual([
-      { collection: 'people', id: 'p-founder', serverVersion: vTwo, serverData: normalize(v2) },
-      { collection: 'people', id: 'p-founder', serverVersion: vTwo, serverData: normalize(v2) },
+      { collection: 'people', id: 'p-founder', serverVersion: vTwo, serverData: normalize(v2), byYou: true },
+      { collection: 'people', id: 'p-founder', serverVersion: vTwo, serverData: normalize(v2), byYou: true },
     ])
     // A create for an id the server already has is a conflict too.
     const dupe = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: stale, baseVersion: null }])
     expect(dupe.json().conflicts[0].serverVersion).toBe(vTwo)
-    // A retried push whose data the server already holds counts as applied.
+    // A retried push whose data the server already holds counts as applied, marked existing.
     const retry = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: v2, baseVersion: vFounder }])
-    expect(retry.json()).toMatchObject({ applied: [{ collection: 'people', id: 'p-founder', version: vTwo }], conflicts: [] })
-    // Nothing was logged for the rejected or repeated changes.
+    expect(retry.json()).toMatchObject({ applied: [{ collection: 'people', id: 'p-founder', version: vTwo, existing: true }], conflicts: [] })
+    // Once something newer is on top, retrying that write is a conflict that says it landed.
+    const v3 = (await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: { ...v2, title: 'Three' }, baseVersion: vTwo }])).json().applied[0].version
+    const late = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: v2, baseVersion: vFounder }])
+    expect(late.json().conflicts).toEqual([
+      { collection: 'people', id: 'p-founder', serverVersion: v3, serverData: normalize({ ...v2, title: 'Three' }), byYou: true, landed: true },
+    ])
+    // Nothing was logged for the rejected or repeated changes: only the two real writes.
     const pull = await app.inject({ method: 'GET', url: `/api/changes?since=${seq0}`, headers: h })
-    expect(pull.json().changes).toHaveLength(1)
+    expect(pull.json().changes.map((c: { version: number }) => c.version)).toEqual([vTwo, v3])
   })
 
-  it('deletes, then pulls the delete; a stale client edit can re-create the record', async () => {
+  it('deletes, then pulls the delete; a stale client edit cannot bring the record back, a re-create can', async () => {
     const res = await push(h, [{ collection: 'people', id: 'p-founder', op: 'delete', baseVersion: vFounder }])
     expect(res.json().applied).toEqual([{ collection: 'people', id: 'p-founder', version: seq0 + 1 }])
     const pull = await app.inject({ method: 'GET', url: `/api/changes?since=${seq0}`, headers: h })
@@ -1011,8 +1061,16 @@ describe('changes', () => {
     const again = await push(h, [{ collection: 'people', id: 'p-founder', op: 'delete', baseVersion: vFounder }])
     expect(again.json()).toMatchObject({ applied: [{ version: seq0 + 1 }], conflicts: [], seq: seq0 + 1 })
 
-    // An edit made against the deleted record is accepted (the record was deleted), with a newer version.
-    const back = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: small().people[0], baseVersion: vFounder }])
+    // An edit made on the copy from before the delete loses to it: the server wins, as for any newer
+    // change, and says the delete was this user's (r2-44).
+    const stale = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: small().people[0], baseVersion: vFounder }])
+    expect(stale.json()).toMatchObject({
+      applied: [],
+      conflicts: [{ collection: 'people', id: 'p-founder', serverVersion: null, serverData: null, byYou: true }],
+      seq: seq0 + 1,
+    })
+    // A client that saw the delete re-creates it as new (Undo), with a newer version.
+    const back = await push(h, [{ collection: 'people', id: 'p-founder', op: 'upsert', data: small().people[0], baseVersion: null }])
     expect(back.json().applied).toEqual([{ collection: 'people', id: 'p-founder', version: seq0 + 2 }])
   })
 
@@ -1165,7 +1223,8 @@ describe('serving the app', () => {
     const res = await served.inject({ method: 'GET', url: '/' })
     expect(res.statusCode).toBe(200)
     expect(res.headers['content-type']).toContain('text/html')
-    expect(res.body).toBe(html)
+    // The file as it is, plus the served mark (the app registers the offline worker only with it).
+    expect(res.body).toBe(html.replace('<!doctype html>', '<!doctype html><meta name="first-twenty-served" content="1">'))
     // Inline scripts are allowed by their hash only: no 'unsafe-inline' for scripts.
     const csp = String(res.headers['content-security-policy'])
     const sha = (text: string) => `'sha256-${createHash('sha256').update(text).digest('base64')}'`
@@ -1182,5 +1241,27 @@ describe('serving the app', () => {
     expect(api.statusCode).toBe(404)
     expect(api.json()).toEqual({ error: 'not_found' })
     await served.close()
+  })
+
+  it('serves the offline worker with the served app only, under its own strict policy (r2-47)', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'ft-app-'))
+    const appFile = path.join(dir, 'first-twenty.html')
+    writeFileSync(appFile, '<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <script>window.ok=1</script>\n  </head><body></body></html>')
+    const served = await makeApp(db, { serveApp: true, appFile })
+    const page = await served.inject({ method: 'GET', url: '/' })
+    // The mark goes right after <head>, so the charset stays near the top.
+    expect(page.body).toContain('<head><meta name="first-twenty-served" content="1">\n    <meta charset="UTF-8" />')
+    // The page may start workers from this server only.
+    expect(String(page.headers['content-security-policy'])).toContain("worker-src 'self'")
+    const sw = await served.inject({ method: 'GET', url: '/sw.js' })
+    expect(sw.statusCode).toBe(200)
+    expect(sw.headers['content-type']).toBe('application/javascript; charset=utf-8')
+    expect(sw.headers['cache-control']).toBe('no-cache')
+    expect(sw.headers['content-security-policy']).toBe("default-src 'none'; connect-src 'self'")
+    expect(sw.headers['x-content-type-options']).toBe('nosniff')
+    expect(sw.body).toContain("addEventListener('fetch'")
+    await served.close()
+    // Without the served app there is no worker to register.
+    expect((await app.inject({ method: 'GET', url: '/sw.js' })).statusCode).toBe(404)
   })
 })

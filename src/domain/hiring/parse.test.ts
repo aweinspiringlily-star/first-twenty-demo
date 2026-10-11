@@ -68,6 +68,27 @@ Oakland, CA`
     })
   })
 
+  it('reads a name pasted on one line with an email, a phone or a link', () => {
+    expect(parseCandidateBlob('Marco Bianchi marco.b@example.com')).toEqual({ firstName: 'Marco', lastName: 'Bianchi', email: 'marco.b@example.com' })
+    expect(parseCandidateBlob('marco.b@example.com Marco Bianchi')).toEqual({ firstName: 'Marco', lastName: 'Bianchi', email: 'marco.b@example.com' })
+    expect(parseCandidateBlob('marco.b@example.com | Marco Bianchi')).toMatchObject({ firstName: 'Marco', lastName: 'Bianchi' })
+    expect(parseCandidateBlob('Marco Bianchi, marco.b@example.com')).toMatchObject({ firstName: 'Marco', lastName: 'Bianchi' })
+    expect(parseCandidateBlob('Marco Bianchi (408) 555-0123')).toEqual({ firstName: 'Marco', lastName: 'Bianchi', phone: '(408) 555-0123' })
+    expect(parseCandidateBlob('Marco Bianchi +1 408 555 0123 marco.b@example.com')).toEqual({
+      firstName: 'Marco',
+      lastName: 'Bianchi',
+      email: 'marco.b@example.com',
+      phone: '(408) 555-0123',
+    })
+    // The line name wins over the profile slug.
+    expect(parseCandidateBlob('Ana de la Cruz https://www.linkedin.com/in/acruz-dev')).toMatchObject({ firstName: 'Ana', lastName: 'de la Cruz' })
+  })
+
+  it('never reads a contact label left beside a number as a name', () => {
+    expect(parseCandidateBlob('Work Phone (408) 555-0123\nMarco Bianchi')).toMatchObject({ firstName: 'Marco', lastName: 'Bianchi', phone: '(408) 555-0123' })
+    expect(parseCandidateBlob('Cell Phone: 408-555-0123')).toEqual({ phone: '(408) 555-0123' })
+  })
+
   it('does not read profile URL digits as a phone, and ignores empty input', () => {
     expect(parseCandidateBlob('linkedin.com/in/alex-5551234567').phone).toBeUndefined()
     expect(parseCandidateBlob('')).toEqual({})

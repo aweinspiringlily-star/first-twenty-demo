@@ -4,7 +4,7 @@ import type { Company, LinkOuts } from '@/domain/types'
 import { useDB } from '@/store/db'
 import { Badge, Field, FormGrid, Icon, Segmented, TextInput } from '@/ui'
 import { commit, EditablePanel, RowList, Row } from './kit'
-import { hostLabel, urlProblem } from './logic'
+import { hostLabel, linkProblem, normalizeWebsite, payrollProviderName } from './logic'
 
 type LinkKey = keyof LinkOuts
 
@@ -13,6 +13,7 @@ const LINKS: Array<{ key: LinkKey; label: string; what: string; placeholder: str
   { key: 'eSign', label: 'E-signature', what: 'Offer letters, PIIAs and policy acknowledgements are signed here.', placeholder: 'https://' },
   { key: 'capTable', label: 'Cap table tool', what: 'The source of truth for grants, exercises and 409A reports.', placeholder: 'https://' },
   { key: 'calendly', label: 'Scheduling link (Calendly)', what: 'Offered in interview scheduling messages.', placeholder: 'https://calendly.com/you' },
+  { key: 'videoRoom', label: 'Video meeting room', what: 'Prefilled as the link for video interviews, in the confirmation message and the calendar files.', placeholder: 'https://meet.google.com/' },
   { key: 'training', label: 'Security training provider', what: 'Linked from security awareness training tasks.', placeholder: 'https://' },
   { key: 'handbook', label: 'Employee handbook', what: 'Linked from acknowledgements and Me.', placeholder: 'https://' },
   { key: 'benefits', label: 'Benefits summary', what: 'Shared on job postings and in onboarding.', placeholder: 'https://' },
@@ -49,8 +50,11 @@ function ExternalLink({ url, label }: { url: string | undefined; label: string }
 
 export function LinksTab() {
   const company = useDB((s) => s.db.company)
+  const providerName = payrollProviderName(company)
+  // What the provider is called while it has no name.
+  const providerLabel = providerName || 'Payroll or PEO provider'
   const value: Draft = {
-    providerName: company.payrollProvider.name,
+    providerName,
     providerKind: company.payrollProvider.kind,
     providerUrl: company.payrollProvider.url || company.linkOuts.payroll || '',
     ...(Object.fromEntries(LINKS.map((l) => [l.key, company.linkOuts[l.key] ?? ''])) as Record<LinkKey, string>),
@@ -64,18 +68,20 @@ export function LinksTab() {
       value={value}
       editLabel="Edit links"
       saveLabel="Save links"
+      // A link typed without https:// ('secure.justworks.com') is saved with it, as Start fresh does.
       validate={(d) => {
-        const bad = [d.providerUrl, ...LINKS.map((l) => d[l.key])].map(urlProblem).find(Boolean)
-        return bad ? `One of the links needs fixing: ${bad}` : !d.providerName.trim() ? 'Name your payroll or PEO provider.' : null
+        const bad = [d.providerUrl, ...LINKS.map((l) => d[l.key])].map(linkProblem).find(Boolean)
+        return bad ? `One of the links needs fixing: ${bad}` : null
       }}
       onSave={(d) =>
         commit('Updated link-outs', (draft) => {
           const c = draft.company
-          c.payrollProvider = { name: d.providerName.trim(), kind: d.providerKind, url: d.providerUrl.trim() }
+          const providerUrl = normalizeWebsite(d.providerUrl)
+          c.payrollProvider = { name: d.providerName.trim(), kind: d.providerKind, url: providerUrl }
           const next: LinkOuts = {}
-          if (d.providerUrl.trim()) next.payroll = d.providerUrl.trim()
+          if (providerUrl) next.payroll = providerUrl
           for (const l of LINKS) {
-            const v = d[l.key].trim()
+            const v = normalizeWebsite(d[l.key])
             if (v) next[l.key] = v
           }
           c.linkOuts = next
@@ -84,10 +90,10 @@ export function LinksTab() {
       view={
         <RowList label="Link-outs">
           <Row
-            title={`Payroll or PEO: ${company.payrollProvider.name}`}
+            title={providerName ? `Payroll or PEO: ${providerName}` : providerLabel}
             badges={<Badge>{company.payrollProvider.kind === 'PEO' ? 'PEO' : 'Payroll provider'}</Badge>}
             meta="Pay, taxes, W-2s, I-9s, benefits enrollment and the sensitive records this app never keeps."
-            actions={<ExternalLink label={company.payrollProvider.name} url={company.payrollProvider.url || company.linkOuts.payroll} />}
+            actions={<ExternalLink label={providerLabel} url={company.payrollProvider.url || company.linkOuts.payroll} />}
           />
           {LINKS.map((l) => (
             <Row key={l.key} title={l.label} meta={l.what} actions={<ExternalLink label={l.label} url={company.linkOuts[l.key]} />} />
@@ -99,10 +105,12 @@ export function LinksTab() {
           <fieldset className="flex flex-col gap-3 rounded-xl border border-line p-3">
             <legend className="px-1 text-[13.5px] font-semibold text-ink-2">Payroll or PEO</legend>
             <FormGrid>
-              <Field label="Provider name" required>
-                {(id) => <TextInput id={id} value={d.providerName} onChange={(e) => set({ providerName: e.target.value })} />}
+              <Field label="Provider name">
+                {(id) => (
+                  <TextInput id={id} placeholder="Your payroll or PEO provider" value={d.providerName} onChange={(e) => set({ providerName: e.target.value })} />
+                )}
               </Field>
-              <Field label="Provider link" error={urlProblem(d.providerUrl)}>
+              <Field label="Provider link" error={linkProblem(d.providerUrl)}>
                 {(id, hint) => (
                   <TextInput id={id} aria-describedby={hint} inputMode="url" placeholder="https://" value={d.providerUrl} onChange={(e) => set({ providerUrl: e.target.value })} />
                 )}
@@ -120,7 +128,7 @@ export function LinksTab() {
           </fieldset>
           <FormGrid>
             {LINKS.map((l) => (
-              <Field key={l.key} label={l.label} error={urlProblem(d[l.key])} hint={urlProblem(d[l.key]) ? undefined : l.what}>
+              <Field key={l.key} label={l.label} error={linkProblem(d[l.key])} hint={linkProblem(d[l.key]) ? undefined : l.what}>
                 {(id, hint) => (
                   <TextInput
                     id={id}

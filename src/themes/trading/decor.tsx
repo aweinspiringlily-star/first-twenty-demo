@@ -11,18 +11,19 @@
 //   (the app's date and the time of day) is pinned at the right end, outside the moving strip.
 // - Headcount: a quote block in the rail: the symbol HC over the rail's own number, and a step
 //   sparkline of headcount history with the last value in a price-label box.
-// - Footer: a function-key bar of real links to the sections this viewer can see (plus F1 for search).
-//   The F numbers are labels only: no function keys are bound (they belong to the browser).
+// - Footer: a key bar of real links to the sections this viewer can see, plus Search with its real
+//   chord (Ctrl K) on a keycap. No F-number caps: function keys belong to the browser and nothing binds them.
 import { type CSSProperties, type Ref, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { openPalette } from '@/app/Header'
 import { activeNavKey, visibleNav } from '@/app/nav'
 import { useRoute } from '@/app/router'
+import { keyLabel, useShortcutList } from '@/app/shortcuts'
 import { useViewer } from '@/app/useViewer'
 import { canSeePipeline } from '@/domain/access'
 import { nextThreshold } from '@/domain/compliance'
 import { hiringMetrics } from '@/domain/hiring/metrics'
 import { inboxItems } from '@/domain/inbox'
-import { outstandingOffers, runway } from '@/domain/pay'
+import { outstandingOffers, RUNWAY_CAP_MONTHS, runway } from '@/domain/pay'
 import { headcountOn, headcountSeries, incomingOn } from '@/domain/people'
 import type { DB, Viewer } from '@/domain/types'
 import { addMonths, fmtDate, parseDate, today } from '@/lib/dates'
@@ -141,14 +142,16 @@ function tapeItems(db: DB, viewer: Viewer, date: string, blur: boolean): TapeIte
     }
     const rw = runway(db, date)
     if (rw.months != null) {
-      // A count of months, not pay: shown in the clear, as Cost and runway shows it while blurred.
-      const m = rw.months === Infinity ? 'INF' : `${rw.months >= 2 ? Math.round(rw.months) : rw.months.toFixed(1)}M`
+      // A count of months, not pay: shown in the clear, as Cost and runway shows it while blurred. Past
+      // RUNWAY_CAP_MONTHS the figure is capped ("60M+"), as Cost and runway says "More than 5 years".
+      const capped = rw.months !== Infinity && rw.months > RUNWAY_CAP_MONTHS
+      const m = rw.months === Infinity ? 'INF' : capped ? `${RUNWAY_CAP_MONTHS}M+` : `${rw.months >= 2 ? Math.round(rw.months) : rw.months.toFixed(1)}M`
       out.push({
         key: 'runway',
         sym: 'RUNWAY',
         value: m,
         tone: 'plain',
-        say: rw.months === Infinity ? 'Runway: cash is not going down' : `Runway ${m.replace('M', ' months')}`,
+        say: rw.months === Infinity ? 'Runway: cash is not going down' : capped ? 'Runway more than 5 years' : `Runway ${m.replace('M', ' months')}`,
       })
     }
     if (rw.netBurnMonthly > 0) {
@@ -353,32 +356,33 @@ function HeadcountQuote({ count, incoming }: HeadcountDecorProps) {
   )
 }
 
-/** F1 to F8: fixed per section, so a key keeps its number when a section is hidden in another view. */
-const FKEYS: Record<string, string> = { home: 'F2', hiring: 'F3', people: 'F4', comp: 'F5', compliance: 'F6', me: 'F7', settings: 'F8' }
-
-/** The function-key bar at the bottom of the main column: real links, labeled with the nav's own words. */
+/**
+ * The key bar at the bottom of the main column: real links, labeled with the nav's own words. Only a key
+ * that really works gets a keycap (Search shows its chord from the shortcut registry); the sections have
+ * no keys, so they show none rather than F numbers the browser owns (F3 is Find).
+ */
 function FunctionKeys() {
   const viewer = useViewer()
   const route = useRoute()
   const active = activeNavKey(route.view, viewer)
   const items = visibleNav(viewer)
+  const search = useShortcutList().find((s) => s.keys === 'mod+k')
   return (
-    <nav className="ft-tr-fkeys" aria-label="Function keys">
+    <nav className="ft-tr-fkeys" aria-label="Quick links">
       <ul className="ft-tr-fkeys__list">
         <li>
-          <button type="button" className="ft-tr-fkey" onClick={openPalette}>
-            <span className="ft-tr-fkey__key" aria-hidden>
-              F1
-            </span>
+          <button type="button" className="ft-tr-fkey" onClick={openPalette} aria-keyshortcuts={search ? 'Control+K Meta+K' : undefined}>
+            {search && (
+              <span className="ft-tr-fkey__key" aria-hidden>
+                {keyLabel(search.keys).join(' ')}
+              </span>
+            )}
             <span className="ft-tr-fkey__label">Search</span>
           </button>
         </li>
         {items.map((n) => (
           <li key={n.key}>
             <a href={n.href} className="ft-tr-fkey" aria-current={n.key === active ? 'page' : undefined}>
-              <span className="ft-tr-fkey__key" aria-hidden>
-                {FKEYS[n.key]}
-              </span>
               <span className="ft-tr-fkey__label">{n.label}</span>
             </a>
           </li>

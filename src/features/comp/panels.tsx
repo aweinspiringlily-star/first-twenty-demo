@@ -5,17 +5,17 @@ import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { canSeePerson } from '@/domain/access'
-import { cancellationPending, cliffDate, fullyVestedDate, grantsFor, grantSummary, pctOfFullyDiluted, scheduleText, vestedHeld } from '@/domain/equity'
-import { currentJob } from '@/domain/lifecycle'
-import { bandForPerson, bandLabel, compaRatio, compHistory, fullTimeEquivalentBase, peopleCostSummary } from '@/domain/pay'
+import { cancellationPending, cliffDate, fullyVestedDate, grantsFor, grantSummary, pctOfFullyDiluted, scheduleText, vestedHeld, vestingStop } from '@/domain/equity'
+import { bandFor, bandLabel, compaRatio, compHistoryByLastDay, fullTimeEquivalentBase, peopleCostSummary } from '@/domain/pay'
+import { canCancelChange, cancelScheduledChange, compReasonLabel } from '@/domain/lifecycle'
 import { fullName, personNameById } from '@/domain/people'
 import type { CompRecord, EquityGrant, ID } from '@/domain/types'
-import { fmtDate, fmtDay, today } from '@/lib/dates'
+import { daysBetween, fmtDate, fmtDay, fmtShort, today } from '@/lib/dates'
 import { money, money2, num, pct } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Badge, Button, Callout, CitationChip, DataTable, EmptyState, Money, Panel, Private, type Column } from '@/ui'
+import { Badge, Button, Callout, CitationChip, DataTable, EmptyState, focusPageStart, Money, Panel, Private, toast, type Column } from '@/ui'
 import { ChangeJobSheet } from './ChangeJobSheet'
-import { cliffCountdown, combinedVesting, overtimeStatusText, REASON_LABEL, variableLabel, vestingMilestones } from './helpers'
+import { changeParts, cliffCountdown, combinedVesting, overtimeStatusText, REASON_LABEL, variableLabel, vestingMilestones } from './helpers'
 import { BandTrack, MoneyText, VestingChart } from './shared'
 
 export { ChangeJobSheet } from './ChangeJobSheet'
@@ -67,15 +67,46 @@ export function PersonJobPayPanel({ personId, hideAction }: { personId: ID; hide
       </Callout>
     )
   }
-  const history = compHistory(db, personId)
-  const cur = currentJob(db, personId, date) ?? history[0]
-  const band = bandForPerson(db, person, date)
+  // Rows dated after the last day never take effect: they stay out of the history, the schedule and the current job.
+  const { history, afterLastDay, lastDay } = compHistoryByLastDay(db, person)
+  const upToDate = history.filter((r) => r.effectiveOn <= date)
+  const cur = upToDate[upToDate.length - 1] ?? history[0]
+  const band = bandFor(db, person.familyId, cur?.levelId ?? person.levelId)
   const level = db.levels.find((l) => l.id === (cur?.levelId ?? person.levelId))
   const family = db.families.find((f) => f.id === person.familyId)
   const fte = cur ? fullTimeEquivalentBase(cur, person.hoursPerWeek) : null
   const scheduled = history.filter((r) => r.effectiveOn > date)
   const rows = [...history].reverse()
   const isAdmin = viewer.role === 'admin'
+
+  // The button goes away with the row it cancels: focus moves to another scheduled row's button or the
+  // panel's Change job or pay button, never to the page body.
+  const cancelChange = (r: CompRecord, trigger: HTMLElement | null) => {
+    const check = canCancelChange(db, r.id)
+    if (!check.ok) {
+      toast({ text: check.reason, tone: 'bad' })
+      return
+    }
+    const label = `Cancelled the ${compReasonLabel(r.reason)} scheduled for ${fmtDate(r.effectiveOn)}`
+    useDB.getState().mutate(label, (d) => {
+      cancelScheduledChange(d, r.id, { date, actorId: viewer.personId })
+    })
+    toast({ text: label, action: { label: 'Undo', onClick: () => useDB.getState().undo() } })
+    let frames = 0
+    const settle = () => {
+      // Wait for the re-render that removes the button; if it stays, focus stays on it.
+      if (trigger?.isConnected) {
+        if (frames++ < 10) requestAnimationFrame(settle)
+        return
+      }
+      const active = document.activeElement
+      if (active && active !== document.body && active.isConnected) return
+      const next = document.querySelector<HTMLElement>('[data-cancel-change], [data-change-job]')
+      if (next) next.focus()
+      else focusPageStart()
+    }
+    requestAnimationFrame(settle)
+  }
 
   const columns: Array<Column<CompRecord>> = [
     {
@@ -118,7 +149,7 @@ export function PersonJobPayPanel({ personId, hideAction }: { personId: ID; hide
       subtitle={self ? 'Your job and pay history' : `${fullName(person)}'s job${seePay ? ' and pay' : ''} history`}
       actions={
         isAdmin && !hideAction ? (
-          <Button icon="edit" onClick={() => setChanging(true)}>
+          <Button icon="edit" data-change-job onClick={() => setChanging(true)}>
             Change job or pay
           </Button>
         ) : undefined
@@ -147,15 +178,57 @@ export function PersonJobPayPanel({ personId, hideAction }: { personId: ID; hide
         </div>
 
         {scheduled.length > 0 && (
-          <Callout tone="accent" title={`Change scheduled for ${fmtDay(scheduled[0].effectiveOn)}`}>
-            {REASON_LABEL[scheduled[0].reason]}: {scheduled[0].title}
-            {seePay && (
-              <>
-                {', '}
-                <Private>{payText(scheduled[0])}</Private>
-              </>
-            )}
-            . It takes effect on that date.
+          <Callout tone="accent" title={scheduled.length === 1 ? `Change scheduled for ${fmtDay(scheduled[0].effectiveOn)}` : `${scheduled.length} changes scheduled`}>
+            <ul className="flex flex-col gap-1.5">
+              {scheduled.map((r) => {
+                const parts = changeParts(db, r, history[history.indexOf(r) - 1]).filter((p) => seePay || (p.kind !== 'pay' && p.kind !== 'variable'))
+                return (
+                  <li key={r.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                    <span>
+                      {scheduled.length > 1 && <span className="font-semibold">{fmtDay(r.effectiveOn)}: </span>}
+                      {REASON_LABEL[r.reason]}
+                      {parts.length > 0 && ': '}
+                      {parts.map((p, i) => (
+                        <span key={p.kind}>
+                          {i > 0 && ', '}
+                          {p.kind === 'pay' || p.kind === 'variable' ? <Private>{p.text}</Private> : p.text}
+                        </span>
+                      ))}
+                      .
+                    </span>
+                    {isAdmin && canCancelChange(db, r.id).ok && (
+                      <Button size="sm" variant="secondary" icon="x" data-cancel-change onClick={(e) => cancelChange(r, e.currentTarget)}>
+                        Cancel scheduled change
+                      </Button>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+            <p className="mt-1">
+              {scheduled.length === 1 ? 'It takes effect on that date.' : 'Each takes effect on its date.'}
+              {isAdmin && scheduled.length > 1 && ' To cancel an earlier one, cancel the later ones first.'}
+            </p>
+          </Callout>
+        )}
+
+        {seeJob && lastDay && afterLastDay.length > 0 && (
+          <Callout tone="neutral" title={`Will not take effect: last day is ${fmtShort(lastDay)}`}>
+            <ul className="flex flex-col gap-0.5">
+              {afterLastDay.map((r) => (
+                <li key={r.id}>
+                  {REASON_LABEL[r.reason]}: {r.title}
+                  {seePay && (
+                    <>
+                      {', '}
+                      <Private>{payText(r)}</Private>
+                    </>
+                  )}
+                  , scheduled for {fmtDay(r.effectiveOn)}.
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1">{afterLastDay.length === 1 ? 'It is' : 'They are'} left out of the job and pay history below.</p>
           </Callout>
         )}
 
@@ -242,7 +315,8 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
   const name = person ? fullName(person) : (contractor?.name ?? 'This person')
   const first = person ? person.preferredName || person.firstName : name.split(' ')[0]
   const summary = useMemo(() => grantSummary(db, personId, date), [db, personId, date])
-  const points = useMemo(() => combinedVesting(summary.grants), [summary.grants])
+  // A leaver's line goes flat at the last day, even before the cancellation is recorded.
+  const points = useMemo(() => combinedVesting(summary.grants, (g) => vestingStop(db, g)), [db, summary.grants])
 
   if (!canSeePerson(viewer, db, personId, 'equity')) {
     return (
@@ -281,11 +355,22 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
   }
   const grants = summary.grants
   const start = grants.map((g) => g.vestingStart).sort()[0]
-  const end = summary.fullyVestedOn ?? grants.map((g) => fullyVestedDate(g)).sort().reverse()[0]
-  const lastDay = person?.endDate ?? contractor?.endOn ?? null
+  // Anyone with a last day (a separation in progress counts) is leaving: vesting, the chart and the table stop there.
+  const exit = summary.exit
+  const lastDay = exit?.lastDay ?? person?.endDate ?? contractor?.endOn ?? null
   const left = !!lastDay && lastDay < date
+  const leaving = !!exit && !left
+  const scheduleEnd = summary.fullyVestedOn ?? grants.map((g) => fullyVestedDate(g)).sort().reverse()[0]
+  const end = exit && exit.lastDay > start ? exit.lastDay : scheduleEnd
   const cliffGrant = summary.cliff ? grants.find((g) => g.cliffMonths > 0 && cliffDate(g) === summary.cliff?.date) : undefined
-  const statusTone = summary.status === 'awaiting_board' ? 'warn' : summary.status === 'ended' ? 'outline' : summary.status === 'fully_vested' ? 'good' : 'accent'
+  const statusTone =
+    summary.status === 'awaiting_board' || summary.status === 'leaving'
+      ? 'warn'
+      : summary.status === 'ended'
+        ? 'outline'
+        : summary.status === 'fully_vested'
+          ? 'good'
+          : 'accent'
   const statusLabel: Record<typeof summary.status, string> = {
     none: 'No grants',
     reserved: 'Reserved',
@@ -293,14 +378,35 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
     pre_cliff: 'Before the cliff',
     vesting: 'Vesting',
     fully_vested: 'Fully vested',
+    leaving: 'Leaving',
     ended: 'Ended',
   }
-  const exerciseBy = person?.separation?.exerciseDeadline
+  const exerciseBy = exit?.exerciseBy ?? person?.separation?.exerciseDeadline
+  const exerciseDays = exerciseBy && lastDay ? daysBetween(lastDay, exerciseBy) : 90
   const earlyEx = grants.find((g) => g.earlyExercise && g.election83bDueOn)
 
   const columns: Array<Column<EquityGrant>> = [
     { key: 'type', header: 'Type', cell: (g) => (g.type === 'RSA' ? 'Restricted stock' : g.type) },
-    { key: 'shares', header: 'Options', align: 'right', sort: (g) => g.shares, cell: (g) => <Private>{num(g.shares)}</Private> },
+    {
+      key: 'shares',
+      header: 'Options',
+      align: 'right',
+      sort: (g) => g.shares,
+      cell: (g) => {
+        // What goes back to the pool at the last day: recorded as cancelled, or not yet vested by then.
+        const back = exit ? g.shares - vestedHeld(db, g, exit.lastDay) : 0
+        return (
+          <Private>
+            {num(g.shares)}
+            {back > 0 && (
+              <span className="block text-[11.5px] text-ink-3">
+                {num(back)} {left ? 'returned' : 'return'} {fmtShort(exit?.lastDay)}
+              </span>
+            )}
+          </Private>
+        )
+      },
+    },
     {
       key: 'strike',
       header: 'Strike',
@@ -339,19 +445,52 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
         </div>
 
         <div className="grid grid-cols-2 gap-x-6 gap-y-3.5 sm:grid-cols-4">
-          <Small label="Total options">
-            <Private>{num(summary.totalShares)}</Private>
-          </Small>
-          <Small label="Vested today">
-            <Private>{num(summary.vested)}</Private>
-          </Small>
-          <Small label="Unvested">
-            <Private>{num(summary.unvested)}</Private>
-          </Small>
-          <Small label="Of fully diluted">
-            <Private>{pct(summary.pctFullyDiluted, 3)}</Private>
-          </Small>
+          {exit ? (
+            <>
+              <Small label={left ? 'Kept after leaving' : 'Kept at the last day'}>
+                <Private>{num(exit.vestedAtExit)}</Private>
+              </Small>
+              <Small label="Vested today">
+                <Private>{num(summary.vested)}</Private>
+              </Small>
+              <Small label={left ? 'Went back to the pool' : 'Go back to the pool'}>
+                <Private>{num(exit.returnsToPool)}</Private>
+              </Small>
+              <Small label="Of fully diluted">
+                <Private>{pct(pctOfFullyDiluted(db, exit.vestedAtExit), 3)}</Private>
+              </Small>
+            </>
+          ) : (
+            <>
+              <Small label="Total options">
+                <Private>{num(summary.totalShares)}</Private>
+              </Small>
+              <Small label="Vested today">
+                <Private>{num(summary.vested)}</Private>
+              </Small>
+              <Small label="Unvested">
+                <Private>{num(summary.unvested)}</Private>
+              </Small>
+              <Small label="Of fully diluted">
+                <Private>{pct(summary.pctFullyDiluted, 3)}</Private>
+              </Small>
+            </>
+          )}
         </div>
+
+        {leaving && exit && (
+          <Callout tone="warn" icon="clock" title={`Vesting stops ${fmtDay(exit.lastDay)}, the last day`}>
+            <Private>{num(exit.vestedAtExit)}</Private> options {exit.lastDay === date ? 'have vested' : 'will have vested by then'};{' '}
+            {exit.returnsToPool > 0 ? (
+              <>
+                the other <Private>{num(exit.returnsToPool)}</Private> go back to the pool {exit.lastDay === date ? 'today' : 'that day'}.
+              </>
+            ) : (
+              'nothing goes back to the pool.'
+            )}
+            {exit.exerciseBy && ` Vested options can be exercised until ${fmtDate(exit.exerciseBy)}.`}
+          </Callout>
+        )}
 
         {!left && summary.cliff && !summary.cliff.passed && cliffGrant && (
           <Callout tone="accent" icon="clock" title={cliffCountdown(summary.cliff.date, cliffGrant.vestingMonths, date)}>
@@ -381,7 +520,7 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
           {table ? (
             <div className="rounded-xl border border-line">
               <DataTable
-                rows={vestingMilestones(points, start)}
+                rows={vestingMilestones(points, start, exit?.lastDay)}
                 rowKey={(r) => r.date}
                 dense
                 caption="Vested options at each anniversary"
@@ -403,12 +542,16 @@ export function PersonEquityPanel({ personId }: { personId: ID }) {
 
         <div className="rounded-xl bg-surface-2 px-4 py-3 text-[14px] text-ink-2">
           <p className="font-semibold text-ink">Exercise window</p>
-          {left && lastDay ? (
+          {(left || leaving) && lastDay ? (
             <p className="mt-1">
               {exerciseBy
-                ? `Vested options can be exercised until ${fmtDate(exerciseBy)}, 90 days after the last day (${fmtDate(lastDay)}).`
-                : `Vested options can be exercised for 90 days after the last day (${fmtDate(lastDay)}).`}{' '}
-              Unvested options went back to the pool.
+                ? `Vested options can be exercised until ${fmtDate(exerciseBy)}, ${exerciseDays} days after the last day (${fmtDate(lastDay)}).`
+                : exit && exit.vestedAtExit === 0
+                  ? `Nothing vested by the last day (${fmtDate(lastDay)}), so there is nothing to exercise.`
+                  : `Vested options can be exercised for 90 days after the last day (${fmtDate(lastDay)}).`}{' '}
+              {left
+                ? 'Unvested options went back to the pool.'
+                : 'Unvested options go back to the pool on the last day. To keep ISO tax treatment, exercise within 3 months of leaving.'}
             </p>
           ) : (
             <p className="mt-1">

@@ -5,6 +5,7 @@ import {
   estimateTwentyWeeks,
   eventHit,
   firstDateAtOrAbove,
+  firstPaidEmployeeOn,
   offerPhantoms,
   projectionDB,
   qualifyingWeeks,
@@ -244,13 +245,24 @@ describe('first crossings and projections', () => {
     expect(projectionDB(db, '2026-10-09', false).people).toHaveLength(2)
     expect(projectionDB(db, '2026-10-09', true).people).toHaveLength(3)
   })
+
+  it('leaves out offers past their expiry date: they can no longer be accepted', () => {
+    const db = makeDB()
+    addOffer(db, { id: 'o-open', startDate: '2026-11-09', status: 'sent', expiresOn: '2026-10-19' })
+    addOffer(db, { id: 'o-lapsed', startDate: '2026-11-09', status: 'sent', expiresOn: '2026-10-14' })
+    addOffer(db, { id: 'o-approved-lapsed', startDate: '2026-11-16', status: 'approved', expiresOn: '2026-10-16' })
+    addOffer(db, { id: 'o-closed', startDate: '2026-11-16', status: 'expired', expiresOn: '2026-10-15' })
+    expect(offerPhantoms(db, '2026-10-19').map((x) => x.offer.id)).toEqual(['o-open'])
+    expect(offerPhantoms(db, '2026-10-20')).toEqual([])
+  })
 })
 
 describe('events', () => {
   it('reports each first-time event with its date', () => {
     const db = ledgerlarkLite()
     const d = '2026-10-09'
-    expect(eventHit(db, 'first_payroll', d)?.date).toBe('2025-02-03')
+    // The founder has no pay on record, so the first payroll is estimated from the first paid employee.
+    expect(eventHit(db, 'first_payroll', d)).toMatchObject({ date: '2025-05-12', personId: 'p-tomas', estimated: true })
     expect(eventHit(db, 'first_non_owner_employee', d)?.date).toBe('2025-05-12')
     expect(eventHit(db, 'first_contractor', d)?.text).toContain('Northline Finance Partners LLC')
     expect(eventHit(db, 'first_out_of_state_employee', d)).toMatchObject({ date: '2026-03-02', personId: 'p-caleb' })
@@ -261,6 +273,47 @@ describe('events', () => {
     expect(eventHit(db, 'first_visa_sponsorship', d)).toBeUndefined()
     expect(eventHit(db, 'ccpa_revenue', d)).toBeUndefined()
     expect(eventHit(db, 'credit_check', d)).toBeUndefined()
+  })
+
+  it('estimates the first payroll from the first paid W-2 start, leaving out unpaid owners', () => {
+    const db = makeDB('2026-01-01')
+    // Only an unpaid founder: no payroll yet.
+    expect(eventHit(db, 'first_payroll', '2026-10-10')).toBeUndefined()
+    // A $0 founder record still is not pay.
+    db.comp.push({ id: 'cr-f0', personId: 'p-founder', effectiveOn: '2026-01-01', payType: 'salary', salary: 0, title: 'CEO', levelId: 'lv-l3', reason: 'hire' })
+    expect(eventHit(db, 'first_payroll', '2026-10-10')).toBeUndefined()
+    // The first employee is paid from their start, whatever the pay field says.
+    addPerson(db, { id: 'p-first', firstName: 'Sam', lastName: 'Rivera', startDate: '2026-11-02' })
+    const hit = eventHit(db, 'first_payroll', '2026-10-10')
+    expect(hit).toMatchObject({ date: '2026-11-02', personId: 'p-first', estimated: true })
+    expect(hit?.text).toBe(
+      'Estimated from the first paid W-2 start on record: Sam Rivera on Nov 2, 2026. Owners with no pay recorded are left out. Add the first payroll date in Settings for an exact date.',
+    )
+    // A founder salary that starts in March is the first payroll.
+    db.comp.push({ id: 'cr-f1', personId: 'p-founder', effectiveOn: '2026-03-02', payType: 'salary', salary: 120000, title: 'CEO', levelId: 'lv-l3', reason: 'merit' })
+    expect(eventHit(db, 'first_payroll', '2026-10-10')).toMatchObject({ date: '2026-03-02', personId: 'p-founder', estimated: true })
+    // A recorded date is a fact, not an estimate.
+    db.company.firstPayrollOn = '2026-03-13'
+    const recorded = eventHit(db, 'first_payroll', '2026-10-10')
+    expect(recorded).toMatchObject({ date: '2026-03-13' })
+    expect(recorded?.estimated).toBeUndefined()
+  })
+
+  it('dates the first paid employee: a first hire, or the day an owner starts being paid', () => {
+    const db = makeDB('2026-01-01')
+    // An unpaid founder alone has never been a paid employee.
+    expect(firstPaidEmployeeOn(db)).toBeUndefined()
+    addPerson(db, { id: 'p-gone', startDate: '2026-04-06', endDate: '2026-05-29' })
+    addPerson(db, { id: 'p-first', startDate: '2026-11-02' })
+    // A hire who has left still counts from the day they started; `through` stops before later dates.
+    expect(firstPaidEmployeeOn(db)).toBe('2026-04-06')
+    expect(firstPaidEmployeeOn(db, '2026-04-05')).toBeUndefined()
+    db.people = db.people.filter((p) => p.id !== 'p-gone')
+    expect(firstPaidEmployeeOn(db, '2026-10-11')).toBeUndefined()
+    expect(firstPaidEmployeeOn(db, '2026-11-02')).toBe('2026-11-02')
+    // A founder salary from Mar 2 comes first.
+    db.comp.push({ id: 'cr-f1', personId: 'p-founder', effectiveOn: '2026-03-02', payType: 'salary', salary: 120000, title: 'CEO', levelId: 'lv-l3', reason: 'merit' })
+    expect(firstPaidEmployeeOn(db)).toBe('2026-03-02')
   })
 
   it('uses the 25102(o) first issuance date, revenue and job credit checks when present', () => {

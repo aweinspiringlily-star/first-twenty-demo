@@ -60,6 +60,17 @@ export function canSeePerson(v: Viewer, db: DB, personId: ID, area: PersonArea):
   return false
 }
 
+/**
+ * A departure that has not happened yet (a last day still ahead): Admin, the person and their manager
+ * line see it; everyone else sees the person as Active until they are alumni (SPEC: Viewing as rules,
+ * an employee sees only name, title, team, manager, location, start date and work anniversary).
+ */
+export function canSeeSeparation(v: Viewer, db: DB, personId: ID): boolean {
+  if (v.role === 'admin') return true
+  if (v.personId === personId) return true
+  return v.role === 'manager' && isInReportingLine(v, db, personId)
+}
+
 // ---- Hiring -----------------------------------------------------------------------------------
 
 export function isHiringManager(v: Viewer, job: Job): boolean {
@@ -178,9 +189,15 @@ export function referredBy(v: Viewer, db: DB): ID[] {
 
 // ---- Time off ---------------------------------------------------------------------------------
 
+/**
+ * Admin approves anything; a manager approves their direct reports' requests. A pending request on an
+ * auto-approve policy (sick leave) is waiting only because it falls before the service wait, and
+ * waiving that or recording it as unpaid is Admin's call.
+ */
 export function canApproveTimeOff(v: Viewer, db: DB, req: TimeOffRequest): boolean {
   if (v.role === 'admin') return true
   if (v.role !== 'manager' || !v.personId) return false
+  if (db.timeOffPolicies.find((p) => p.id === req.policyId)?.autoApprove) return false
   const person = db.people.find((p) => p.id === req.personId)
   return person?.managerId === v.personId
 }

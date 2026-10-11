@@ -2,6 +2,7 @@
 // SLA badges, the sweep queue and summary, the talent pool, candidate search, the timeline, stage
 // editing and quick-add validation. No store imports: everything takes db (and a date) so it is
 // testable. Rules come from src/domain (access.ts, hiring/*); this file only shapes data for the UI.
+import { links } from '@/app/router'
 import { canSeeApplication, canSeeCandidate, canSeeOthersScorecards, canSeePipeline } from '@/domain/access'
 import {
   attentionReasons,
@@ -45,6 +46,7 @@ import type {
 } from '@/domain/types'
 import { type ISODate, type ISODateTime, localDateOf, parseDate, toISODate } from '@/lib/dates'
 import { mailtoHref } from '@/lib/email'
+import { MAX_RECORD_BYTES } from '@/sync/protocol'
 
 // ---- Visibility -------------------------------------------------------------------------------
 
@@ -725,4 +727,156 @@ export function textIssueError(issues: TextIssue[]): string | undefined {
   const b = issues.find((i) => i.blocks)
   if (!b) return undefined
   return b.law === 'criminal' ? 'Criminal history cannot be saved before a conditional offer. Take it out to save.' : 'Pay history cannot be saved. Take it out to save.'
+}
+
+// ---- Note length (sync limit) -----------------------------------------------------------------
+
+/**
+ * The longest note one box accepts. Each record syncs as at most 256 KB (docs/SYNC.md), and a note,
+ * scorecard note or offer note lives inside one record, so a single box stays far below that.
+ */
+export const NOTE_MAX_CHARS = 20_000
+
+/** Show the character count once a note gets this close to the limit. */
+export const NOTE_COUNT_FROM = 18_000
+
+/** The record a note is saved into may not pass this many characters of JSON (under the 256 KB limit). */
+export const RECORD_MAX_CHARS = 200_000
+
+/**
+ * Why a note cannot be saved: longer than NOTE_MAX_CHARS, or the record it lands in would pass
+ * RECORD_MAX_CHARS of JSON once it is added (`recordChars`: the record's JSON length before it).
+ */
+export function noteLengthError(text: string, recordChars = 0): string | undefined {
+  if (text.length > NOTE_MAX_CHARS) return `Notes can be up to ${NOTE_MAX_CHARS.toLocaleString('en-US')} characters. Shorten this one.`
+  if (recordChars + JSON.stringify(text).length > RECORD_MAX_CHARS) return 'This note is too long to sync. Shorten it.'
+  return undefined
+}
+
+/** '18,250 of 20,000 characters' near the limit, else null. */
+export function noteCountText(text: string): string | null {
+  return text.length >= NOTE_COUNT_FROM ? `${text.length.toLocaleString('en-US')} of ${NOTE_MAX_CHARS.toLocaleString('en-US')} characters` : null
+}
+
+// ---- Job size (sync limit) --------------------------------------------------------------------
+
+/** The longest job description the box accepts (maxLength). A long posting runs a few thousand characters. */
+export const JOB_DESC_MAX_CHARS = 20_000
+
+/** '18,250 of 20,000 characters' once a job description gets near the limit, else null. */
+export function jobDescCountText(text: string): string | null {
+  return text.length >= JOB_DESC_MAX_CHARS - 2_000 ? `${text.length.toLocaleString('en-US')} of ${JOB_DESC_MAX_CHARS.toLocaleString('en-US')} characters` : null
+}
+
+/**
+ * Why a job cannot be saved for its size: a description over JOB_DESC_MAX_CHARS, or a job record whose
+ * JSON passes MAX_RECORD_BYTES (the most the server takes for one record), so the change could never
+ * sync. Pass `descriptionChanged: false` when the description was not edited, so an older long one does
+ * not block other edits (the record check still applies).
+ */
+export function jobSizeError(job: Job, opts: { descriptionChanged?: boolean } = {}): string | undefined {
+  if (opts.descriptionChanged !== false && job.description.length > JOB_DESC_MAX_CHARS) {
+    return `A job description can be up to ${JOB_DESC_MAX_CHARS.toLocaleString('en-US')} characters. Shorten this one.`
+  }
+  if (new TextEncoder().encode(JSON.stringify(job)).length > MAX_RECORD_BYTES) return 'This job is too large to sync. Shorten the description.'
+  return undefined
+}
+
+// ---- Remote jobs and locations ----------------------------------------------------------------
+
+type JobLocation = Pick<DB['locations'][number], 'id' | 'kind' | 'state'>
+
+/** True when no remote location is picked (only offices, or nothing), which a remote job should not quote. */
+export function officeOnly(locations: JobLocation[], selected: ID[]): boolean {
+  return !locations.some((l) => l.kind === 'remote' && selected.includes(l.id))
+}
+
+/**
+ * The locations to pick when a job's work mode becomes Remote and only offices are picked: the
+ * workspace's remote location in the same state as the first office (Remote (California) for San Jose
+ * HQ), else its first remote location. The posting and the offer letter quote the location, so a remote
+ * job left on the office would give the HQ street address. Undefined when nothing should change: a
+ * remote location is already picked, or the workspace has none (the sheet shows a hint instead).
+ */
+export function remoteLocationsFor(locations: JobLocation[], selected: ID[]): ID[] | undefined {
+  if (!officeOnly(locations, selected)) return undefined
+  const remotes = locations.filter((l) => l.kind === 'remote')
+  const state = locations.find((l) => selected.includes(l.id))?.state
+  const best = remotes.find((l) => l.state === state) ?? remotes[0]
+  return best ? [best.id] : undefined
+}
+
+// ---- Pay sanity -------------------------------------------------------------------------------
+
+/**
+ * A typo check for pay fields: annual pay above $2,000,000 or an hourly rate above $1,000 is almost
+ * certainly a slip (an extra digit, two numbers run together). Returns the field error, or undefined.
+ */
+export function payTooHighError(value: number | null | undefined, basis: 'annual' | 'hourly'): string | undefined {
+  if (value == null) return undefined
+  return value > (basis === 'hourly' ? 1_000 : 2_000_000) ? 'That looks too high. Check the number.' : undefined
+}
+
+// ---- Desired pay unit -------------------------------------------------------------------------
+
+/**
+ * True when a candidate's desired pay can be asked by the hour for these jobs: one is posted with an
+ * hourly range (under $1,000, as payRangeLine reads it) or is part time. Desired pay only, never pay
+ * history (Labor Code 432.3).
+ */
+export function hourlyDesiredFits(jobs: Array<Pick<Job, 'payMax' | 'employmentType'> | undefined>): boolean {
+  return jobs.some((j) => !!j && ((j.payMax != null && j.payMax < 1000) || j.employmentType === 'part_time'))
+}
+
+/**
+ * The amount when the desired pay unit switches. A figure that only makes sense in the new unit is
+ * converted at 2,080 hours ($62,000 a year becomes $29.75 an hour, $30 an hour becomes $62,000 a year);
+ * one that already reads right in the new unit (typed before the unit was picked) stays as typed.
+ */
+export function switchDesiredUnit(amount: number | null, to: 'year' | 'hour'): number | null {
+  if (amount == null) return null
+  if (to === 'hour') return amount >= 1000 ? Math.round((amount / 2080) * 4) / 4 : amount
+  return amount < 1000 ? Math.round((amount * 2080) / 1000) * 1000 : amount
+}
+
+// ---- Edit sheets: save only what changed ------------------------------------------------------
+
+function sameJSON(a: unknown, b: unknown): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** The fields the user changed in an edit sheet: `draft` against the record as it was when the sheet opened. */
+export function changedFields<T extends object>(initial: T, draft: T): Array<keyof T> {
+  return (Object.keys(draft) as Array<keyof T>).filter((k) => !sameJSON(initial[k], draft[k]))
+}
+
+/**
+ * Fields the user changed that also changed in the store since the sheet opened (another computer
+ * saved them, and a pull brought it in): saving would overwrite that change. Fields where both sides
+ * landed on the same value are not conflicts.
+ */
+export function conflictingFields<T extends object>(initial: T, draft: T, current: T): Array<keyof T> {
+  return changedFields(initial, draft).filter((k) => !sameJSON(current[k], initial[k]) && !sameJSON(current[k], draft[k]))
+}
+
+// ---- Sender without a work email -------------------------------------------------------------
+
+/**
+ * What to say when the person a hiring email goes out from has no work email on file (Start fresh never
+ * guesses one): the same words on the interview invite, the close-out note and the welcome banner. Only
+ * Admin sets work emails (on the person page), so other views say to ask Admin.
+ */
+export function missingWorkEmailHint(
+  viewer: Pick<Viewer, 'role' | 'personId'>,
+  senderId: ID | null | undefined,
+  senderName: string,
+): { text: string; link?: { href: string; label: string } } {
+  const self = !!senderId && senderId === viewer.personId
+  const whose = self ? 'your' : `${senderName}'s`
+  const reach = self ? 'replies reach you' : 'replies reach them'
+  if (viewer.role !== 'admin') return { text: `Ask Admin to add ${whose} work email to ${self ? 'your' : 'their'} profile so ${reach}.` }
+  return {
+    text: `Add ${whose} work email to ${self ? 'your' : 'their'} profile so ${reach}.`,
+    link: senderId ? { href: links.person(senderId), label: self ? 'Open your profile' : 'Open their profile' } : { href: links.settings('company'), label: 'Open Settings' },
+  }
 }

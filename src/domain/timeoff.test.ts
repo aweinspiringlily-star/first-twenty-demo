@@ -2,6 +2,7 @@ import { produce } from 'immer'
 import { describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
 import {
+  approveAsUnpaid,
   approveRequest,
   balances,
   cancelRequest,
@@ -14,7 +15,9 @@ import {
   pendingApprovals,
   policyAvailable,
   requestHours,
+  serviceWait,
   timeOffICS,
+  unpaidPolicyFor,
   vacationPayout,
   whoIsOut,
   workdays,
@@ -219,6 +222,44 @@ describe('sick leave on a rehire (Labor Code 246(g)(2))', () => {
     expect(r.usableFrom).toBeUndefined()
     expect(r.note).toContain('3 days restored from before')
     expect(checkRequest(db, { personId: 'p-back', policyId: 'pol-sick', startDate: '2026-09-14', endDate: '2026-09-14' }, '2026-09-10').warnings).toEqual([])
+  })
+
+  it('says before the start date what day 1 brings, restored hours included', () => {
+    const db = baseDB()
+    db.people.push(mkPerson('p-old', 'Omar', '2026-01-05', { endDate: '2026-08-28', personalEmail: 'omar@example.com' }))
+    addRequest(db, 'tr-old', 'p-old', 'pol-sick', '2026-03-02', '2026-03-03')
+    db.people.push(mkPerson('p-back', 'Omar', '2026-10-19', { personalEmail: 'omar@example.com', hireNumber: 18, rehireOfPersonId: 'p-old' }))
+    const r = row(db, 'p-back', 'pol-sick', '2026-10-11')
+    // Nothing on the books yet, but the row says what arrives on Oct 19: no wait for a rehire within 12 months.
+    expect(r).toMatchObject({ earned: 0, balance: 0, usableFrom: '2026-10-19', startsOn: { date: '2026-10-19', granted: 40, restored: 24, hours: 40 } })
+    // 64 hours on the books, but the policy's 40-hour yearly limit is what can be used: the note says why the number is 40.
+    expect(r.note).toBe(
+      'On Oct 19, 2026, the start date: 5 days plus 3 days restored from before (rehired within 12 months, Labor Code 246), 64 hours on the books; up to 40 hours (5 days) can be used a year under your policy, usable from day 1. 5 days each January 1 and at hire.',
+    )
+    // From day 1 the row is the usual one, and the note still explains the limit.
+    const started = row(db, 'p-back', 'pol-sick', '2026-10-19')
+    expect(started.startsOn).toBeUndefined()
+    expect(started).toMatchObject({ balance: 40, available: 40 })
+    expect(started.note).toBe(
+      '5 days each January 1 and at hire, up to 40 hours used a year. Includes 3 days restored from before (rehired within 12 months, Labor Code 246), usable now. 64 hours on the books in all, of which up to 40 hours (5 days) can be used a year under your policy.',
+    )
+    // A new hire who has not started gets the grant on day 1, usable after the 90-day wait.
+    db.people.push(mkPerson('p-new', 'Nia', '2026-11-02'))
+    const fresh = row(db, 'p-new', 'pol-sick', '2026-10-11')
+    expect(fresh).toMatchObject({ usableFrom: '2027-01-30', startsOn: { date: '2026-11-02', granted: 40, restored: 0, hours: 40 } })
+    expect(fresh.note).toMatch(/^On Nov 2, 2026, the start date: 5 days, usable from Jan 30, 2027 \(the 90th day of employment\)\./)
+  })
+
+  it('keeps the plain day-1 note when the restored hours fit under the yearly limit', () => {
+    const db = baseDB()
+    db.timeOffPolicies = db.timeOffPolicies.map((p) => (p.id === 'pol-sick' ? { ...p, usageCapHours: 80 } : p))
+    db.people.push(mkPerson('p-old', 'Omar', '2026-01-05', { endDate: '2026-08-28' }))
+    db.people.push(mkPerson('p-back', 'Omar', '2026-10-19', { hireNumber: 18, rehireOfPersonId: 'p-old' }))
+    const r = row(db, 'p-back', 'pol-sick', '2026-10-11')
+    expect(r.startsOn).toEqual({ date: '2026-10-19', granted: 40, restored: 40, hours: 80 })
+    expect(r.note).toBe(
+      'On Oct 19, 2026, the start date: 5 days plus 5 days restored from before (rehired within 12 months, Labor Code 246), usable from day 1. 5 days each January 1 and at hire, up to 80 hours used a year.',
+    )
   })
 
   it('treats a return after more than 12 months as a new hire', () => {
@@ -435,6 +476,23 @@ describe('vacation payout', () => {
     expect(vacationPayout(db, 'p-pay', '2026-08-31')).toMatchObject({ hours: 40, amount: 3_000 })
   })
 
+  it('never counts past the recorded last day, so an alumnus payout stays what it was at exit', () => {
+    const db = baseDB()
+    db.people.push(mkPerson('p-left', 'Omar', '2026-01-01', { endDate: '2026-08-23' }))
+    db.comp.push(salary('p-left', '2026-01-01', 156_000))
+    const atExit = vacationPayout(db, 'p-left', '2026-08-23')
+    expect(atExit).toMatchObject({ hours: 77.5, amount: 5_812.5, asOf: '2026-08-23' })
+    // Asked for today, it is still the payout at the last day.
+    expect(vacationPayout(db, 'p-left', D)).toMatchObject({ hours: 77.5, amount: 5_812.5, asOf: '2026-08-23' })
+    // The balance on the books after the exit matches it, and stops growing.
+    expect(row(db, 'p-left', 'pol-vacation', D)).toMatchObject({ balance: 77.5, available: 77.5 })
+    expect(row(db, 'p-left', 'pol-vacation', '2027-03-01').balance).toBe(77.5)
+    // A last day still ahead is counted to that day.
+    db.people.push(mkPerson('p-going', 'Elena', '2026-01-01', { endDate: '2026-10-30' }))
+    db.comp.push(salary('p-going', '2026-01-01', 156_000))
+    expect(vacationPayout(db, 'p-going', '2026-10-30').asOf).toBe('2026-10-30')
+  })
+
   it('pays an hourly employee at the hourly rate', () => {
     const db = baseDB()
     db.people.push(mkPerson('p-pt', 'Luis', '2026-07-20', { employmentType: 'part_time', hoursPerWeek: 24, flsa: 'non_exempt' }))
@@ -466,5 +524,81 @@ describe('calendar file', () => {
     expect(ics).toContain('DTEND;VALUE=DATE:20261017')
     expect(ics).not.toContain('Vacation')
     expect(timeOffICS(db, 'missing')).toBe('')
+  })
+})
+
+describe('sick leave before the 90-day wait', () => {
+  // Aisha started Sep 8, 2026: sick leave is usable from Dec 6 (the 90th day of employment).
+  function aishaDB(): DB {
+    const db = baseDB()
+    db.people.push(mkPerson('p-aisha', 'Aisha', '2026-09-08'))
+    return db
+  }
+  const early = { personId: 'p-aisha', policyId: 'pol-sick', startDate: '2026-10-12', endDate: '2026-10-12' }
+
+  it('knows when a request falls before the wait', () => {
+    const db = aishaDB()
+    expect(serviceWait(db, early)).toEqual({ usableFrom: '2026-12-06', days: 90 })
+    expect(serviceWait(db, { ...early, startDate: '2026-12-07' })).toBeNull()
+    expect(serviceWait(db, { ...early, policyId: 'pol-vacation' })).toBeNull()
+    const check = checkRequest(db, { ...early }, D)
+    expect(check.wait).toMatchObject({ usableFrom: '2026-12-06', days: 90 })
+    expect(check.warnings).toContain(check.wait?.text)
+  })
+
+  it('waits for Admin instead of approving itself, and takes nothing off the balance meanwhile', () => {
+    const next = produce(aishaDB(), (d) => {
+      createRequest(d, early, { date: D, id: 'tr-early', beforeWait: 'hold' })
+    })
+    expect(next.timeOffRequests[0]).toMatchObject({ status: 'pending', hours: 8 })
+    expect(next.timeOffRequests[0].decisionNote).toBeUndefined()
+    expect(pendingApprovals(next).map((r) => r.id)).toEqual(['tr-early'])
+    expect(balances(next, 'p-aisha', '2026-12-07').find((r) => r.policy.id === 'pol-sick')).toMatchObject({ used: 0, available: 40 })
+    // History recorded outside the request sheet keeps its approval (the sample's early sick day)
+    const recorded = produce(aishaDB(), (d) => {
+      createRequest(d, early, { date: D, id: 'tr-history' })
+    })
+    expect(recorded.timeOffRequests[0]).toMatchObject({ status: 'approved', decisionNote: 'Approved automatically' })
+  })
+
+  it('lets Admin waive the wait for one request, as paid sick leave with a note', () => {
+    const recorded = produce(aishaDB(), (d) => {
+      createRequest(d, early, { date: D, id: 'tr-waived', beforeWait: 'waive' })
+    })
+    expect(recorded.timeOffRequests[0]).toMatchObject({ status: 'approved', decidedOn: D, hours: 8, decisionNote: 'Approved: the 90-day wait was waived for this request' })
+    expect(recorded.activity[0].text).toBe('Time off recorded for Aisha Test, Mon, Oct 12 (1 day), with the 90-day wait waived')
+    // Approving a pending one later says the same
+    const approved = produce(aishaDB(), (d) => {
+      createRequest(d, early, { date: D, id: 'tr-early', beforeWait: 'hold' })
+      approveRequest(d, 'tr-early', { date: D, approverId: 'p-founder' })
+    })
+    expect(approved.timeOffRequests[0]).toMatchObject({ status: 'approved', decisionNote: 'Approved: the 90-day wait was waived for this request' })
+  })
+
+  it('records it as unpaid leave instead: the unpaid policy when there is one, else no hours', () => {
+    const unpaid = produce(aishaDB(), (d) => {
+      createRequest(d, early, { date: D, id: 'tr-early', beforeWait: 'hold' })
+      expect(approveAsUnpaid(d, 'tr-early', { date: D, approverId: 'p-founder' })).toBe(true)
+      expect(approveAsUnpaid(d, 'tr-early', { date: D })).toBe(false)
+    })
+    expect(unpaid.timeOffRequests[0]).toMatchObject({
+      status: 'approved',
+      policyId: 'pol-unpaid',
+      hours: 8,
+      approverId: 'p-founder',
+      decisionNote: 'Recorded as unpaid: before the 90-day wait ends on Dec 6, 2026',
+    })
+    expect(unpaid.activity.at(-1)?.text).toBe("Recorded Aisha Test's time off as unpaid, Mon, Oct 12")
+    expect(balances(unpaid, 'p-aisha', '2026-12-07').find((r) => r.policy.id === 'pol-sick')?.used).toBe(0)
+
+    const noPolicy = aishaDB()
+    noPolicy.timeOffPolicies = noPolicy.timeOffPolicies.filter((p) => p.kind !== 'unpaid')
+    expect(unpaidPolicyFor(noPolicy, noPolicy.people[1], D)).toBeUndefined()
+    const kept = produce(noPolicy, (d) => {
+      createRequest(d, early, { date: D, id: 'tr-early', beforeWait: 'hold' })
+      approveAsUnpaid(d, 'tr-early', { date: D })
+    })
+    expect(kept.timeOffRequests[0]).toMatchObject({ status: 'approved', policyId: 'pol-sick', hours: 0 })
+    expect(balances(kept, 'p-aisha', '2026-12-07').find((r) => r.policy.id === 'pol-sick')).toMatchObject({ used: 0, available: 40 })
   })
 })

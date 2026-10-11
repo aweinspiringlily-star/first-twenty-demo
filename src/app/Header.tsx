@@ -1,19 +1,40 @@
 // Global header: sync status, search, + New, backup age, privacy blur, display options and the shortcut
 // sheet. Shown at the top of every page (inside the main column on wide screens). Also the shell's
 // notices: preview, sample company and server sync banners.
-import { type ReactNode, useEffect, useId, useRef, useState } from 'react'
+import { Fragment, type ReactNode, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { daysBetween, fmtDate, fmtDateTime, fmtTime, parseDate, toISODate, today } from '@/lib/dates'
 import { copyText, downloadFile } from '@/lib/files'
 import { plural } from '@/lib/format'
-import { useDB } from '@/store/db'
+import { companyStem } from '@/store/backup'
+import { sampleIsCurrent, useDB } from '@/store/db'
 import { type TextScale, type Theme, usePrefs } from '@/store/prefs'
+import {
+  describeRecord,
+  detectHostContext,
+  editsTo,
+  moreAloneText,
+  type RecordLabel,
+  refreshedParts,
+  refreshedText,
+  refusedText,
+  removedTail,
+  replacedTail,
+  tooLargeManyText,
+  tooLargeTail,
+  tooLargeText,
+} from '@/features/settings/serverLogic'
 import {
   clearRefreshed,
   clearReplacedRemotely,
+  clearRestoredRemotely,
+  connect,
+  discardRejected,
   getReplacedBackup,
+  isServedPage,
   retryRejected,
   STORAGE_FULL_MESSAGE,
   type SyncStatusState,
+  type SyncUser,
   syncNow,
   useSyncStatus,
 } from '@/sync'
@@ -344,26 +365,226 @@ export function PreviewBanner() {
   )
 }
 
-/** Banner while the sample company is loaded. */
+// A First Twenty server at this page's origin, for a browser that is not connected (the sample banner,
+// the rail note and the server notice point a new computer, or a founder who started fresh here, at
+// it). Asked once per page load: for the sample on any page served over http(s), and for any other
+// local workspace only on a page the server served (isServedPage), so the Vite dev server, a file or the
+// artifact viewer never probes /api for it (docs/SYNC.md). Signing in or out after that (Settings,
+// Server) shows at once: the sync status's user changes, and a sign-in asks again, since only a signed-in
+// answer says whether the server is empty. Connecting means the server holds a workspace; disconnecting
+// asks again.
+/** empty: the server holds no workspace yet (known only when signed in; absent when it could not tell). */
+type ServerHere = { signedIn: boolean; empty?: boolean }
+/** The answer, with the sync status's user when it came (a later change of user is a sign-in or sign-out). */
+type ServerAnswer = ServerHere & { user: SyncUser | null }
+let serverHere: ServerAnswer | null = null
+let serverHereAsked = false
+let serverHereAsking = false
+let statusWatched = false
+const serverHereListeners = new Set<() => void>()
+
+function setServerHere(answer: ServerAnswer | null): void {
+  serverHere = answer
+  for (const fn of serverHereListeners) fn()
+}
+
+/** Asks once per page load (again with `again`: after a sign-in or a disconnect). */
+function askServerHere(again = false): void {
+  if ((serverHereAsked && !again) || serverHereAsking) return
+  serverHereAsked = true
+  if (detectHostContext() !== 'web') return
+  watchStatus()
+  serverHereAsking = true
+  void connect
+    .checkServer()
+    .then((res) => {
+      setServerHere(res.ok ? { signedIn: res.signedIn, empty: res.empty, user: useSyncStatus.getState().user } : null)
+    })
+    .catch(() => {
+      /* nothing answered: the banner stays as it is */
+    })
+    .finally(() => {
+      serverHereAsking = false
+    })
+}
+
+/**
+ * Keeps the answer true to what happens after it: a sign-in (no user before, one now) asks again for
+ * whether the server is empty; connecting (an upload, or the server's copy) means the server holds a
+ * workspace now; going back to local only (Disconnect) asks again.
+ */
+function watchStatus(): void {
+  if (statusWatched) return
+  statusWatched = true
+  let { mode, user } = useSyncStatus.getState()
+  useSyncStatus.subscribe((s) => {
+    const signedIn = user === null && s.user !== null
+    const modeChanged = s.mode !== mode
+    mode = s.mode
+    user = s.user
+    if (modeChanged && mode === 'server' && serverHere) setServerHere({ ...serverHere, empty: false })
+    if (mode !== 'server' && (modeChanged || signedIn)) askServerHere(true)
+  })
+}
+
+function subscribeServerHere(fn: () => void): () => void {
+  serverHereListeners.add(fn)
+  return () => serverHereListeners.delete(fn)
+}
+
+/**
+ * The server answering at this origin (null: none answered, or nobody asked yet). ask: ask now if this
+ * page load has not asked yet (the sample banner, and on a served page the rail note and the server
+ * notice). signedIn is the answer until the sync status's user changes: the engine sets a new one on
+ * sign-in and clears it on sign-out. empty is known only from an answer given while signed in.
+ */
+export function useServerHere(ask = false): ServerHere | null {
+  const here = useSyncExternalStore(subscribeServerHere, () => serverHere, () => null)
+  const user = useSyncStatus((s) => s.user)
+  useEffect(() => {
+    if (ask) askServerHere()
+  }, [ask])
+  if (!here) return null
+  const signedIn = signedInHere(here, user)
+  return signedIn ? (here.signedIn && here.empty !== undefined ? { signedIn, empty: here.empty } : SIGNED_IN_HERE) : SIGNED_OUT_HERE
+}
+
+/**
+ * Whether this browser is signed in to the server here: the page-load answer, until the sync status's
+ * user is no longer the one it had then (a new user after signing in, none after signing out).
+ */
+export function signedInHere(answer: ServerAnswer, user: SyncUser | null): boolean {
+  return user === answer.user ? answer.signedIn : user !== null
+}
+
+const SIGNED_IN_HERE: ServerHere = { signedIn: true }
+const SIGNED_OUT_HERE: ServerHere = { signedIn: false }
+
+/** Start fresh: on a page with a server, from Settings, Server, so the next step there (sign in, upload) follows. */
+const startFreshHref = (server: boolean) => (server ? href('settings', 'server', 'fresh') : links.startFresh())
+
+/**
+ * Banner while the sample company is loaded. A browser served by the company's server (a new computer)
+ * is pointed at signing in there first: the sample is what every new browser shows until then. A server
+ * that is still empty asks for a company instead: Start fresh (which then uploads) or Import a backup.
+ */
 export function SampleBanner() {
   const meta = useDB((s) => s.db.meta)
   const company = useDB((s) => s.db.company.name)
   const viewer = useViewer()
-  if (!meta.sample || viewer.role !== 'admin') return null
+  const local = useSyncStatus((s) => s.mode !== 'server')
+  const shown = meta.sample && viewer.role === 'admin'
+  const server = useServerHere(shown && local)
+  if (!shown) return null
+  const here = local ? server : null
+  const empty = !!here?.signedIn && here.empty === true
+  // Only loadSample moves the dates; a saved or uploaded sample keeps the ones it had then.
+  const current = sampleIsCurrent({ meta })
+  // 40px hit areas; the negative margins keep the banner as compact as its text.
+  const action = 'ft-banner__action inline-flex min-h-10 items-center rounded-lg px-2 font-bold underline'
   return (
     <div className="ft-banner ft-banner--sample mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-accent-soft px-4 py-1.5 text-[13.5px] text-accent-soft-ink sm:py-2.5">
       <span className="min-w-0 flex-[1_1_8rem] sm:hidden">
         Sample company: <strong>{company}</strong>
+        {here && (empty ? '. Your server is empty.' : here.signedIn ? '. Your server is here.' : '. Sign in to your server to get started.')}
       </span>
       <span className="hidden min-w-0 flex-[1_1_12rem] sm:inline">
-        You are exploring <strong>{company}</strong>, a fictional sample company. Its dates move with the calendar so the story stays current.
+        You are exploring <strong>{company}</strong>, a fictional sample company.{' '}
+        {here
+          ? empty
+            ? 'Your server is empty. Start fresh or import a backup, then upload it.'
+            : here.signedIn
+              ? "This page is served by your company's server, and you are signed in. Open your workspace from it."
+              : "This page is served by your company's server. Sign in to your server to get started."
+          : current
+            ? 'Its dates move with the calendar so the story stays current.'
+            : local
+              ? 'This saved copy keeps its dates; reset the sample in Settings, Data for current dates.'
+              : 'This saved copy keeps its dates.'}
       </span>
-      {/* Opens the Start fresh sheet directly. 40px hit area; negative margins keep the banner compact. */}
-      <a href={links.startFresh()} className="ft-banner__action -my-1.5 -mr-2 ml-auto inline-flex min-h-10 items-center rounded-lg px-2 font-bold underline sm:-my-2.5">
-        <span className="sm:hidden">Start fresh</span>
-        <span className="hidden sm:inline">Start fresh as a solo founder</span>
-      </a>
+      <span className="-my-1.5 -mr-2 ml-auto flex flex-wrap items-center gap-x-1 sm:-my-2.5">
+        {here &&
+          (empty ? (
+            // Lands on the Import panel; a finished import goes back to Settings, Server to upload it.
+            <a href={href('settings', 'data', 'import')} className={action}>
+              <span className="sm:hidden">Import</span>
+              <span className="hidden sm:inline">Import a backup</span>
+            </a>
+          ) : (
+            <a href={SERVER_SETTINGS_HREF} className={action}>
+              {here.signedIn ? (
+                <>
+                  <span className="sm:hidden">Open it</span>
+                  <span className="hidden sm:inline">Open your server's workspace</span>
+                </>
+              ) : (
+                <>
+                  <span className="sm:hidden">Sign in</span>
+                  <span className="hidden sm:inline">Sign in to your server</span>
+                </>
+              )}
+            </a>
+          ))}
+        {/* Opens the Start fresh sheet directly. */}
+        <a href={startFreshHref(!!here)} className={action}>
+          <span className="sm:hidden">Start fresh</span>
+          <span className="hidden sm:inline">Start fresh as a solo founder</span>
+        </a>
+      </span>
     </div>
+  )
+}
+
+// Not connected, on a page the server served: the workspace lives in this browser only. A founder who
+// started fresh (or imported) here keeps a pointer to the server, until they connect or dismiss it.
+const SERVER_HINT_KEY = 'first-twenty:server-hint-dismissed:v1'
+
+function serverHintDismissed(): boolean {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem(SERVER_HINT_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A notice for a workspace of the company's own (not the sample) that lives only in this browser while
+ * the server this page came from answers: signed out (sign in to keep it there) or signed in with an empty
+ * server (upload it). Dismissed once per browser.
+ */
+export function ServerHereBanner() {
+  const sample = useDB((s) => s.db.meta.sample)
+  const viewer = useViewer()
+  const local = useSyncStatus((s) => s.mode !== 'server')
+  const shown = !sample && viewer.role === 'admin' && local
+  const here = useServerHere(shown && isServedPage())
+  const [dismissed, setDismissed] = useState(serverHintDismissed)
+  if (!shown || !here || dismissed) return null
+  const empty = here.signedIn && here.empty === true
+  if (here.signedIn && !empty) return null
+  const dismiss = () => {
+    try {
+      localStorage.setItem(SERVER_HINT_KEY, '1')
+    } catch {
+      /* storage blocked: it stays dismissed until the page reloads */
+    }
+    setDismissed(true)
+  }
+  return (
+    <SyncBanner
+      kind="here"
+      icon="globe"
+      onDismiss={dismiss}
+      actions={
+        <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
+          {empty ? 'Upload it' : 'Sign in to your server'}
+        </a>
+      }
+    >
+      {empty
+        ? 'This company is saved in this browser only, and your server is empty. Upload it to keep it on your server.'
+        : 'This company is saved in this browser only. Your server answers at this address: sign in to keep the company there.'}
+    </SyncBanner>
   )
 }
 
@@ -408,10 +629,22 @@ export function lastSyncedText(at: string | null): string {
 type SyncView = { kind: ChipKind; tip: string }
 
 type ChipInput = Pick<SyncStatusState, 'status' | 'mode' | 'pending' | 'rejected' | 'lastSyncAt' | 'lastError' | 'hold' | 'user'> &
-  Partial<Pick<SyncStatusState, 'logoutPending' | 'pendingEdits'>>
+  Partial<Pick<SyncStatusState, 'logoutPending' | 'pendingEdits' | 'rejectedKeys' | 'signedOutByUser'>>
 
 /** Said after a sign-out the server could not confirm (the chip tip and the signed-out notice). */
 const SESSION_STAYS_OPEN = "Your server's session stays open until this browser reaches it again."
+
+/**
+ * Signed out: a sign-out the user chose says so; a session that ended on its own (the browser closed, the
+ * 12-hour limit) says that, as Settings, Server does. Plus the open-session note when the server could not
+ * confirm a sign-out.
+ */
+export function signedOutText(s: { signedOutByUser?: boolean; logoutPending?: boolean }): string {
+  const said = s.signedOutByUser
+    ? 'You signed out of your server. Changes stay on this device until you sign in again.'
+    : 'Your session on your server ended. Changes stay on this device until you sign in again.'
+  return s.logoutPending ? `${said} ${SESSION_STAYS_OPEN}` : said
+}
 
 /** What the chip says, or null when this browser is not connected (a local install shows nothing). */
 export function syncView(s: ChipInput): SyncView | null {
@@ -444,10 +677,7 @@ export function syncView(s: ChipInput): SyncView | null {
   }
   switch (s.status) {
     case 'signed_out':
-      return {
-        kind: 'signed-out',
-        tip: `Signed out of your server. Changes stay on this device until you sign in.${s.logoutPending ? ` ${SESSION_STAYS_OPEN}` : ''}${waiting} ${last}`,
-      }
+      return { kind: 'signed-out', tip: `${signedOutText(s)}${waiting} ${last}` }
     case 'offline':
       return { kind: 'offline', tip: `Cannot reach your server. Changes sync when the connection returns.${waiting} ${last}` }
     case 'error':
@@ -459,10 +689,16 @@ export function syncView(s: ChipInput): SyncView | null {
       }
     default:
       if (s.rejected > 0) {
-        return {
-          kind: 'attention',
-          tip: `The server refused ${plural(s.rejected, 'change')}. ${s.rejected === 1 ? 'It is' : 'They are'} kept on this device. ${last}`,
-        }
+        // A change too large to sync was never sent: the server did not refuse it.
+        const tooLarge = s.rejectedKeys?.filter((r) => r.tooLarge).length ?? 0
+        const refused = s.rejected - tooLarge
+        const said = [
+          refused > 0 && `The server refused ${plural(refused, 'change')}.`,
+          tooLarge > 0 && `${plural(tooLarge, 'change is', 'changes are')} too large to sync.`,
+        ]
+          .filter(Boolean)
+          .join(' ')
+        return { kind: 'attention', tip: `${said} ${s.rejected === 1 ? 'It is' : 'They are'} kept on this device. ${last}` }
       }
       return { kind: 'synced', tip: `Every change is on your server${s.user ? ` (signed in as ${s.user.email})` : ''}. ${last}` }
   }
@@ -504,8 +740,10 @@ export function SyncChip({ compact, className }: { compact?: boolean; className?
   const hold = useSyncStatus((s) => s.hold)
   const user = useSyncStatus((s) => s.user)
   const logoutPending = useSyncStatus((s) => s.logoutPending)
+  const signedOutByUser = useSyncStatus((s) => s.signedOutByUser)
+  const rejectedKeys = useSyncStatus((s) => s.rejectedKeys)
   const tipId = `sync-tip-${useId().replace(/:/g, '')}`
-  const view = syncView({ status, mode, pending, pendingEdits, rejected, lastSyncAt, lastError, hold, user, logoutPending })
+  const view = syncView({ status, mode, pending, pendingEdits, rejected, rejectedKeys, lastSyncAt, lastError, hold, user, logoutPending, signedOutByUser })
   if (!view) return null
   const word = CHIP_WORD[view.kind]
   const steady = STEADY_WORDS.includes(view.kind)
@@ -573,10 +811,11 @@ export function SyncChip({ compact, className }: { compact?: boolean; className?
   )
 }
 
-type BannerKind = 'storage' | 'replaced' | 'signed-out' | 'offline' | 'rejected' | 'paused' | 'refreshed'
+/** 'here' is the server notice for a browser that is not connected (ServerHereBanner), outside SyncBanners. */
+type BannerKind = 'storage' | 'replaced' | 'restored' | 'signed-out' | 'offline' | 'rejected' | 'paused' | 'refreshed' | 'here'
 
 /** Top to bottom. */
-const BANNER_ORDER: BannerKind[] = ['storage', 'replaced', 'signed-out', 'offline', 'rejected', 'paused', 'refreshed']
+const BANNER_ORDER: BannerKind[] = ['storage', 'replaced', 'restored', 'signed-out', 'offline', 'rejected', 'paused', 'refreshed']
 
 /**
  * Notices that are role=alert: screen readers speak an alert when it appears with its text. The others
@@ -654,6 +893,61 @@ function SyncBanner({
 
 const BANNER_ACTION = 'ft-banner__action inline-flex min-h-10 items-center rounded-lg px-2 font-bold text-accent hover:underline'
 
+/** A banner action that cannot be undone asks for a second click first, as ConfirmButton does. */
+function BannerConfirm({ children, confirmLabel, onConfirm }: { children: ReactNode; confirmLabel: string; onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false)
+  useEffect(() => {
+    if (!armed) return
+    const t = setTimeout(() => setArmed(false), 4000)
+    return () => clearTimeout(t)
+  }, [armed])
+  return (
+    <button
+      type="button"
+      aria-live="polite"
+      onBlur={() => setArmed(false)}
+      onClick={() => {
+        if (!armed) return setArmed(true)
+        setArmed(false)
+        onConfirm()
+      }}
+      className={BANNER_ACTION}
+    >
+      {armed ? confirmLabel : children}
+    </button>
+  )
+}
+
+/**
+ * A record named in a notice: a link to it when it has a page. The link sits inside a sentence, so its
+ * vertical padding (which moves no text) gives it a 40px hit area.
+ */
+function RecordName({ name, capital }: { name: RecordLabel; capital?: boolean }) {
+  const label = capital ? name.label.charAt(0).toUpperCase() + name.label.slice(1) : name.label
+  return name.href ? (
+    <a href={name.href} className="py-3 font-bold text-accent underline">
+      {label}
+    </a>
+  ) : (
+    <>{label}</>
+  )
+}
+
+/** "A, B and 2 more", with links. */
+function NamedList({ names, more }: { names: RecordLabel[]; more: number }) {
+  return (
+    <>
+      {names.map((n, i) => (
+        <Fragment key={`${i}-${n.label}`}>
+          {i === 0 ? '' : i === names.length - 1 && more === 0 ? ' and ' : ', '}
+          <RecordName name={n} />
+        </Fragment>
+      ))}
+      {more > 0 && ` and ${more} more`}
+    </>
+  )
+}
+
 /**
  * Sync now, after the user asked (the palette, the notices): says it started and how it went. The
  * engine keeps retrying on its own either way.
@@ -662,28 +956,20 @@ export function runSyncNow(startText = 'Syncing with your server') {
   toast({ text: startText, tone: 'neutral' })
   void syncNow().then(() => {
     const s = useSyncStatus.getState()
-    if (s.status === 'synced' && s.rejected > 0) {
-      toast({ text: `The server refused ${plural(s.rejected, 'change')} again. ${s.rejected === 1 ? 'It is' : 'They are'} kept on this device.`, tone: 'bad' })
+    // Changes too large to sync are never sent, so they are not "refused again".
+    const refused = s.rejected - s.rejectedKeys.filter((r) => r.tooLarge).length
+    if (s.status === 'synced' && refused > 0) {
+      toast({ text: `The server refused ${plural(refused, 'change')} again. ${refused === 1 ? 'It is' : 'They are'} kept on this device.`, tone: 'bad' })
     } else if (s.status === 'synced') toast({ text: 'Synced with your server', tone: 'good' })
     else if (s.status !== 'syncing') toast({ text: s.lastError ?? 'Sync did not finish. It tries again on its own.', tone: 'bad' })
   })
-}
-
-/** 'Delta Inc' -> 'delta-inc' (file names). */
-function fileStem(name: string): string {
-  const stem = name
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-  return stem || 'first-twenty'
 }
 
 /** The workspace shown before another computer replaced the server's, as backup JSON (Import reads it). */
 function replacedBackupJSON(): { name: string; json: string } | null {
   const db = getReplacedBackup()
   if (!db) return null
-  return { name: `${fileStem(db.company?.name ?? '')}-backup-before-replace-${today()}.json`, json: JSON.stringify(db, null, 2) }
+  return { name: `${companyStem(db.company?.name ?? '')}-backup-before-replace-${today()}.json`, json: JSON.stringify(db, null, 2) }
 }
 
 function downloadReplacedBackup() {
@@ -715,25 +1001,31 @@ export function useSyncStorageWarning(): boolean {
   const mode = useSyncStatus((s) => s.mode)
   const hold = useSyncStatus((s) => s.hold)
   const full = useSyncStatus((s) => s.storageFull)
-  const waiting = useSyncStatus((s) => s.pending + s.rejected)
-  return mode === 'server' && hold !== 'sample' && full && waiting > 0
+  const waiting = useSyncStatus((s) => s.pending + s.rejected > 0)
+  return mode === 'server' && hold !== 'sample' && full && waiting
 }
 
 /**
  * Notices about the server connection, under the header: browser storage full, the server's workspace
- * replaced from another computer, signed out, the server unreachable for more than a minute, changes the
- * server refused, a paused connection, and server copies that won over this device's edits. Never in a
- * local install, and never while the sample company is open.
+ * replaced from another computer (or by another copy of this one), signed out, the server unreachable
+ * for more than a minute, changes the server refused (or too large to sync), a paused connection, and
+ * server copies that won over this device's edits (named, with links). Never in a local install, and
+ * never while the sample company is open.
  */
 export function SyncBanners() {
   const status = useSyncStatus((s) => s.status)
   const mode = useSyncStatus((s) => s.mode)
   const pendingEdits = useSyncStatus((s) => s.pendingEdits)
   const rejected = useSyncStatus((s) => s.rejected)
+  const rejectedKeys = useSyncStatus((s) => s.rejectedKeys)
   const hold = useSyncStatus((s) => s.hold)
   const refreshed = useSyncStatus((s) => s.refreshed)
+  const refreshedKeys = useSyncStatus((s) => s.refreshedKeys)
   const logoutPending = useSyncStatus((s) => s.logoutPending)
+  const signedOutByUser = useSyncStatus((s) => s.signedOutByUser)
   const replaced = useSyncStatus((s) => s.replacedRemotely)
+  const restored = useSyncStatus((s) => s.restoredRemotely)
+  const db = useDB((s) => s.db)
   const storageWarning = useSyncStorageWarning()
   const [offlineSince, setOfflineSince] = useState<number | null>(null)
   const [offlineLong, setOfflineLong] = useState(false)
@@ -755,9 +1047,10 @@ export function SyncBanners() {
     return () => clearTimeout(t)
   }, [status, offlineSince])
 
-  const showing: Record<BannerKind, boolean> = {
+  const showing: Record<Exclude<BannerKind, 'here'>, boolean> = {
     storage: connected && storageWarning,
     replaced: connected && replaced !== null,
+    restored: connected && restored !== null && replaced === null,
     'signed-out': connected && status === 'signed_out',
     offline: connected && status === 'offline' && offlineLong,
     rejected: connected && rejected > 0,
@@ -765,45 +1058,68 @@ export function SyncBanners() {
     refreshed: connected && refreshed > 0,
   }
   // A dismissed notice comes back the next time its condition starts again (the next time offline...).
-  const ended = [...dismissed].filter((k) => !showing[k]).join(' ')
+  const ended = [...dismissed].filter((k) => k === 'here' || !showing[k]).join(' ')
   useEffect(() => {
     if (!ended) return
     const gone = ended.split(' ')
     setDismissed((d) => new Set([...d].filter((k) => !gone.includes(k))))
   }, [ended])
 
-  const visible = (k: BannerKind) => showing[k] && !dismissed.has(k)
+  const visible = (k: Exclude<BannerKind, 'here'>) => showing[k] && !dismissed.has(k)
   const dismiss = (k: BannerKind) => () => setDismissed((d) => new Set(d).add(k))
 
+  // Named records: the newest ones the server's copy replaced (or removed), and the changes too large to sync.
+  const named = refreshedParts(db, refreshed, refreshedKeys)
+  const tooLarge = rejectedKeys.filter((r) => r.tooLarge)
+  const refusedCount = rejected - tooLarge.length
+  const oneTooLarge = tooLarge.length === 1 ? { ref: tooLarge[0], name: describeRecord(db, tooLarge[0].collection, tooLarge[0].id) } : null
+  const discardTooLarge = () => {
+    void discardRejected(tooLarge.map((r) => ({ collection: r.collection, id: r.id }))).then((res) =>
+      toast(
+        res.ok
+          ? { text: tooLarge.length === 1 ? 'Change discarded. This browser shows what your server has.' : 'Changes discarded. This browser shows what your server has.' }
+          : { text: res.message, tone: 'bad' },
+      ),
+    )
+  }
+
   // What each notice says, also spoken through the live region below when it appears.
-  const text: Record<BannerKind, string> = {
+  const text: Record<Exclude<BannerKind, 'here'>, string> = {
     storage: STORAGE_FULL_MESSAGE,
     replaced: replaced
       ? `Your server's workspace was replaced from another computer. This browser now shows ${replaced.companyName || 'another workspace'}.`
       : '',
-    'signed-out': `Signed out of your server. Changes stay on this device until you sign in.${logoutPending ? ` ${SESSION_STAYS_OPEN}` : ''}`,
+    restored:
+      "Your server's workspace was replaced with another copy of it, from a backup or from another computer. Changes made after that copy was taken may be gone.",
+    'signed-out': signedOutText({ signedOutByUser, logoutPending }),
     offline:
       pendingEdits > 0
         ? `Cannot reach your server. ${plural(pendingEdits, 'change')} will sync when it is reachable again.`
         : 'Cannot reach your server. Changes will sync when it is reachable again.',
-    rejected: `The server refused ${plural(rejected, 'change')}. ${rejected === 1 ? 'It is' : 'They are'} kept on this device until you retry.`,
+    rejected: [
+      oneTooLarge
+        ? tooLargeText(oneTooLarge.name, oneTooLarge.ref.collection)
+        : tooLarge.length > 1
+          ? tooLargeManyText(tooLarge.length, tooLarge.map((r) => r.collection))
+          : '',
+      refusedCount > 0 ? refusedText(refusedCount) : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
     paused:
       hold === 'server_empty'
         ? "Syncing is paused: your server has no workspace. Upload this browser's workspace or disconnect."
         : "Syncing is paused: this browser's workspace was replaced and never uploaded. Choose which copy to keep.",
-    refreshed:
-      refreshed === 1
-        ? "1 item had a newer change on your server, so this device's edit to it was replaced by the server's copy."
-        : `${refreshed} items had newer changes on your server, so this device's edits to them were replaced by the server's copy.`,
+    refreshed: refreshedText(db, refreshed, refreshedKeys),
   }
   const textRef = useRef(text)
   textRef.current = text
 
   // Speak a notice when it appears (cleared first, set on the next frame, so a repeat is spoken again).
-  const visibleKey = BANNER_ORDER.filter(visible).join(' ')
+  const visibleKey = BANNER_ORDER.filter((k) => k !== 'here' && visible(k)).join(' ')
   useEffect(() => {
     const now = new Set(visibleKey ? (visibleKey.split(' ') as BannerKind[]) : [])
-    const fresh = BANNER_ORDER.filter((k) => now.has(k) && !shownBefore.current.has(k) && !ALERT_BANNERS.has(k))
+    const fresh = BANNER_ORDER.filter((k): k is Exclude<BannerKind, 'here'> => k !== 'here' && now.has(k) && !shownBefore.current.has(k) && !ALERT_BANNERS.has(k))
     shownBefore.current = now
     if (fresh.length === 0) return
     const say = fresh.map((k) => textRef.current[k]).join(' ')
@@ -856,6 +1172,11 @@ export function SyncBanners() {
           the copy go.
         </SyncBanner>
       )}
+      {visible('restored') && (
+        <SyncBanner kind="restored" icon="info" onDismiss={clearRestoredRemotely}>
+          {text.restored}
+        </SyncBanner>
+      )}
       {visible('signed-out') && (
         <SyncBanner
           kind="signed-out"
@@ -882,23 +1203,39 @@ export function SyncBanners() {
           onDismiss={dismiss('rejected')}
           actions={
             <>
-              <button
-                type="button"
-                onClick={() => {
-                  retryRejected()
-                  runSyncNow(`Sending ${plural(rejected, 'change')} again`)
-                }}
-                className={BANNER_ACTION}
-              >
-                Retry
-              </button>
+              {/* Retrying cannot help a change too large to sync: it is shortened or discarded instead. */}
+              {refusedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    retryRejected()
+                    runSyncNow(`Sending ${plural(refusedCount, 'change')} again`)
+                  }}
+                  className={BANNER_ACTION}
+                >
+                  Retry
+                </button>
+              )}
+              {tooLarge.length > 0 && (
+                <BannerConfirm confirmLabel="Press again to discard" onConfirm={discardTooLarge}>
+                  {tooLarge.length === 1 ? 'Discard this change' : 'Discard them'}
+                </BannerConfirm>
+              )}
               <a href={SERVER_SETTINGS_HREF} className={BANNER_ACTION}>
                 Details
               </a>
             </>
           }
         >
-          {text.rejected}
+          {oneTooLarge ? (
+            <>
+              <RecordName name={oneTooLarge.name} capital />
+              {tooLargeTail(oneTooLarge.ref.collection)}
+              {refusedCount > 0 && ` ${refusedText(refusedCount)}`}
+            </>
+          ) : (
+            text.rejected
+          )}
         </SyncBanner>
       )}
       {visible('paused') && (
@@ -917,7 +1254,27 @@ export function SyncBanners() {
       )}
       {visible('refreshed') && (
         <SyncBanner kind="refreshed" icon="info" onDismiss={clearRefreshed}>
-          {text.refreshed}
+          {named.replaced.length === 0 && named.removed.length === 0 ? (
+            text.refreshed
+          ) : (
+            <>
+              {named.replaced.length > 0 && (
+                <>
+                  {editsTo(named.replaced.length + named.more)} <NamedList names={named.replaced} more={named.more} />
+                  {replacedTail(named.replaced.length + named.more)}
+                </>
+              )}
+              {named.removed.length > 0 && (
+                // Gone from this browser too: named from its last copy here, with no link.
+                <>
+                  {named.replaced.length > 0 && ' '}
+                  {editsTo(named.removed.length)} <NamedList names={named.removed} more={0} />
+                  {removedTail(named.removed.length)}
+                </>
+              )}
+              {named.moreAlone > 0 && ` ${moreAloneText(named.moreAlone)}`}
+            </>
+          )}
         </SyncBanner>
       )}
     </>

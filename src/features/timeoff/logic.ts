@@ -6,9 +6,9 @@ import type { Draft } from 'immer'
 import { canSeePerson, canSeeTimeOffDetail } from '@/domain/access'
 import { setTaskStatus } from '@/domain/checklists/actions'
 import { TASK_IDS } from '@/domain/checklists/templates'
-import { fullName } from '@/domain/people'
+import { firstName, fullName, isEmployedOn } from '@/domain/people'
 import { hoursLabel, type OutEntry, workdayList } from '@/domain/timeoff'
-import type { DB, Holiday, ID, LeaveCase, Person, TimeOffKind, Viewer } from '@/domain/types'
+import type { DB, Holiday, ID, LeaveCase, Person, TimeOffKind, TimeOffRequest, Viewer } from '@/domain/types'
 import { addDays, addMonths, daysBetween, fmtDate, fmtDay, fmtShort, type ISODate, isWeekday, parseDate } from '@/lib/dates'
 import { buildICS } from '@/lib/ics'
 import { logActivity } from '@/store/draft'
@@ -90,6 +90,44 @@ export function nextWorkdayOnOrAfter(d: ISODate, holidays: ReadonlyArray<Pick<Ho
   let cur = d
   while (!isWorkday(cur, holidays)) cur = addDays(cur, 1)
   return cur
+}
+
+/**
+ * 'In N weeks' for a start date: the Monday on or after today + N weeks (the next workday when that Monday is
+ * a holiday), so the chip lands about N weeks out, the way the offboarding 'In 2 weeks (Fri)' chip does.
+ */
+export function startInWeeks(t: ISODate, weeks: number, holidays: ReadonlyArray<Pick<Holiday, 'date'>>): ISODate {
+  const target = addDays(t, 7 * weeks)
+  const monday = weekMonday(target) === target ? target : addDays(weekMonday(target), 7)
+  return nextWorkdayOnOrAfter(monday, holidays)
+}
+
+/** Start date chips for a leave case: Today, Next Mon, then 'In 2 weeks (Mon)' and on, labeled with the weekday they land on. */
+export function leaveStartPresets(t: ISODate, holidays: ReadonlyArray<Pick<Holiday, 'date'>>): Array<{ label: string; date: ISODate }> {
+  const weekday = (d: ISODate) => fmtDay(d).split(',')[0]
+  return [
+    { label: 'Today', date: t },
+    { label: 'Next Mon', date: addDays(weekMonday(t), 7) },
+    ...[2, 4, 6].map((n) => {
+      const date = startInWeeks(t, n, holidays)
+      return { label: `In ${n} weeks (${weekday(date)})`, date }
+    }),
+  ]
+}
+
+/**
+ * Start date chips for a hire or a rehire: Next Mon, then 'In 2 weeks (Mon)' and 'In 3 weeks (Mon)' on the Monday
+ * on or after today plus N weeks (startInWeeks), labeled with the weekday they land on, as the leave chips are.
+ */
+export function hireStartPresets(t: ISODate, holidays: ReadonlyArray<Pick<Holiday, 'date'>>): Array<{ label: string; date: ISODate }> {
+  const weekday = (d: ISODate) => fmtDay(d).split(',')[0]
+  return [
+    { label: 'Next Mon', date: addDays(weekMonday(t), 7) },
+    ...[2, 3].map((n) => {
+      const date = startInWeeks(t, n, holidays)
+      return { label: `In ${n} weeks (${weekday(date)})`, date }
+    }),
+  ]
 }
 
 export function lastWorkdayOnOrBefore(d: ISODate, holidays: ReadonlyArray<Pick<Holiday, 'date'>>): ISODate {
@@ -278,6 +316,17 @@ export function defaultLeaveReturn(startDate: ISODate, holidays: ReadonlyArray<P
   return nextWorkdayOnOrAfter(addDays(startDate, 84), holidays)
 }
 
+/**
+ * The longest note a time off request or a leave case takes (maxLength). A note is a line or two for the approver
+ * or about coverage; the cap keeps the record well under what the server takes for one record.
+ */
+export const TIMEOFF_NOTE_MAX_CHARS = 1_000
+
+/** '850 of 1,000 characters' once a note gets near the limit, else null. */
+export function noteCountText(text: string, max = TIMEOFF_NOTE_MAX_CHARS): string | null {
+  return text.length >= max * 0.8 ? `${text.length.toLocaleString('en-US')} of ${max.toLocaleString('en-US')} characters` : null
+}
+
 /** Policy kinds whose request never asks for a note or reason (sick leave, and leave kept confidential by law). */
 export function noReasonKind(kind: TimeOffKind): boolean {
   return kind === 'sick' || kind === 'bereavement' || kind === 'reproductive_loss'
@@ -363,6 +412,42 @@ export function entryView(db: DB, viewer: Viewer, e: OutEntry): EntryView {
 export function approverLabel(db: Pick<DB, 'people'>, person: Pick<Person, 'managerId'>): string {
   const m = person.managerId ? db.people.find((p) => p.id === person.managerId) : undefined
   return m ? fullName(m) : 'Admin'
+}
+
+/**
+ * The manager a pending request waits on, by the inbox's rule (src/domain/inbox.ts timeOffItems): for
+ * Admin, the person's manager when that manager is still here and is someone else. Null when it waits on
+ * the viewer, which is always so outside Admin, and for sick leave before the service wait (Admin's call).
+ */
+export function waitingOnManager(db: DB, viewer: Pick<Viewer, 'role' | 'personId'>, req: TimeOffRequest, date: ISODate): Person | null {
+  if (viewer.role !== 'admin') return null
+  if (db.timeOffPolicies.find((p) => p.id === req.policyId)?.autoApprove) return null
+  const person = db.people.find((p) => p.id === req.personId)
+  const manager = person?.managerId ? db.people.find((p) => p.id === person.managerId) : undefined
+  if (!manager || manager.id === viewer.personId || !isEmployedOn(manager, date)) return null
+  return manager
+}
+
+export type ApprovalGroup = { key: string; label: string; manager?: Person; requests: TimeOffRequest[] }
+
+/**
+ * Requests to approve, grouped the way the inbox routes them: "Waiting for you" first (always there, even
+ * when empty), then "Waiting on Tomas" for each manager who approves the rest. Admin can still act on those.
+ */
+export function approvalGroups(db: DB, viewer: Pick<Viewer, 'role' | 'personId'>, requests: TimeOffRequest[], date: ISODate): ApprovalGroup[] {
+  const mine: TimeOffRequest[] = []
+  const others = new Map<ID, ApprovalGroup>()
+  for (const r of requests) {
+    const manager = waitingOnManager(db, viewer, r, date)
+    if (!manager) {
+      mine.push(r)
+      continue
+    }
+    const group = others.get(manager.id) ?? { key: manager.id, label: `Waiting on ${firstName(manager)}`, manager, requests: [] }
+    group.requests.push(r)
+    others.set(manager.id, group)
+  }
+  return [{ key: 'you', label: 'Waiting for you', requests: mine }, ...[...others.values()].sort((a, b) => a.label.localeCompare(b.label))]
 }
 
 // ---------------------------------------------------------------------------------------------

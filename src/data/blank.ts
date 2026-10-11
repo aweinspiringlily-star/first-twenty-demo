@@ -22,6 +22,10 @@ export type BlankInput = {
   founderFirstName: string
   founderLastName: string
   founderTitle?: string
+  /**
+   * The founder's work email. '' keeps it empty (Start fresh, when the founder leaves it blank). Left out,
+   * it is guessed as first name at the company name + '.com', for the sample and test kits only.
+   */
   founderEmail?: string
   foundedOn?: string
   hqCity?: string
@@ -53,7 +57,8 @@ export function blankDB(input: BlankInput): DB {
       workweek: 'Monday to Friday',
       paySchedule: 'semi_monthly',
       fundingRounds: [],
-      payrollProvider: { name: 'Your payroll or PEO provider', kind: 'PEO', url: '' },
+      // No provider name until the founder adds one in Settings, Link-outs (screens say "your payroll or PEO provider").
+      payrollProvider: { name: '', kind: 'PEO', url: '' },
       linkOuts: {},
       costModel: { benefitsPerHeadMonthly: 1150, peoToolsPerHeadMonthly: 375, workersCompPct: 0.003 },
       soc2Enabled: false,
@@ -109,6 +114,8 @@ export function blankDB(input: BlankInput): DB {
       },
     ],
     comp: [],
+    // Placeholder cap table numbers (capTableConfirmedOn stays unset): Comp and plan > Equity asks the
+    // founder to check them against the cap table tool, and offer letters leave out the % until then.
     equity: {
       authorizedShares: 12_000_000,
       fullyDilutedShares: 10_000_000,

@@ -4,7 +4,7 @@ import { type ReactNode, useEffect, useRef } from 'react'
 import type { DB } from '@/domain/types'
 import { copyText, downloadFile } from '@/lib/files'
 import { useDB } from '@/store/db'
-import { cx, Icon, type IconName, Private, toast } from '@/ui'
+import { Button, cx, Icon, type IconName, Private, toast } from '@/ui'
 import { splitMoney } from './logic'
 
 class Refused extends Error {}
@@ -105,11 +105,42 @@ export function TextPreview({ text, label, maxHeight = 260 }: { text: string; la
 }
 
 /**
+ * Download and Copy buttons for an interview's two calendar files (the candidate's and the panel's).
+ * `cancel` labels them as cancellation files, which take the invite off the calendars that have it.
+ */
+export function IcsFileButtons({ stem, firstName, candidate, panel, cancel }: { stem: string; firstName: string; candidate: () => string; panel: () => string; cancel?: boolean }) {
+  const kind = cancel ? 'cancellation' : 'calendar file'
+  const file = (aud: 'candidate' | 'panel') => `${stem}-${aud}${cancel ? '-cancel' : ''}.ics`
+  const mime = 'text/calendar;charset=utf-8'
+  return (
+    <>
+      <div className="flex flex-wrap gap-2">
+        <Button icon="download" onClick={() => void downloadOrCopy(file('candidate'), candidate(), mime, `the candidate ${kind}`)}>
+          {cancel ? `Download cancellation for ${firstName}` : `Download for ${firstName}`}
+        </Button>
+        <Button icon="download" onClick={() => void downloadOrCopy(file('panel'), panel(), mime, `the panel ${kind}`)}>
+          {cancel ? 'Download cancellation for the panel' : 'Download for the panel'}
+        </Button>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="ghost" size="sm" icon="copy" onClick={() => void copyWithToast(candidate(), `the candidate ${kind} as text`)}>
+          {cancel ? 'Copy candidate cancellation as text' : 'Copy candidate file as text'}
+        </Button>
+        <Button variant="ghost" size="sm" icon="copy" onClick={() => void copyWithToast(panel(), `the panel ${kind} as text`)}>
+          {cancel ? 'Copy panel cancellation as text' : 'Copy panel file as text'}
+        </Button>
+      </div>
+    </>
+  )
+}
+
+/**
  * A bordered sub-section for blocks that sit inside the candidate page's application panel (the hiring
  * core wraps them in its own Panel, so these never add a second card shadow).
  */
 export function SubPanel({
   title,
+  titleId,
   subtitle,
   icon,
   actions,
@@ -117,6 +148,8 @@ export function SubPanel({
   className,
 }: {
   title: ReactNode
+  /** Gives the heading an id and makes it focusable from script, so focus can land here after an action. */
+  titleId?: string
   subtitle?: ReactNode
   icon?: IconName
   actions?: ReactNode
@@ -129,7 +162,9 @@ export function SubPanel({
         <div className="flex min-w-0 items-start gap-2">
           {icon && <Icon name={icon} size={17} className="ft-subpanel__icon mt-0.5 shrink-0 text-ink-3" />}
           <div className="min-w-0">
-            <h3 className="ft-subpanel__title text-[14.5px] font-bold text-ink">{title}</h3>
+            <h3 id={titleId} tabIndex={titleId ? -1 : undefined} className="ft-subpanel__title text-[14.5px] font-bold text-ink">
+              {title}
+            </h3>
             {subtitle && <p className="ft-subpanel__subtitle mt-0.5 text-[13px] text-ink-3">{subtitle}</p>}
           </div>
         </div>

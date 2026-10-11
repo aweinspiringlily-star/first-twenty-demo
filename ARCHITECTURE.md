@@ -137,6 +137,8 @@ the UI must say so where it matters and never pretend otherwise. Access helpers 
   so the overlay under it stays open.
 - Controls that remove themselves (the header Undo after the last change, a toast's Undo or Dismiss) move focus
   to a stable neighbor or back where it came from first (`restoreFocus` from `@/ui`), never to `<body>`.
+  `restoreFocus` focuses the original element where it is (no scroll), but scrolls a replacement or the
+  fallback into view, so focus never lands on something off-screen.
 - Input and switch borders use `border-control` (the `--control-border` token, 3:1 on surfaces), not `border-line-strong`.
 - Respect `prefers-reduced-motion` (handled globally in CSS); never animate content into view from opacity 0.
 
@@ -182,7 +184,7 @@ Pure logic in `src/domain/**` gets unit tests next to it (`*.test.ts`). Use fixe
 | `#home` | Home (Tonight header, inbox, threshold card, growth chart, this week, hiring pulse, checklists in flight, people cost; First hire kit at headcount 1). Employees land on Me instead. | features/home (+ `src/domain/inbox.ts`) |
 | `#hiring[.jobs\|.candidates\|.offers\|.kits]` | Hiring tabs. `#hiring.add[.<jobId>]` opens quick add; `#hiring.new-job[.<planSlotId>]` opens the new job sheet. | features/hiring |
 | `#job.<id>[.board\|.list\|.sweep\|.edit\|.posting]` | Job pipeline (list default under 768px), Sweep mode, edit, posting text (`.edit.posting` edits, then returns to the posting) | features/hiring |
-| `#candidate.<id>` | Candidate profile | features/hiring |
+| `#candidate.<id>[.offer.<applicationId>]` | Candidate profile; `.offer.<applicationId>` (`links.candidateOffer`) puts focus on that application's offer next action | features/hiring |
 | `#people[.directory\|.org\|.wall\|.checklists\|.timeoff\|.contractors]` | People tabs. `#people.new` adds a person; `#people.contractors.new` adds a contractor or advisor. The Time off tab renders `TimeOffTab` from features/timeoff. | features/people |
 | `#person.<id>[.overview\|.job\|.equity\|.timeoff\|.checklists\|.emergency\|.activity\|.offboard\|.change]` | Person profile; `.offboard` and `.change` open those sheets | features/people |
 | `#checklist.<id>` | One checklist | features/people |
@@ -213,6 +215,12 @@ Each is exported from the owning feature's `index.tsx` (stubs exist until that f
   Display (look, text size 100-150%, theme for looks with light and dark, reduced motion, single-key shortcuts on/off), shortcut sheet (?).
 - Shortcuts: register with `useShortcut(keys, handler, {description, group})` from `src/app/shortcuts.ts`.
   Never add raw keydown listeners for shortcuts. Single keys respect the user's "shortcuts off" setting.
+  `enabled: false` turns a key off and takes it off the ? sheet; add `listed: true` for a key that works only
+  while focus is in one place (the pipeline board's A, R, S, Enter and arrows), so the sheet still lists it
+  after the sheet itself takes focus.
+- Backups: `downloadBackupFile`, `backupJSON`, `markExported` and `backupFileName` from `src/store/backup.ts`.
+  Every backup (Settings > Data, Settings > Server, the Home inbox) is the same `<company>-backup-<date>.json`,
+  and the backup time is stamped without an Undo step; never record it through `mutate`.
 - Money and other sensitive numbers: render through `<Money value>` / `<MoneyRange>` / `<Private>` from `@/ui`
   so the privacy blur hides them. Equity share counts and option values also go in `<Private>`.
 - Files: `copyText`, `downloadFile`, `toCSV`, `printHTML`, `escapeHTML` from `src/lib/files.ts`.

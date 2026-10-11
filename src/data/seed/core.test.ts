@@ -7,7 +7,7 @@ import { openTasks } from '@/domain/checklists/generate'
 import { evaluateAll } from '@/domain/compliance/engine'
 import { RULE_BY_ID } from '@/domain/compliance/rules'
 import { soc2Evidence } from '@/domain/compliance/soc2'
-import { cliffDate, current409A, poolSummary, valuationWarnings, vestedShares } from '@/domain/equity'
+import { capTableIsPlaceholder, cliffDate, current409A, poolSummary, valuationWarnings, vestedShares } from '@/domain/equity'
 import { annualBase, bandFor, currentComp, exemptFlags, outOfBand } from '@/domain/pay'
 import { employedOn, headcountOn, incomingOn } from '@/domain/people'
 import { balances, pendingApprovals, whoIsOut } from '@/domain/timeoff'
@@ -287,6 +287,8 @@ describe('trainings and policies', () => {
 describe('equity', () => {
   it('matches the cap table and 409A history', () => {
     expect(db.equity).toMatchObject({ authorizedShares: 15_000_000, fullyDilutedShares: 12_000_000, founderShares: 7_000_000, poolShares: 1_200_000 })
+    // Confirmed numbers, so the sample's offer letters state the % of fully diluted shares.
+    expect(capTableIsPlaceholder(db)).toBe(false)
     expect(current409A(db, TODAY)?.fmvPerShare).toBe(1.15)
     expect(current409A(db, '2026-01-22')?.fmvPerShare).toBe(0.25)
     expect(valuationWarnings(db, TODAY)).toEqual([])

@@ -238,32 +238,29 @@ export function openTrainingRows(db: DB, date: ISODate, course: TrainingCourse):
   return out
 }
 
-/** The last day worked, when it is before the date (the person has left). */
-function leftBefore(person: Person, date: ISODate): ISODate | undefined {
-  const last = person.separation?.lastDay ?? person.endDate ?? undefined
-  return last && last < date ? last : undefined
+/** The last day worked, recorded or scheduled. */
+function lastDayOf(person: Person): ISODate | undefined {
+  return person.separation?.lastDay ?? person.endDate ?? undefined
+}
+
+/** A row that is not owed: a completion that is still valid shows as done, the rest as not required. */
+function notOwed(r: TrainingRow, date: ISODate, reason: string): TrainingRow {
+  const valid = !!r.completedOn && !!r.nextDueOn && date <= r.nextDueOn
+  return { ...r, required: false, recommended: false, reason, status: valid ? 'done' : 'not_required', dueOn: valid ? r.dueOn : undefined }
 }
 
 /**
  * One row per course for a person on the date: harassment (1 or 2 hours), security awareness, WVPP.
- * After the last day nothing is required: a completion that is still valid shows as done, the rest as
- * not required.
+ * After the last day nothing is required. Before a scheduled last day, a course that falls due after it
+ * is not required either (the person leaves first), the way startOffboarding drops pending trainings
+ * due after the last day.
  */
 export function trainingRequirements(db: DB, person: Person, date: ISODate): TrainingRow[] {
   const rows = [harassmentRow(db, person, date), securityRow(db, person, date), wvppRow(db, person, date)]
-  const left = leftBefore(person, date)
-  if (!left) return rows
-  return rows.map((r) => {
-    const valid = !!r.completedOn && !!r.nextDueOn && date <= r.nextDueOn
-    return {
-      ...r,
-      required: false,
-      recommended: false,
-      reason: `Left on ${fmtDate(left)}; no longer required.`,
-      status: valid ? 'done' : 'not_required',
-      dueOn: valid ? r.dueOn : undefined,
-    }
-  })
+  const last = lastDayOf(person)
+  if (!last) return rows
+  if (last < date) return rows.map((r) => notOwed(r, date, `Left on ${fmtDate(last)}; no longer required.`))
+  return rows.map((r) => (r.required && r.dueOn && r.dueOn > last ? notOwed(r, date, `Leaves ${fmtDate(last)}, before it is due; not required.`) : r))
 }
 
 export type TrainingMatrix = {

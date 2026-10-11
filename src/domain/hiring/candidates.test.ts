@@ -36,6 +36,19 @@ describe('addCandidate', () => {
     ])
   })
 
+  it('keeps an hourly desired pay with its unit, and stores no unit for a yearly figure', () => {
+    let hourly = ''
+    let yearly = ''
+    const db = produce(fixtureDB(), (d) => {
+      hourly = addCandidate(d, { firstName: 'Ana', lastName: 'Ruiz', email: 'ana@example.com', source: 'inbound', desiredPay: 29.5, desiredPayUnit: 'hour' }, { date: FRI }).candidateId
+      yearly = addCandidate(d, { firstName: 'Bo', lastName: 'Lee', email: 'bo@example.com', source: 'inbound', desiredPay: 62_000, desiredPayUnit: 'year' }, { date: FRI }).candidateId
+    })
+    expect(db.candidates.find((c) => c.id === hourly)).toMatchObject({ desiredPay: 29.5, desiredPayUnit: 'hour' })
+    const bo = db.candidates.find((c) => c.id === yearly)!
+    expect(bo.desiredPay).toBe(62_000)
+    expect('desiredPayUnit' in bo).toBe(false)
+  })
+
   it('does not create a second application for the same job', () => {
     produce(fixtureDB(), (d) => {
       expect(addApplication(d, 'c-alex', 'j-fullstack', { date: FRI })).toBe('a-alex')
@@ -125,5 +138,30 @@ describe('messages', () => {
     const m = offerNudgeMessage(db, 'o-1')!
     expect(m.body).toContain('It is open until Wed Oct 14.')
     expect(m.subject).toBe('Checking in on your Ledgerlark offer')
+    expect(offerNudgeMessage(db, 'o-1', { date: '2026-10-14' })?.body).toContain('It is open until Wed Oct 14.')
+  })
+
+  it('never nudges with an expiry date that has already passed', () => {
+    const db = produce(fixtureDB(), (d) => {
+      d.offers.push({ id: 'o-1', candidateId: 'c-alex', title: 'Senior full-stack engineer', status: 'sent', expiresOn: '2026-10-14' } as (typeof d.offers)[number])
+    })
+    expect(offerNudgeMessage(db, 'o-1', { date: '2026-10-19' })).toBeNull()
+    const expired = produce(db, (d) => {
+      d.offers[0].status = 'expired'
+    })
+    expect(offerNudgeMessage(expired, 'o-1', { date: '2026-10-12' })).toBeNull()
+  })
+
+  it('addresses the close-out note to the sender only when they have a work email', () => {
+    const db = produce(fixtureDB(), (d) => {
+      const founder = d.people.find((p) => p.isFounder)
+      if (founder) founder.workEmail = ''
+    })
+    const note = closeOutMessage(db, 'j-fullstack')!
+    expect(note.from).toBe('')
+    expect(note.mailto.startsWith('mailto:?bcc=')).toBe(true)
+    const withEmail = closeOutMessage(fixtureDB(), 'j-fullstack', { senderId: 'p-tomas' })!
+    expect(withEmail.from).toBe('tomas@ledgerlark.com')
+    expect(withEmail.mailto.startsWith('mailto:tomas@ledgerlark.com?bcc=')).toBe(true)
   })
 })

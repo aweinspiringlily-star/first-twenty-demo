@@ -18,6 +18,7 @@ import { TASK_IDS } from '@/domain/checklists/templates'
 import { currentActorId, logActivity, useDB } from '@/store/db'
 import { Badge, Button, Callout, ChipGroup, CitationChip, ConfirmButton, cx, Field, Icon, TextArea, TextInput, toast } from '@/ui'
 import { act, SubPanel } from '../interviews/common'
+import { NOTE_MAX_CHARS } from '../logic'
 import { backgroundStep, checkCleared, contingenciesCleared } from './logic'
 
 const FCA = { label: 'Gov Code 12952', url: 'https://calcivilrights.ca.gov/wp-content/uploads/sites/32/2025/07/Fair-Chance-Act-Factsheet_English.pdf' }
@@ -246,7 +247,7 @@ function FairChanceStepper({ offer, bg }: { offer: Offer; bg: BackgroundCheck })
         return s.done ? null : (
           <div className="flex w-full flex-col gap-2">
             <Field label="Assessment note" hint="Short reasoning only: the factors you weighed for this job. Never paste the report.">
-              {(id, describedBy) => <TextArea id={id} rows={3} aria-describedby={describedBy} value={note} onChange={(e) => setNote(e.target.value)} />}
+              {(id, describedBy) => <TextArea id={id} rows={3} maxLength={NOTE_MAX_CHARS} aria-describedby={describedBy} value={note} onChange={(e) => setNote(e.target.value)} />}
             </Field>
             <div>
               <Button size="sm" variant="primary" disabled={!note.trim()} onClick={() => fair(`Recorded the Fair Chance assessment for ${name}`, { assessmentOn: date, assessmentNote: note.trim() })}>
@@ -338,14 +339,14 @@ function FairChanceStepper({ offer, bg }: { offer: Offer; bg: BackgroundCheck })
       ) : (
         <div className="mt-4 flex flex-col gap-2 border-t border-line pt-3">
           <Field label="Decision reason" hint="Logged on the offer's history.">
-            {(id, describedBy) => <TextInput id={id} aria-describedby={describedBy} value={reason} onChange={(e) => setReason(e.target.value)} />}
+            {(id, describedBy) => <TextInput id={id} aria-describedby={describedBy} maxLength={NOTE_MAX_CHARS} value={reason} onChange={(e) => setReason(e.target.value)} />}
           </Field>
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" icon="check" onClick={() => decide('proceed')}>
               Proceed with the offer
             </Button>
             {fc.finalNoticeOn ? (
-              <ConfirmButton disabled={!reason.trim()} onConfirm={() => decide('rescind')} confirmLabel="Click again to rescind">
+              <ConfirmButton disabled={!reason.trim()} onConfirm={() => decide('rescind')} confirmLabel="Press again to rescind">
                 Rescind the offer
               </ConfirmButton>
             ) : (

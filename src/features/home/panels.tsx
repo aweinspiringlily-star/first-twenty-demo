@@ -53,7 +53,7 @@ export function GrowthPanel({ solo }: { solo?: boolean }) {
       {solo && !g.hasPlan && (
         <p className="mt-2 text-[13.5px] text-ink-3">
           It's just you for now. Add plan lines in{' '}
-          <a href={links.comp('plan')} className="font-semibold text-accent underline underline-offset-2">
+          <a href={links.comp('plan')} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline underline-offset-2">
             Comp and plan
           </a>{' '}
           to see the dotted plan line.
@@ -252,14 +252,29 @@ export function FirstHireKitPanel({ showOpenJob = true }: { showOpenJob?: boolea
                       {item.neededBy}
                     </Badge>
                   )}
+                  {item.due && (
+                    <Badge tone={item.due.estimated ? 'neutral' : 'warn'} icon="clock">
+                      {item.due.text}
+                    </Badge>
+                  )}
                   {item.done && (
                     <Badge tone="good" icon="check">
                       {item.onFile ?? (item.doneOn ? `Done ${fmtDate(item.doneOn)}` : 'Done')}
                     </Badge>
                   )}
                   <CitationChip label={item.link.label} url={item.link.url} />
+                  {item.go && !item.done && admin && (
+                    <a href={item.go.href} className="inline-flex min-h-10 items-center rounded-full px-2.5 text-[12.5px] font-semibold text-accent hover:bg-accent-soft">
+                      {item.go.label}
+                    </a>
+                  )}
+                  {item.due?.estimated && (
+                    <a href={links.settings('company')} className="inline-flex min-h-10 items-center rounded-full px-2.5 text-[12.5px] font-semibold text-accent hover:bg-accent-soft">
+                      Add the first payroll date
+                    </a>
+                  )}
                   {item.key === 'kit-payroll' && !item.done && (
-                    <a href={links.settings('links')} className="inline-flex h-7 items-center rounded-full px-2.5 text-[12.5px] font-semibold text-accent hover:bg-accent-soft">
+                    <a href={links.settings('links')} className="inline-flex min-h-10 items-center rounded-full px-2.5 text-[12.5px] font-semibold text-accent hover:bg-accent-soft">
                       Save the link in Settings
                     </a>
                   )}

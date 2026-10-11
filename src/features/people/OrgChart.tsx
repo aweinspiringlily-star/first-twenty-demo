@@ -278,7 +278,7 @@ export function OrgChart() {
       <p className="text-[13px] text-ink-3">
         Built from each person's manager. Change a manager with Change job or pay on their profile.{' '}
         {viewer.role === 'admin' && (
-          <a href={links.comp('plan')} className="font-semibold text-accent hover:underline">
+          <a href={links.comp('plan')} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent hover:underline">
             Planned roles come from the headcount plan.
           </a>
         )}

@@ -6,6 +6,7 @@ import { resolveViewer } from '@/app/useViewer'
 import type { Checklist, Contractor, DB } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
 import { produce } from 'immer'
+import { generateChecklist } from '@/domain/checklists/generate'
 import { openJobFromPlan } from '@/domain/lifecycle'
 import {
   ab5Result,
@@ -14,6 +15,8 @@ import {
   backfillTargetStart,
   buildOrgTree,
   canActOnTask,
+  contractorSizeError,
+  contractorTooLarge,
   convertedPerson,
   de542Status,
   directoryRows,
@@ -33,8 +36,12 @@ import {
   prepareBackfillSlot,
   releaseTerms,
   releaseText,
+  SCOPE_MAX_CHARS,
+  scopeCountText,
+  scopeSummary,
   splitName,
   startsInText,
+  taskOwnerText,
   titleFromScope,
   visibleOrgNodes,
   visibleTasks,
@@ -160,6 +167,40 @@ describe('checklist phases and due dates', () => {
     if (!day1) throw new Error('no I-9 section 1 task')
     expect(dueExplanation(db, cl, day1)).toBe('on the start date, Mon Oct 19')
   })
+  it('says when a company target moved off the weekend, and explains the sign-on bonus task', () => {
+    const lucas = db.people.find((p) => p.id === 'p-lucas')
+    if (!lucas) throw new Error('no Lucas')
+    const person = { ...lucas, id: 'p-nov', startDate: '2026-11-02' }
+    const cl = generateChecklist({ ...db, people: [...db.people, person] }, { person, templateId: 'tpl-onboarding', anchorDate: '2026-11-02', createdOn: TODAY })
+    const withNov = { ...db, people: [...db.people, person], checklists: [...db.checklists, cl] }
+    // Nov 2 + 90 days is Sun Jan 31: the check-in moved to Mon Feb 1.
+    const checkin = cl.tasks.find((t) => t.templateTaskId === 'on-checkin-90')
+    if (!checkin) throw new Error('no 90-day check-in')
+    expect(checkin.dueOn).toBe('2027-02-01')
+    expect(dueExplanation(withNov, cl, checkin)).toBe('90 days after Mon Nov 2, moved to the next business day')
+    // A legal deadline keeps its date: no move to explain.
+    const de34 = cl.tasks.find((t) => t.templateTaskId === 'on-de34')
+    if (!de34) throw new Error('no DE 34 task')
+    expect(dueExplanation(withNov, cl, de34)).toBe('20 days after Mon Nov 2')
+    // The sign-on bonus payroll task is added at hire, outside the template.
+    const bonus = { ...checkin, id: 't-nov-bonus', templateTaskId: 'on-sign-on-bonus', dueOn: '2026-11-02', dueRuleText: 'Start', statutory: false }
+    expect(dueExplanation(withNov, cl, bonus)).toBe('on the start date, Mon Nov 2')
+  })
+  it('gives the last-day tasks of a weekend termination no earlier file-by day', () => {
+    const kofi = db.people.find((p) => p.id === 'p-kofi')
+    if (!kofi) throw new Error('no Kofi')
+    const cl = generateChecklist(db, {
+      person: { ...kofi, endDate: '2026-10-10' },
+      templateId: 'tpl-offboarding',
+      anchorDate: '2026-10-10',
+      createdOn: '2026-10-10',
+      separationType: 'terminated',
+    })
+    const pay = cl.tasks.find((t) => t.templateTaskId === 'off-final-pay-termination')
+    if (!pay) throw new Error('no final pay task')
+    expect(dueLine(db, cl, pay).label).toBe('Due Sat Oct 10')
+    expect(cl.tasks.filter((t) => /file by/.test(dueLine(db, cl, t).label))).toEqual([])
+  })
   it('sorts groups in phase order', () => {
     const cl = checklistOf('p-lucas', 'onboarding')
     const groups = groupByPhase(cl, cl.tasks)
@@ -229,6 +270,25 @@ describe('checklist access', () => {
   })
 })
 
+describe('task owner text', () => {
+  it('names the assignee of an admin-tracked task without calling them Admin', () => {
+    const cl = checklistOf('p-lucas', 'onboarding')
+    const person = (id: string) => db.people.find((p) => p.id === id)
+    const tomas = person('p-tomas')
+    if (!tomas) throw new Error('no Tomas')
+    expect(taskOwnerText(db, cl, { ownerRole: 'admin', assigneeId: 'p-tomas' })).toBe(`Owner: ${tomas.firstName} ${tomas.lastName} (Admin tracks it)`)
+    expect(taskOwnerText(db, cl, { ownerRole: 'admin', assigneeId: null })).toBe('Owner: Admin')
+    expect(taskOwnerText(db, cl, { ownerRole: 'manager', assigneeId: 'p-tomas' })).toBe(`Owner: Manager, ${tomas.firstName} ${tomas.lastName}`)
+  })
+  it('gives an unassigned manager task to whoever manages the person now', () => {
+    const cl = checklistOf('p-lucas', 'onboarding')
+    const lucas = db.people.find((p) => p.id === 'p-lucas')
+    const manager = db.people.find((p) => p.id === lucas?.managerId)
+    if (!manager) throw new Error('no manager')
+    expect(taskOwnerText(db, cl, { ownerRole: 'manager', assigneeId: null })).toBe(`Owner: Manager, ${manager.firstName} ${manager.lastName}`)
+  })
+})
+
 describe('AB5 check', () => {
   it('needs all three prongs without an exemption', () => {
     expect(ab5Result({ exemption: 'none', a: true, b: true, c: true }).outcome).toBe('likely_ok')
@@ -281,6 +341,25 @@ describe('contractor paperwork', () => {
     expect(titleFromScope('Writes release notes and API docs.')).toBe('Release note writer')
     expect(titleFromScope('Brand identity and marketing website project.')).toBe('Brand identity')
     expect(titleFromScope('  ')).toBe('')
+  })
+  it('caps the scope of work and stops a record too large to sync', () => {
+    const c = k('k-marisol')
+    expect(scopeCountText('x'.repeat(1_799))).toBeNull()
+    expect(scopeCountText('x'.repeat(1_850))).toBe('1,850 of 2,000 characters')
+    expect(contractorSizeError({ ...c, scope: 'x'.repeat(SCOPE_MAX_CHARS) })).toBeUndefined()
+    expect(contractorSizeError({ ...c, scope: 'x'.repeat(SCOPE_MAX_CHARS + 1) })).toBe('A scope of work can be up to 2,000 characters. Shorten this one.')
+    // A pasted 300 KB scope saved before the cap: too large to sync, and only shortening it clears that.
+    const huge = { ...c, scope: 'x'.repeat(300_000) }
+    expect(contractorTooLarge(huge)).toBe(true)
+    expect(contractorTooLarge(c)).toBe(false)
+    expect(contractorSizeError(huge, { scopeChanged: false })).toBe('This contractor is too large to sync. Shorten the scope of work.')
+    expect(contractorSizeError({ ...c, scope: 'x'.repeat(5_000) }, { scopeChanged: false })).toBeUndefined()
+  })
+  it('sums up a scope in one line for the page subtitle', () => {
+    expect(scopeSummary('Reviews close-agent outputs.\nSecond line.')).toBe('Reviews close-agent outputs.')
+    const long = scopeSummary('word '.repeat(100))
+    expect(long.length).toBe(160)
+    expect(long.endsWith('...')).toBe(true)
   })
   it('links a converted contractor to the employee only while that record exists', () => {
     const c = k('k-marisol')

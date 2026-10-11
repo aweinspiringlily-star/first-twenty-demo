@@ -1,8 +1,9 @@
 import { produce } from 'immer'
 import { describe, expect, it, vi } from 'vitest'
+import { interviewCancelMessage } from '@/domain/hiring/messages'
 import { fixtureDB } from '@/domain/hiring/testkit'
-import type { ScheduleInput } from '@/domain/hiring/scheduling'
-import { latestStartedTime, logPastInterview, pastDayPresets, pastStart, pastTimes } from './pastInterview'
+import { interviewCancelICS, scheduleInterview, type ScheduleInput } from '@/domain/hiring/scheduling'
+import { defaultLogStep, latestStartedTime, logPastInterview, pastDayPresets, pastStart, pastTimes, scheduledForStep } from './pastInterview'
 
 vi.mock('@/data/seed', async () => {
   const { blankDB } = await import('@/data/blank')
@@ -70,5 +71,79 @@ describe('logPastInterview', () => {
   it('refuses a time that has not happened yet', () => {
     const db = fixtureDB()
     expect(() => produce(db, (d) => void logPastInterview(d, input('2026-10-12T17:00:00.000Z'), { date: SAT, now: '2026-10-10T17:00:00.000Z' }))).toThrow(/has not happened yet/)
+  })
+})
+
+describe('logging a step that is already on the calendar', () => {
+  const SUN = '2026-10-11'
+  /** Ben's intro call booked for Mon Oct 12, 10:00 AM PT with Tomas and Priya. */
+  function booked() {
+    let bookedId = ''
+    const db = produce(fixtureDB(), (d) => {
+      const intro = d.jobs[0].interviewPlan.find((s) => s.stageId === 'intro')!
+      bookedId = scheduleInterview(
+        d,
+        { applicationId: 'a-ben', stepId: intro.id, stageId: 'intro', name: intro.name, startsAt: '2026-10-12T17:00:00.000Z', durationMin: 30, interviewerIds: ['p-tomas', 'p-priya'], format: 'video', attributes: ['Communication'] },
+        { date: '2026-10-09' },
+      )
+    })
+    return { db, bookedId, intro: db.jobs[0].interviewPlan.find((s) => s.stageId === 'intro')! }
+  }
+
+  it('starts "Already happened" on the booked step, not the next one', () => {
+    const { db, bookedId, intro } = booked()
+    const app = db.applications.find((a) => a.id === 'a-ben')!
+    expect(defaultLogStep(db.jobs[0], app, db.interviews)?.id).toBe(intro.id)
+    expect(scheduledForStep(db.interviews, 'a-ben', intro.id)?.id).toBe(bookedId)
+    expect(scheduledForStep(db.interviews, 'a-ben', 'nope')).toBeUndefined()
+    expect(scheduledForStep(db.interviews, 'a-alex', intro.id)).toBeUndefined()
+    // With nothing booked it is the next step to schedule, as before.
+    const fresh = fixtureDB()
+    expect(defaultLogStep(fresh.jobs[0], fresh.applications.find((a) => a.id === 'a-ben')!, fresh.interviews)?.stageId).toBe('intro')
+  })
+
+  it('moves the booked interview to the time it was held, with one set of owed scorecards', () => {
+    const { db, bookedId, intro } = booked()
+    const now = '2026-10-11T17:30:00.000Z' // Sun 10:30 AM PT
+    let id = ''
+    const next = produce(db, (d) => {
+      id = logPastInterview(
+        d,
+        { applicationId: 'a-ben', stepId: intro.id, stageId: 'intro', name: intro.name, startsAt: pastStart(SUN, 9), durationMin: 30, interviewerIds: ['p-tomas', 'p-priya'], format: 'video', attributes: ['Communication'] },
+        { date: SUN, now, replacesId: bookedId },
+      )
+    })
+    expect(next.interviews.find((i) => i.id === bookedId)?.status).toBe('cancelled')
+    const held = next.interviews.find((i) => i.id === id)
+    expect(held).toMatchObject({ status: 'completed', startsAt: '2026-10-11T16:00:00.000Z', stepId: intro.id })
+    // Nothing for this step is left on the calendar, and only the held interview owes scorecards.
+    expect(next.interviews.filter((i) => i.applicationId === 'a-ben' && i.status === 'scheduled')).toEqual([])
+    const owed = next.scorecards.filter((s) => s.applicationId === 'a-ben' && !s.submittedAt)
+    expect(owed.map((s) => [s.interviewId, s.interviewerId])).toEqual([
+      [id, 'p-tomas'],
+      [id, 'p-priya'],
+    ])
+    const rows = next.activity.filter((a) => a.entityId === 'a-ben').slice(-1)
+    expect(rows[0]).toMatchObject({ kind: 'interview_completed' })
+    expect(rows[0].text).toBe(`Logged the ${intro.name.toLowerCase()} with Ben Ortiz, held Sun, Oct 11, 9:00 AM PT (it was on the calendar for Mon, Oct 12, 10:00 AM PT)`)
+    // The old time keeps its own cancellation file and a note that does not promise a new time.
+    expect(interviewCancelICS(next, bookedId, 'candidate')).toContain('METHOD:CANCEL')
+    const note = interviewCancelMessage(next, bookedId, { senderId: 'p-tomas', heldAt: held!.startsAt })
+    expect(note?.body).toContain('Since we already had it, the invite for Mon, Oct 12, 10:00 AM PT is no longer needed')
+    expect(note?.body).not.toContain('new time')
+  })
+
+  it('adds a new interview when nothing was booked for the step', () => {
+    const { db, bookedId, intro } = booked()
+    const tech = db.jobs[0].interviewPlan.find((s) => s.stageId === 'technical')!
+    const next = produce(db, (d) => {
+      logPastInterview(
+        d,
+        { applicationId: 'a-ben', stepId: tech.id, stageId: 'technical', name: tech.name, startsAt: pastStart(SUN, 9), durationMin: 60, interviewerIds: ['p-tomas'], format: 'video', attributes: [] },
+        { date: SUN, now: '2026-10-11T17:30:00.000Z' },
+      )
+    })
+    expect(next.interviews.find((i) => i.id === bookedId)?.status).toBe('scheduled')
+    expect(scheduledForStep(next.interviews, 'a-ben', intro.id)?.id).toBe(bookedId)
   })
 })

@@ -87,9 +87,25 @@ export function focusPageStart(): void {
 }
 
 /**
+ * Focuses a stand-in for the control the user last touched (its re-rendered twin, or a fallback such as
+ * the next action) and scrolls it into view when it is not fully on screen: unlike the original trigger,
+ * it may sit anywhere on the page (below the fold on a phone, or lower in a roomier look). It lands
+ * mid-screen, clear of the phone's fixed top bar and of a toast at the bottom.
+ */
+function focusStandIn(el: HTMLElement): void {
+  el.focus({ preventScroll: true })
+  const r = el.getBoundingClientRect()
+  const vh = window.innerHeight || document.documentElement.clientHeight
+  const vw = window.innerWidth || document.documentElement.clientWidth
+  if (r.top >= 0 && r.left >= 0 && r.bottom <= vh && r.right <= vw) return
+  el.scrollIntoView({ block: 'center', inline: 'nearest' })
+}
+
+/**
  * Puts focus back on `prev` after an overlay closes. When React replaced or removed it (a route
  * change, or the trigger disappeared because the action finished), focus goes to its replacement,
- * then to `fallback`, then to the page title, so keyboard users never land on <body>.
+ * then to `fallback`, then to the page title, so keyboard users never land on <body>. The original
+ * trigger is focused where it is (no scroll); a replacement or fallback is scrolled into view.
  */
 export function restoreFocus(prev: HTMLElement | null, fallback?: () => HTMLElement | null | undefined): void {
   const fp = prev ? fingerprint(prev) : null
@@ -103,7 +119,7 @@ export function restoreFocus(prev: HTMLElement | null, fallback?: () => HTMLElem
     }
     const repl = fp ? findReplacement(fp) : null
     if (repl) {
-      repl.focus({ preventScroll: true })
+      focusStandIn(repl)
       return true
     }
     return false
@@ -116,14 +132,29 @@ export function restoreFocus(prev: HTMLElement | null, fallback?: () => HTMLElem
   setTimeout(() => {
     if (attempt()) return
     const fb = fallback?.()
-    if (fb?.isConnected) fb.focus({ preventScroll: true })
+    if (fb?.isConnected) focusStandIn(fb)
     else focusPageStart()
   }, 0)
+}
+
+/** Open focus traps, oldest first. Only the newest (topmost) one pulls stray focus back, as with Escape. */
+const trapStack: object[] = []
+
+/**
+ * Focus outside the topmost trapped overlay that is still fine: a menu (menus render in a portal), a
+ * toast, or another modal dialog with its own focus handling (the search palette opened over a sheet).
+ */
+function focusMayLeave(trap: HTMLElement, node: Element): boolean {
+  if (node.closest('[role="menu"], .ft-toaster')) return true
+  const dialog = node.closest('[role="dialog"][aria-modal="true"]')
+  return !!dialog && dialog !== trap
 }
 
 /**
  * Keeps Tab focus inside the container and restores focus when it closes. Initial focus goes to
  * [data-autofocus], else the first control in the body, so a reflexive Enter never hits Close.
+ * When focus falls out of the topmost one (a control that removed itself leaves it on <body>, or a
+ * script focused the page behind), the next Tab, or the stray focus itself, brings it back inside.
  */
 export function useFocusTrap(
   ref: React.RefObject<HTMLElement | null>,
@@ -159,8 +190,31 @@ export function useFocusTrap(
       }
     }
     el.addEventListener('keydown', onKey)
+    const token = {}
+    trapStack.push(token)
+    const isTop = () => trapStack[trapStack.length - 1] === token
+    const strayed = (node: Element | null) => !node || node === document.body || (!el.contains(node) && !focusMayLeave(el, node))
+    // Tab from <body> (or from the page behind) goes to the first control, Shift+Tab to the last.
+    const onDocKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab' || e.defaultPrevented || !isTop() || !strayed(document.activeElement)) return
+      const f = focusablesIn(el)
+      if (f.length === 0) return
+      e.preventDefault()
+      ;(e.shiftKey ? f[f.length - 1] : f[0]).focus()
+    }
+    const onFocusIn = (e: FocusEvent) => {
+      const target = e.target instanceof Element ? e.target : null
+      if (!isTop() || !target || target === document.body || !strayed(target)) return
+      focusablesIn(el)[0]?.focus()
+    }
+    document.addEventListener('keydown', onDocKey)
+    document.addEventListener('focusin', onFocusIn)
     return () => {
       el.removeEventListener('keydown', onKey)
+      document.removeEventListener('keydown', onDocKey)
+      document.removeEventListener('focusin', onFocusIn)
+      const i = trapStack.lastIndexOf(token)
+      if (i !== -1) trapStack.splice(i, 1)
       el.setAttribute('data-overlay-closing', '')
       restoreFocus(prev && prev !== document.body ? prev : null, returnFocus.current)
     }
@@ -299,12 +353,12 @@ export function Modal({
 }
 
 /**
- * Two-step button for destructive or irreversible actions: the first click arms it,
- * the second confirms. Disarms after 4 seconds or on blur.
+ * Two-step button for destructive or irreversible actions: the first press (click, Enter or Space) arms
+ * it, the second confirms. Disarms after 4 seconds or on blur.
  */
 export function ConfirmButton({
   onConfirm,
-  confirmLabel = 'Click again to confirm',
+  confirmLabel = 'Press again to confirm',
   children,
   variant = 'secondary',
   ...rest

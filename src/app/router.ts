@@ -50,7 +50,11 @@ export function href(...segments: Array<string | null | undefined | false>): str
 }
 
 export function navigate(...segments: Array<string | null | undefined | false>): void {
-  const h = href(...segments)
+  navigateTo(href(...segments))
+}
+
+/** Goes to an href built with href(...) or links.* (nothing happens when the page is already there). */
+export function navigateTo(h: string): void {
   if (window.location.hash !== h) window.location.hash = h.slice(1)
 }
 
@@ -71,6 +75,8 @@ export const links = {
   hiring: (tab?: 'jobs' | 'candidates' | 'offers' | 'kits') => href('hiring', tab),
   job: (id: string, view?: 'board' | 'list' | 'sweep' | 'edit' | 'posting') => href('job', id, view),
   candidate: (id: string) => href('candidate', id),
+  /** The candidate's profile with focus on one application's offer (its next action: Make offer, Mark sent, Hire). */
+  candidateOffer: (id: string, applicationId: string) => href('candidate', id, 'offer', applicationId),
   newCandidate: (jobId?: string) => href('hiring', 'add', jobId),
   newJob: (planSlotId?: string) => href('hiring', 'new-job', planSlotId),
   // People

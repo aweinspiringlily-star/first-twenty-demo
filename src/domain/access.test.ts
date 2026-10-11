@@ -3,7 +3,7 @@
 import '@/store/db'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { buildSampleDB } from '@/data/seed'
-import { canSeeCandidatePay, canSeeOffer, canSeeOthersScorecards, isHiredApplication } from '@/domain/access'
+import { canApproveTimeOff, canSeeCandidatePay, canSeeOffer, canSeeOthersScorecards, canSeeSeparation, isHiredApplication } from '@/domain/access'
 import type { DB, Viewer } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
 
@@ -59,5 +59,31 @@ describe('independent scorecards per interview', () => {
     expect(canSeeOthersScorecards(hannah, db, app, { nowISO: new Date(Date.parse(later.startsAt) - 3_600_000).toISOString() })).toBe(true)
     // Once it has started and her card for it is still open, others' cards stay hidden.
     expect(canSeeOthersScorecards(hannah, db, app, { nowISO: new Date(Date.parse(later.startsAt) + 26 * 3_600_000).toISOString() })).toBe(false)
+  })
+})
+
+describe('pending departures', () => {
+  it('shows a last day still ahead only to Admin, the person and their manager line', () => {
+    // Kofi reports to Tomas, who reports to the founder; Nikhil also reports to Tomas.
+    expect(canSeeSeparation(viewer('admin', 'p-founder'), db, 'p-kofi')).toBe(true)
+    expect(canSeeSeparation(viewer('employee', 'p-kofi'), db, 'p-kofi')).toBe(true)
+    expect(canSeeSeparation(viewer('manager', 'p-tomas'), db, 'p-kofi')).toBe(true)
+    expect(canSeeSeparation(viewer('employee', 'p-aisha'), db, 'p-kofi')).toBe(false)
+    expect(canSeeSeparation(viewer('employee', 'p-nikhil'), db, 'p-kofi')).toBe(false)
+    // A manager outside the line, and the manager in the Employee preview, do not
+    expect(canSeeSeparation(viewer('manager', 'p-elena'), db, 'p-kofi')).toBe(false)
+    expect(canSeeSeparation(viewer('employee', 'p-tomas'), db, 'p-kofi')).toBe(false)
+  })
+})
+
+describe('time off approvals', () => {
+  it('leaves sick leave that falls before the 90-day wait to Admin', () => {
+    const base = { id: 'tr-x', personId: 'p-kofi', startDate: '2026-10-12', endDate: '2026-10-12', hours: 8, status: 'pending' as const, requestedOn: '2026-10-09' }
+    const vacation = { ...base, policyId: 'pol-vacation' }
+    const sick = { ...base, policyId: 'pol-sick' }
+    expect(canApproveTimeOff(viewer('manager', 'p-tomas'), db, vacation)).toBe(true)
+    expect(canApproveTimeOff(viewer('manager', 'p-elena'), db, vacation)).toBe(false)
+    expect(canApproveTimeOff(viewer('manager', 'p-tomas'), db, sick)).toBe(false)
+    expect(canApproveTimeOff(viewer('admin', 'p-founder'), db, sick)).toBe(true)
   })
 })

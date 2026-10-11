@@ -14,7 +14,7 @@ import {
   type RuleAction,
   type RuleResult,
 } from '@/domain/compliance'
-import { setCountOverride, setRuleActionDone, setRuleDeadline, setRuleStatus } from '@/domain/compliance/actions'
+import { setCountOverride, setRuleActionDone, setRuleDeadline, setRuleStatus, trainingsRecordedBy } from '@/domain/compliance/actions'
 import type { DB } from '@/domain/types'
 import { addDays, fmtDate, type ISODate, parseDate, today } from '@/lib/dates'
 import { plural } from '@/lib/format'
@@ -38,6 +38,7 @@ import {
   TextArea,
   TextInput,
   TextLink,
+  toast,
 } from '@/ui'
 import { Disclosure, LegalNote } from './bits'
 import {
@@ -61,6 +62,17 @@ import { commit } from './mutate'
 import { NextThresholdBody, ThresholdPreview } from './panels'
 
 type Filter = 'all' | 'action' | 'done' | 'later'
+
+/**
+ * The longest note a rule card keeps (a not-applicable reason, a deadline's source, a count override's why).
+ * Every rule's status syncs as one record of at most 256 KB (docs/SYNC.md), so each note stays short.
+ */
+const NOTE_MAX = 2_000
+
+/** ' 1,850 of 2,000 characters.' once a note gets close to NOTE_MAX, else ''. */
+function noteCount(text: string): string {
+  return text.length >= NOTE_MAX - 200 ? ` ${text.length.toLocaleString('en-US')} of ${NOTE_MAX.toLocaleString('en-US')} characters.` : ''
+}
 
 export function MilestonesTab({ ruleId }: { ruleId?: string }) {
   const db = useDB((s) => s.db)
@@ -387,8 +399,18 @@ function RuleCard({
             <ul className="flex flex-col gap-1 text-[14px] text-ink-2">
               {ownDue && (
                 <li>
-                  Due {fmtDate(ownDue.on)}
-                  {ownDue.recorded ? ' (deadline you recorded)' : ''}.
+                  {r.dueEstimated && !ownDue.recorded ? (
+                    <>
+                      Due about {fmtDate(ownDue.on)} (estimated).{' '}
+                      <TextLink href={links.settings('company')}>Add your first payroll date in Settings, Company</TextLink>{' '}
+                      for the exact deadline.
+                    </>
+                  ) : (
+                    <>
+                      Due {fmtDate(ownDue.on)}
+                      {ownDue.recorded ? ' (deadline you recorded)' : ''}.
+                    </>
+                  )}
                 </li>
               )}
               {cycle && <li>{cycle}</li>}
@@ -477,7 +499,7 @@ function RuleFollowUps({ r, followUps, db }: { r: RuleResult; followUps: RuleFol
                 <p className="text-[14.5px] font-semibold text-ink">{f.title}</p>
                 <p className="text-[13px] font-semibold text-bad">{followUpDueText(f, t)}</p>
               </div>
-              <TextLink href={link.href} className="inline-flex min-h-10 items-center text-[14px]">
+              <TextLink href={link.href} hitArea={false} className="inline-flex min-h-10 items-center text-[14px]">
                 {link.label}
               </TextLink>
             </li>
@@ -493,6 +515,20 @@ function rawKeysFor(r: RuleResult, a: RuleAction, db: DB): boolean {
   if (raw[a.id]) return true
   const yearly = !!r.rule.cycle?.actionIds.includes(a.id)
   return Object.keys(raw).some((k) => k.startsWith(`${a.id}@`) || (yearly && /^year-\d{4}$/.test(k)))
+}
+
+/**
+ * Done today on a rule step. SB 553 'Train everyone' also records a WVPP completion for everyone in scope
+ * (legal training records, kept 1 year), so its toast says how many and links to the Training tab.
+ */
+function markActionDone(db: DB, ruleId: string, a: RuleAction) {
+  const t = today()
+  const trained = trainingsRecordedBy(db, ruleId, a.id, t)
+  const text = trained ? `Recorded WVPP training for ${plural(trained, 'person', 'people')} today` : `Done: ${a.title}`
+  if (!commit(text, (d) => setRuleActionDone(d, ruleId, a.id, t), { quiet: trained > 0 })) return
+  if (trained) {
+    toast({ text, action: { label: 'Undo', onClick: () => useDB.getState().undo() }, link: { label: 'Review in Training', href: links.compliance('training') } })
+  }
 }
 
 function RuleActions({ r, db }: { r: RuleResult; db: DB }) {
@@ -532,7 +568,7 @@ function RuleActions({ r, db }: { r: RuleResult; db: DB }) {
                 size="md"
                 variant={r.state === 'applies' ? 'primary' : 'secondary'}
                 icon="check"
-                onClick={() => commit(`Done: ${a.title}`, (d) => setRuleActionDone(d, rule.id, a.id, today()))}
+                onClick={() => markActionDone(db, rule.id, a)}
               >
                 Done today
               </Button>
@@ -568,7 +604,7 @@ function CountOverride({ r }: { r: RuleResult }) {
           {(id, d) => <NumberInput id={id} aria-describedby={d} min={0} step={1} value={value} onChange={setValue} />}
         </Field>
         <Field label="Why (required)" id={`ov-note-${r.rule.id}`}>
-          {(id) => <TextInput id={id} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Say why the count differs" />}
+          {(id) => <TextInput id={id} maxLength={NOTE_MAX} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Say why the count differs" />}
         </Field>
       </FormGrid>
       <ChipGroup<string>
@@ -666,8 +702,8 @@ function NotApplicableModal({ result, onClose }: { result: RuleResult | null; on
     >
       <p className="text-[14px] text-ink-2">Say why, so the next person (or an auditor) knows. You can clear this later from the card.</p>
       <ChipGroup<string> className="mt-3" label="Reason" value={reason} onChange={setReason} options={NA_REASONS.map((n) => ({ value: n, label: n }))} />
-      <Field label="Note" className="mt-3" hint="Optional when a reason above fits.">
-        {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} value={note} onChange={(e) => setNote(e.target.value)} />}
+      <Field label="Note" className="mt-3" hint={`Optional when a reason above fits.${noteCount(note)}`}>
+        {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} maxLength={NOTE_MAX} value={note} onChange={(e) => setNote(e.target.value)} />}
       </Field>
     </Modal>
   )
@@ -727,7 +763,7 @@ function DeadlineModal({ result, onClose }: { result: RuleResult | null; onClose
         />
       </div>
       <Field label="Note" className="mt-3" hint="Optional, for example where the date came from.">
-        {(id, d) => <TextInput id={id} aria-describedby={d} value={note} onChange={(e) => setNote(e.target.value)} />}
+        {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={NOTE_MAX} value={note} onChange={(e) => setNote(e.target.value)} />}
       </Field>
     </Modal>
   )

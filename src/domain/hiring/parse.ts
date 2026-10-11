@@ -88,10 +88,25 @@ function looksLikeName(line: string): boolean {
   if (!line || line.length > 60) return false
   if (/[@\d:/|]|https?|www\./i.test(line)) return false
   if (/^(best|thanks|thank you|regards|kind regards|cheers|sincerely|warmly|hi|hello|hey|dear|sent from|get outlook|on .* wrote)\b/i.test(line)) return false
+  // Contact labels left behind once the number or address is taken out ('Work Phone (408) 555-0101').
+  if (/\b(phone|mobile|cell|tel|telephone|fax|e-?mail|website|portfolio|contact|linkedin|github)\b/i.test(line)) return false
   const words = line.split(/\s+/).filter(Boolean)
   if (words.length < 2 || words.length > 4) return false
   if (/\b(at|engineer|manager|director|lead|founder|ceo|cto|cfo|senior|staff|head|president|accountant|controller|designer|analyst|consultant|inc|llc|corp)\b/i.test(line)) return false
   return words.every((w) => NAME_PARTICLES.includes(w.toLowerCase()) || /^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'.-]*$/.test(w))
+}
+
+/**
+ * A line without its email addresses, links and phone numbers, and the separators left at its ends, so
+ * 'Marco Bianchi marco.b@example.com' or 'marco.b@example.com | Marco Bianchi' still reads as a name.
+ */
+function withoutContacts(line: string): string {
+  return line
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, ' ')
+    .replace(/https?:\/\/\S+|\bwww\.\S+|\b(?:[a-z]{2,3}\.)?(?:linkedin|github)\.com\/\S*/gi, ' ')
+    .replace(/(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b|\+\d{1,3}[\s.-]?\d[\d\s.-]{6,14}\d/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s,;|·•<>–-]+|[\s,;|·•<>–-]+$/g, '')
 }
 
 function splitName(full: string): { firstName: string; lastName: string } {
@@ -165,7 +180,8 @@ export function parseCandidateBlob(text: string): ParsedCandidate {
   const phone = noUrls.match(/(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b|\+\d{1,3}[\s.-]?\d[\d\s.-]{6,14}\d/)
   if (phone) out.phone = formatPhone(phone[0])
 
-  // Name: "Name: X", then "Name <email>", then the first name-like line, then the LinkedIn slug, then the email.
+  // Name: "Name: X", then "Name <email>", then the first name-like line (with any email, link or phone on
+  // that line taken out), then the LinkedIn slug, then the email.
   let name: { firstName: string; lastName: string } | null = null
   const labeled = src.match(/^\s*(?:name|candidate)\s*[:\-]\s*(.+)$/im)
   if (labeled) {
@@ -179,7 +195,8 @@ export function parseCandidateBlob(text: string): ParsedCandidate {
   let nameLineIndex = -1
   if (!name) {
     for (let i = 0; i < lines.length; i++) {
-      const cleaned = stripNoise(lines[i].replace(/\s*[|,-]\s*LinkedIn\s*$/i, '').split(/\s+[|]\s+|\s+-\s+/)[0])
+      const bare = withoutContacts(lines[i].replace(/\s*[|,-]\s*LinkedIn\s*$/i, ''))
+      const cleaned = stripNoise(bare.split(/\s+[|]\s+|\s+-\s+/)[0])
       if (looksLikeName(cleaned)) {
         name = splitName(cleaned)
         nameLineIndex = i

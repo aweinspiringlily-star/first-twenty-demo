@@ -5,14 +5,27 @@ import { application, candidate, fixtureDB, FRI } from '@/domain/hiring/testkit'
 import type { DB, Job, Viewer } from '@/domain/types'
 import {
   candidateOfferOn,
+  changedFields,
+  conflictingFields,
+  JOB_DESC_MAX_CHARS,
+  jobDescCountText,
+  jobSizeError,
+  NOTE_MAX_CHARS,
+  officeOnly,
+  remoteLocationsFor,
+  noteCountText,
+  noteLengthError,
+  payTooHighError,
   candidateRows,
   candidateTimeline,
   compareJobs,
   emptySweepCounts,
   filterCandidateRows,
   guessTimezone,
+  hourlyDesiredFits,
   jobAgeText,
   lastActivityFor,
+  missingWorkEmailHint,
   moveStage,
   plannedRows,
   quickAddMatches,
@@ -23,6 +36,7 @@ import {
   stepToSchedule,
   sweepQueue,
   sweepSummaryText,
+  switchDesiredUnit,
   talentPool,
   textIssueError,
   textIssues,
@@ -417,5 +431,132 @@ describe('free-text guardrails', () => {
     expect(withOffer).toBeDefined()
     expect(candidateOfferOn(db, withOffer?.candidateId as string)).toBe(withOffer?.conditionalOfferOn)
     expect(candidateOfferOn(db, 'c-mateo-molina')).toBeNull()
+  })
+})
+
+describe('note length (sync limit)', () => {
+  it('caps one note and the record it lands in, and shows a count near the limit', () => {
+    expect(noteLengthError('A short note')).toBeUndefined()
+    expect(noteLengthError('x'.repeat(NOTE_MAX_CHARS))).toBeUndefined()
+    expect(noteLengthError('x'.repeat(NOTE_MAX_CHARS + 1))).toBe('Notes can be up to 20,000 characters. Shorten this one.')
+    expect(noteLengthError('x'.repeat(300_000))).toBe('Notes can be up to 20,000 characters. Shorten this one.')
+    expect(noteLengthError('x'.repeat(10_000), 195_000)).toBe('This note is too long to sync. Shorten it.')
+    expect(noteCountText('x'.repeat(100))).toBeNull()
+    expect(noteCountText('x'.repeat(18_250))).toBe('18,250 of 20,000 characters')
+  })
+})
+
+describe('job size (sync limit)', () => {
+  const job = (): Job => {
+    const j = fixtureDB().jobs.find((x) => x.id === 'j-fullstack')
+    if (!j) throw new Error('fixture job missing')
+    return j
+  }
+
+  it('caps the description, with a count near the limit', () => {
+    expect(jobSizeError(job())).toBeUndefined()
+    expect(jobSizeError({ ...job(), description: 'x'.repeat(JOB_DESC_MAX_CHARS) })).toBeUndefined()
+    expect(jobSizeError({ ...job(), description: 'x'.repeat(JOB_DESC_MAX_CHARS + 1) })).toBe('A job description can be up to 20,000 characters. Shorten this one.')
+    expect(jobSizeError({ ...job(), description: 'x'.repeat(290_000) })).toBe('A job description can be up to 20,000 characters. Shorten this one.')
+    expect(jobDescCountText('x'.repeat(100))).toBeNull()
+    expect(jobDescCountText('x'.repeat(18_250))).toBe('18,250 of 20,000 characters')
+  })
+
+  it('stops a job record that could never sync, even when the description was not edited', () => {
+    const huge = { ...job(), description: 'x'.repeat(280_000) }
+    expect(jobSizeError(huge, { descriptionChanged: false })).toBe('This job is too large to sync. Shorten the description.')
+    // An older description over the box limit that still syncs does not block other edits.
+    expect(jobSizeError({ ...job(), description: 'x'.repeat(25_000) }, { descriptionChanged: false })).toBeUndefined()
+    // Bytes, not characters: three-byte characters count three times toward the record budget.
+    const wide = { ...job(), stages: job().stages.map((s) => ({ ...s, name: '測'.repeat(30_000) })) }
+    expect(jobSizeError(wide, { descriptionChanged: false })).toBe('This job is too large to sync. Shorten the description.')
+  })
+})
+
+describe('remote jobs and locations', () => {
+  const locations = [
+    { id: 'loc-hq', kind: 'hq' as const, state: 'CA' },
+    { id: 'loc-remote-tx', kind: 'remote' as const, state: 'TX' },
+    { id: 'loc-remote-ca', kind: 'remote' as const, state: 'CA' },
+  ]
+
+  it('picks the remote location in the office state when only offices are picked', () => {
+    expect(remoteLocationsFor(locations, ['loc-hq'])).toEqual(['loc-remote-ca'])
+    expect(remoteLocationsFor(locations, [])).toEqual(['loc-remote-tx'])
+    expect(remoteLocationsFor(locations.filter((l) => l.id !== 'loc-remote-ca'), ['loc-hq'])).toEqual(['loc-remote-tx'])
+  })
+
+  it('changes nothing when a remote location is picked or the workspace has none', () => {
+    expect(remoteLocationsFor(locations, ['loc-hq', 'loc-remote-tx'])).toBeUndefined()
+    expect(remoteLocationsFor([locations[0]], ['loc-hq'])).toBeUndefined()
+    expect(officeOnly(locations, ['loc-hq'])).toBe(true)
+    expect(officeOnly(locations, [])).toBe(true)
+    expect(officeOnly(locations, ['loc-remote-ca'])).toBe(false)
+  })
+})
+
+describe('pay sanity', () => {
+  it('flags amounts that are almost certainly typos', () => {
+    expect(payTooHighError(230_000, 'annual')).toBeUndefined()
+    expect(payTooHighError(2_000_000, 'annual')).toBeUndefined()
+    expect(payTooHighError(180_000_175_000, 'annual')).toBe('That looks too high. Check the number.')
+    expect(payTooHighError(1_000, 'hourly')).toBeUndefined()
+    expect(payTooHighError(1_750, 'hourly')).toBe('That looks too high. Check the number.')
+    expect(payTooHighError(null, 'annual')).toBeUndefined()
+  })
+})
+
+describe('desired pay unit', () => {
+  it('offers an hourly desired pay for an hourly posted range or a part-time job', () => {
+    expect(hourlyDesiredFits([{ payMax: 34, employmentType: 'part_time' }])).toBe(true)
+    expect(hourlyDesiredFits([{ payMax: 34, employmentType: 'full_time' }])).toBe(true)
+    expect(hourlyDesiredFits([{ payMax: 80_000, employmentType: 'part_time' }])).toBe(true)
+    expect(hourlyDesiredFits([{ payMax: 230_000, employmentType: 'full_time' }, undefined])).toBe(false)
+    expect(hourlyDesiredFits([{ payMax: null, employmentType: 'full_time' }])).toBe(false)
+    expect(hourlyDesiredFits([])).toBe(false)
+  })
+
+  it('converts a figure that only makes sense in the new unit, and keeps one typed for it', () => {
+    expect(switchDesiredUnit(62_000, 'hour')).toBe(29.75)
+    expect(switchDesiredUnit(30, 'hour')).toBe(30)
+    expect(switchDesiredUnit(30, 'year')).toBe(62_000)
+    expect(switchDesiredUnit(62_000, 'year')).toBe(62_000)
+    expect(switchDesiredUnit(null, 'hour')).toBeNull()
+  })
+})
+
+describe('edit sheets save only what changed', () => {
+  const opened = { title: 'ML engineer (agents)', description: 'Old', panelIds: ['p-1'] }
+
+  it('lists the fields the user changed, comparing arrays by value', () => {
+    expect(changedFields(opened, { ...opened, panelIds: ['p-1'] })).toEqual([])
+    expect(changedFields(opened, { ...opened, description: 'New' })).toEqual(['description'])
+  })
+
+  it('finds a field changed both here and on another computer, and ignores the ones only one side touched', () => {
+    const mine = { ...opened, description: 'New' }
+    // Another computer changed the title; this sheet changed only the description: no conflict.
+    expect(conflictingFields(opened, mine, { ...opened, title: 'Founding ML engineer (agents)' })).toEqual([])
+    // Both changed the title to different values: a conflict.
+    expect(conflictingFields(opened, { ...mine, title: 'ML engineer, agents' }, { ...opened, title: 'Founding ML engineer (agents)' })).toEqual(['title'])
+    // Both landed on the same value: not a conflict.
+    expect(conflictingFields(opened, { ...mine, title: 'Same' }, { ...opened, title: 'Same' })).toEqual([])
+  })
+})
+
+describe('a sender without a work email', () => {
+  it('says the same thing everywhere, links Admin to the person page, and tells others to ask Admin', () => {
+    expect(missingWorkEmailHint({ role: 'admin', personId: 'p-founder' }, 'p-founder', 'Maya Raman')).toEqual({
+      text: 'Add your work email to your profile so replies reach you.',
+      link: { href: '#person.p-founder', label: 'Open your profile' },
+    })
+    expect(missingWorkEmailHint({ role: 'admin', personId: 'p-jasmine' }, 'p-founder', 'Maya Raman')).toEqual({
+      text: "Add Maya Raman's work email to their profile so replies reach them.",
+      link: { href: '#person.p-founder', label: 'Open their profile' },
+    })
+    // Only Admin sets work emails: a hiring manager gets no link to a field they cannot change.
+    expect(missingWorkEmailHint({ role: 'manager', personId: 'p-tomas' }, 'p-tomas', 'Tomas Herrera')).toEqual({
+      text: 'Ask Admin to add your work email to your profile so replies reach you.',
+    })
   })
 })

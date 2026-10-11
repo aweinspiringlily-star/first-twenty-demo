@@ -1,14 +1,15 @@
 // Small building blocks shared across the People pages: employee numbers, status badges, the AB5
 // chip and the checklist task row (one-tap Done with Undo, Not applicable with a note, evidence link).
-import { useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { setTaskStatus } from '@/domain/checklists/actions'
+import { TASK_IDS } from '@/domain/checklists/templates'
 import { fullName, getPerson } from '@/domain/people'
 import type { Checklist, ChecklistTask, Contractor, DB, LeaveCase, Person } from '@/domain/types'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { daysBetween, fmtDate, fmtShort, type ISODate, today } from '@/lib/dates'
 import { useDB } from '@/store/db'
-import { Avatar, Badge, Button, ChipGroup, CitationChip, cx, Field, Icon, TextInput, toast, type Tone } from '@/ui'
+import { Avatar, Badge, Button, ChipGroup, CitationChip, cx, Field, Icon, restoreFocus, TextInput, toast, type Tone } from '@/ui'
 import {
   AB5_LABEL,
   ab5Result,
@@ -17,7 +18,9 @@ import {
   dayLabel,
   type DirStatus,
   dueLine,
-  OWNER_LABEL,
+  LINE_MAX_CHARS,
+  LINK_MAX_CHARS,
+  taskOwnerText,
 } from './helpers'
 
 export const LEAVE_KIND_LABEL: Record<LeaveCase['kind'], string> = {
@@ -64,7 +67,7 @@ export function PersonChip({
     <span className="inline-flex min-w-0 items-center gap-2.5">
       <Avatar name={fullName(person)} size={size} muted={muted} />
       {link ? (
-        <a href={links.person(person.id)} className="min-w-0 hover:[&_.font-semibold]:text-accent">
+        <a href={links.person(person.id)} className="-my-2.5 inline-flex min-h-10 min-w-0 items-center hover:[&_.font-semibold]:text-accent">
           {name}
         </a>
       ) : (
@@ -74,19 +77,24 @@ export function PersonChip({
   )
 }
 
-/** Pre-start, Active, On leave (back Jan 11), Alumni. Leave type only for those allowed to see it. */
+/**
+ * Pre-start, Active, On leave (back Jan 11), Last day Oct 30, Alumni. Leave type only for those allowed
+ * to see it; a last day still ahead only with showLastDay (canSeeSeparation), else they read Active.
+ */
 export function PersonStatusBadge({
   db,
   person,
   status,
   leave,
   showLeaveType,
+  showLastDay,
 }: {
   db: DB
   person: Person
   status: DirStatus
   leave?: LeaveCase
   showLeaveType?: boolean
+  showLastDay?: boolean
 }) {
   const t = today()
   if (status === 'starting') {
@@ -108,7 +116,7 @@ export function PersonStatusBadge({
       </Badge>
     )
   }
-  if (person.endDate && person.endDate >= t) {
+  if (showLastDay && person.endDate && person.endDate >= t) {
     return (
       <Badge tone="warn" icon="clock">
         Last day {fmtShort(person.endDate)}
@@ -214,7 +222,9 @@ function moveFocusAfter(key: string): void {
 
 /**
  * One checklist task: title, state, a due date that explains itself (and its weekend-aware file-by
- * day), owner, why with the citation, and the actions the viewer may take.
+ * day), owner, why with the citation, and the actions the viewer may take. The Not applicable and
+ * Evidence panels open below the buttons, take focus, and give it back to their button on Cancel,
+ * save or Escape.
  */
 export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist; task: ChecklistTask; showPerson?: boolean }) {
   const db = useDB((s) => s.db)
@@ -229,8 +239,24 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
   const uid = useId().replace(/:/g, '')
   const line = dueLine(db, checklist, task)
   const person = getPerson(db, checklist.personId)
-  const assignee = task.assigneeId ? getPerson(db, task.assigneeId) : undefined
   const open = task.status === 'open'
+  const naRef = useRef<HTMLButtonElement>(null)
+  const evidenceRef = useRef<HTMLButtonElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+
+  // An opened panel takes focus (its first control), so Tab continues inside it rather than past it.
+  useEffect(() => {
+    if (!mode) return
+    panelRef.current?.querySelector<HTMLElement>('input, textarea, button:not([tabindex="-1"]):not([disabled])')?.focus()
+  }, [mode])
+
+  const toggle = (m: 'na' | 'evidence') => setMode(mode === m ? null : m)
+  /** Closes the panel and gives focus back to the button that opened it. */
+  const closePanel = () => {
+    const trigger = mode === 'na' ? naRef.current : evidenceRef.current
+    setMode(null)
+    restoreFocus(trigger)
+  }
   const hasWhy = !!(task.why || task.citation || task.soc2Control || task.link)
 
   const focusKey = `${checklist.id}:${task.id}`
@@ -250,7 +276,7 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
       if (t) t.evidenceLink = link.trim() || undefined
     })
     undoToast(label)
-    setMode(null)
+    closePanel()
   }
 
   return (
@@ -282,7 +308,10 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
             </div>
             {showPerson && person && (
               <p className="mt-0.5 text-[13px] text-ink-3">
-                For <a className="font-semibold text-ink-2 hover:text-accent" href={links.checklist(checklist.id)}>{fullName(person)}</a>
+                For{' '}
+                <a className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-ink-2 hover:text-accent" href={links.checklist(checklist.id)}>
+                  {fullName(person)}
+                </a>
               </p>
             )}
             <p className="mt-1 text-[13.5px] text-ink-2" title={line.full}>
@@ -290,14 +319,13 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
               {line.explain && <span className="text-ink-2">{` · ${line.explain}`}</span>}
             </p>
             <p className="mt-0.5 text-[13px] text-ink-3">
-              Owner: {OWNER_LABEL[task.ownerRole]}
-              {assignee ? `, ${fullName(assignee)}` : ''}
+              {taskOwnerText(db, checklist, task)}
               {task.status === 'done' && task.doneById && getPerson(db, task.doneById) ? ` · done by ${fullName(getPerson(db, task.doneById) as Person)}` : ''}
             </p>
             {task.note && <p className="mt-1 text-[13.5px] text-ink-2">Note: {task.note}</p>}
             {task.evidenceLink && (
               <p className="mt-1 text-[13.5px]">
-                <a href={task.evidenceLink} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 font-semibold text-accent hover:underline">
+                <a href={task.evidenceLink} target="_blank" rel="noreferrer noopener" className="-my-2.5 inline-flex min-h-10 items-center gap-1 font-semibold text-accent hover:underline">
                   <Icon name="link" size={14} />
                   Evidence
                   <Icon name="external" size={12} />
@@ -309,6 +337,7 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
                 type="button"
                 aria-expanded={whyOpen}
                 aria-controls={`${uid}-why`}
+                aria-label={`Why this matters: ${task.title}`}
                 onClick={() => setWhyOpen((o) => !o)}
                 className="ft-why mt-1.5 inline-flex min-h-10 items-center gap-1 rounded-md text-[13.5px] font-semibold text-ink-2 hover:text-ink"
               >
@@ -322,62 +351,18 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   {task.citation && <CitationChip label={task.citation.label} url={task.citation.url} />}
                   {task.soc2Control && <Badge tone="outline">SOC 2 evidence</Badge>}
-                  {task.link && (
-                    <a href={task.link} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[13px] font-semibold text-accent hover:underline">
+                  {/* A link into the app (the accepted offer for a sign-on bonus) opens here, not in a new tab. */}
+                  {task.link && task.link.startsWith('#') ? (
+                    <a href={task.link} className="-my-2.5 inline-flex min-h-10 items-center gap-1 text-[13px] font-semibold text-accent hover:underline">
+                      {task.templateTaskId === TASK_IDS.signOnBonus ? 'Open the accepted offer' : 'Open the related record'} <Icon name="arrow-right" size={12} />
+                    </a>
+                  ) : task.link ? (
+                    <a href={task.link} target="_blank" rel="noreferrer noopener" className="-my-2.5 inline-flex min-h-10 items-center gap-1 text-[13px] font-semibold text-accent hover:underline">
                       Open the form or guide <Icon name="external" size={12} />
                     </a>
-                  )}
+                  ) : null}
                 </div>
                 {task.citation && <p className="mt-2 text-[12.5px] text-ink-3">Not legal advice; confirm with counsel or your PEO.</p>}
-              </div>
-            )}
-
-            {mode === 'na' && (
-              <div className="mt-3 rounded-xl border border-line bg-surface-2/60 p-3">
-                <p className="text-[13.5px] font-semibold text-ink-2">Why is it not needed?</p>
-                <ChipGroup
-                  label="Common reasons"
-                  size="sm"
-                  className="mt-2"
-                  value={NA_NOTES.includes(note) ? note : null}
-                  onChange={(v) => setNote(v)}
-                  options={NA_NOTES.map((n) => ({ value: n, label: n }))}
-                />
-                <Field label="Note" className="mt-2" id={`${uid}-na`} hint={task.statutory ? 'Items required by law need a note.' : undefined}>
-                  {(id, d) => <TextInput id={id} aria-describedby={d} value={note} onChange={(e) => setNote(e.target.value)} placeholder="One line is enough" />}
-                </Field>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button
-                    variant="primary"
-                    disabled={!note.trim()}
-                    onClick={() => {
-                      setStatus('not_applicable', `Marked not applicable: ${task.title}`, { note: note.trim() })
-                      setMode(null)
-                    }}
-                  >
-                    Mark not applicable
-                  </Button>
-                  <Button variant="ghost" onClick={() => setMode(null)}>
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            )}
-            {mode === 'evidence' && (
-              <div className="mt-3 rounded-xl border border-line bg-surface-2/60 p-3">
-                <Field label="Link to the proof" id={`${uid}-ev`} hint="Where it lives: the PEO, Drive or a ticket. Never upload the file here.">
-                  {(id, d) => (
-                    <TextInput id={id} aria-describedby={d} type="url" inputMode="url" value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://" />
-                  )}
-                </Field>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button variant="primary" onClick={saveEvidence}>
-                    Save link
-                  </Button>
-                  <Button variant="ghost" onClick={() => setMode(null)}>
-                    Cancel
-                  </Button>
-                </div>
               </div>
             )}
           </div>
@@ -396,7 +381,14 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
                   Done
                 </Button>
                 {canSkip && (
-                  <Button variant="ghost" aria-expanded={mode === 'na'} onClick={() => setMode(mode === 'na' ? null : 'na')}>
+                  <Button
+                    ref={naRef}
+                    variant="ghost"
+                    aria-expanded={mode === 'na'}
+                    aria-controls={mode === 'na' ? `${uid}-panel` : undefined}
+                    aria-label={`Not applicable: ${task.title}`}
+                    onClick={() => toggle('na')}
+                  >
                     Not applicable
                   </Button>
                 )}
@@ -413,17 +405,96 @@ export function TaskRow({ checklist, task, showPerson }: { checklist: Checklist;
               </Button>
             )}
             <Button
+              ref={evidenceRef}
               variant="ghost"
               icon="link"
               aria-expanded={mode === 'evidence'}
+              aria-controls={mode === 'evidence' ? `${uid}-panel` : undefined}
               aria-label={`${task.evidenceLink ? 'Edit' : 'Add'} evidence link: ${task.title}`}
-              onClick={() => setMode(mode === 'evidence' ? null : 'evidence')}
+              onClick={() => toggle('evidence')}
             >
               {task.evidenceLink ? 'Edit link' : 'Evidence'}
             </Button>
           </div>
         )}
       </div>
+      {/* Below the buttons that open it (full width, lined up with the title), so it comes next in Tab order. */}
+      {canAct && mode && (mode === 'evidence' || open) && (
+        <div
+          ref={panelRef}
+          id={`${uid}-panel`}
+          role="group"
+          aria-label={mode === 'na' ? `Not applicable: ${task.title}` : `Evidence link: ${task.title}`}
+          className="mt-3 ml-9 rounded-xl border border-line bg-surface-2/60 p-3"
+          onKeyDown={(e) => {
+            if (e.key !== 'Escape' || e.defaultPrevented) return
+            // Closes only this panel: a sheet or dialog underneath stays open.
+            e.preventDefault()
+            e.stopPropagation()
+            closePanel()
+          }}
+        >
+          {mode === 'na' ? (
+            <>
+              <p className="text-[13.5px] font-semibold text-ink-2">Why is it not needed?</p>
+              <ChipGroup
+                label="Common reasons"
+                size="sm"
+                className="mt-2"
+                value={NA_NOTES.includes(note) ? note : null}
+                onChange={(v) => setNote(v)}
+                options={NA_NOTES.map((n) => ({ value: n, label: n }))}
+              />
+              <Field label="Note" className="mt-2" id={`${uid}-na`} hint={task.statutory ? 'Items required by law need a note.' : undefined}>
+                {(id, d) => (
+                  <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={note} onChange={(e) => setNote(e.target.value)} placeholder="One line is enough" />
+                )}
+              </Field>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  variant="primary"
+                  disabled={!note.trim()}
+                  onClick={() => {
+                    // The task leaves the open list, so focus moves on to the next task (setStatus), not back here.
+                    setStatus('not_applicable', `Marked not applicable: ${task.title}`, { note: note.trim() })
+                    setMode(null)
+                  }}
+                >
+                  Mark not applicable
+                </Button>
+                <Button variant="ghost" onClick={closePanel}>
+                  Cancel
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <Field label="Link to the proof" id={`${uid}-ev`} hint="Where it lives: the PEO, Drive or a ticket. Never upload the file here.">
+                {(id, d) => (
+                  <TextInput
+                    id={id}
+                    aria-describedby={d}
+                    type="url"
+                    inputMode="url"
+                    maxLength={LINK_MAX_CHARS}
+                    value={link}
+                    onChange={(e) => setLink(e.target.value)}
+                    placeholder="https://"
+                  />
+                )}
+              </Field>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button variant="primary" onClick={saveEvidence}>
+                  Save link
+                </Button>
+                <Button variant="ghost" onClick={closePanel}>
+                  Cancel
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </li>
   )
 }

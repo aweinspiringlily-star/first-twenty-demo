@@ -1,12 +1,16 @@
 // New job (#hiring.new-job[.<planSlotId>]): a role template prefills title, family, level, the band
-// as the posted range, the description, stages and interview plan. Pick the hiring manager, panel,
-// locations, work mode, sponsorship and background check, then create a draft job.
+// as the posted range, the description, stages and interview plan. The team follows the family until
+// picked by hand. Pick the employment type, hiring manager, panel, locations, work mode, sponsorship
+// and background check, then create a draft job.
 // Hiring managers get the request mode instead ('Request a job'): template, title, level, quarter and
 // a reason, saved as a draft job that waits for Admin approval in the inbox.
+// Picking Remote with only an office as the location swaps in the workspace's remote location (the
+// posting and the offer letter quote it). After a create, focus lands on the new job page's title.
 import { useState } from 'react'
+import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
 import { DEFAULT_ROLE_TEMPLATES } from '@/data/roleTemplates'
-import { createJob, effectiveBand, jobFromTemplate, requestJob, requisitionQuarters, roleTemplates } from '@/domain/hiring'
+import { createJob, departmentForFamily, effectiveBand, jobFromTemplate, requestJob, requisitionQuarters, roleTemplates, templateLabel } from '@/domain/hiring'
 import { founder } from '@/domain/people'
 import type { ID, Job, PlanSlot, RoleTemplate } from '@/domain/types'
 import { fmtQuarter, today } from '@/lib/dates'
@@ -20,6 +24,7 @@ import {
   CitationChip,
   Field,
   focusFirstInvalid,
+  focusPageStart,
   FormGrid,
   MoneyInput,
   Private,
@@ -33,8 +38,28 @@ import {
   toast,
 } from '@/ui'
 import { commit } from './actions'
-import { teamOptions } from './logic'
-import { NotLegalAdvice } from './parts'
+import { JOB_DESC_MAX_CHARS, jobDescCountText, jobSizeError, NOTE_MAX_CHARS, noteCountText, officeOnly, payTooHighError, remoteLocationsFor, teamOptions } from './logic'
+import { EMPLOYMENT_OPTIONS, NotLegalAdvice } from './parts'
+
+/**
+ * After a create the sheet closes onto the new job page, but its trigger may still be on screen (the
+ * header New menu), where the sheet would hand focus back. Once the job page has rendered, with no sheet
+ * over it (from a plan line the posting sheet opens and takes focus itself), focus its title instead,
+ * after the sheet's own focus return.
+ */
+function focusNewJobPage(jobId: ID): void {
+  const page = links.job(jobId)
+  let frames = 0
+  const tick = () => {
+    const onPage = window.location.hash === page || window.location.hash.startsWith(`${page}.`)
+    if (onPage && !document.querySelector('[role="dialog"][aria-modal="true"]') && document.querySelector('#main h1')) {
+      setTimeout(focusPageStart, 0)
+      return
+    }
+    if (++frames < 30) requestAnimationFrame(tick)
+  }
+  requestAnimationFrame(tick)
+}
 
 export function NewJobSheet({
   open,
@@ -85,6 +110,8 @@ function RequestJobInner({ onClose }: { onClose: (jobId?: ID) => void }) {
     setJob((j) => ({ ...j, familyId, levelId, payMin: b?.min ?? null, payMax: b?.max ?? null, ...(b ? { equityMinPct: b.equityMinPct, equityMaxPct: b.equityMaxPct } : {}) }))
   }
 
+  // The reason is stored on the job's request, so it is capped like a note (the record must fit one sync).
+  const reasonCount = noteCountText(reason)
   const problems: string[] = []
   if (!me) problems.push('Pick who you are under Viewing as first.')
   if (!job.title.trim()) problems.push('Add a title.')
@@ -101,7 +128,10 @@ function RequestJobInner({ onClose }: { onClose: (jobId?: ID) => void }) {
     const ok = commit(`Requested the ${title} job. Admin will review it.`, (d) => {
       requestJob(d, { ...job, title, interviewPlan: job.interviewPlan.map((s) => (s.interviewerIds.length ? s : { ...s, interviewerIds: [me] })) }, { requestedById: me, quarter, reason, date: t })
     })
-    if (ok) onClose(job.id)
+    if (ok) {
+      onClose(job.id)
+      focusNewJobPage(job.id)
+    }
   }
 
   return (
@@ -130,7 +160,7 @@ function RequestJobInner({ onClose }: { onClose: (jobId?: ID) => void }) {
       <div className="flex flex-col gap-5">
         <Field label="Role template" hint="Prefills the level, description, stages and interview plan." id="rj-template">
           {(id, hint) => (
-            <Select<string> id={id} aria-describedby={hint} value={templateId} onChange={pickTemplate} placeholder="Start blank" options={templates.map((tpl) => ({ value: tpl.id, label: tpl.name }))} />
+            <Select<string> id={id} aria-describedby={hint} value={templateId} onChange={pickTemplate} placeholder="Start blank" options={templates.map((tpl) => ({ value: tpl.id, label: templateLabel(tpl) }))} />
           )}
         </Field>
         <Field label="Title" required id="rj-title" error={tried && !job.title.trim() ? 'Add a title.' : undefined}>
@@ -156,11 +186,11 @@ function RequestJobInner({ onClose }: { onClose: (jobId?: ID) => void }) {
         <Field
           label="Why the team needs this role"
           required
-          hint="A sentence or two for Admin: the work it unblocks, or who it replaces."
+          hint={`A sentence or two for Admin: the work it unblocks, or who it replaces.${reasonCount ? ` ${reasonCount}.` : ''}`}
           error={tried && !reason.trim() ? 'Say why the team needs this role, in a sentence or two.' : undefined}
           id="rj-reason"
         >
-          {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} value={reason} onChange={(e) => setReason(e.target.value)} />}
+          {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} maxLength={NOTE_MAX_CHARS} value={reason} onChange={(e) => setReason(e.target.value)} />}
         </Field>
         <p className="text-[13px] text-ink-3">
           You will be the hiring manager. It shows on your Jobs list as a draft and in your inbox until Admin decides. Viewing as is a preview, not security.
@@ -193,7 +223,16 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
   const [templateId, setTemplateId] = useState<ID | ''>(templateFor(templates, slot)?.id ?? '')
   const [job, setJob] = useState<Job>(() => build(templateFor(templates, slot), defaultHm))
   const [tried, setTried] = useState(false)
+  // Once the team is picked by hand, a later template or family change leaves it alone.
+  const [teamPicked, setTeamPicked] = useState(false)
+  // The remote location picked automatically when Work mode became Remote (said under Locations).
+  const [swappedTo, setSwappedTo] = useState<string | null>(null)
   const set = <K extends keyof Job>(k: K, v: Job[K]) => setJob((j) => ({ ...j, [k]: v }))
+  const setWorkMode = (mode: Job['workMode']) => {
+    const remote = mode === 'remote' ? remoteLocationsFor(db.locations, job.locationIds) : undefined
+    setJob((j) => ({ ...j, workMode: mode, ...(remote ? { locationIds: remote } : {}) }))
+    setSwappedTo(remote ? remote.map((id) => db.locations.find((l) => l.id === id)?.name ?? '').join(', ') : null)
+  }
 
   const pickTemplate = (id: ID) => {
     setTemplateId(id)
@@ -206,8 +245,10 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
         hiringManagerId: cur.hiringManagerId,
         panelIds: cur.panelIds,
         ...(slot ? { title: slot.title } : {}),
+        ...(teamPicked ? { departmentId: cur.departmentId } : {}),
         locationIds: cur.locationIds,
         workMode: cur.workMode,
+        employmentType: cur.employmentType,
         sponsorship: cur.sponsorship,
         backgroundCheck: cur.backgroundCheck,
       }
@@ -217,10 +258,25 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
   const band = effectiveBand(db, job.familyId, job.levelId)
   const families = db.families.map((f) => ({ value: f.id, label: f.name }))
   const levels = [...db.levels].sort((a, b) => a.order - b.order).map((l) => ({ value: l.id, label: `${l.code} ${l.name}` }))
+  const minHigh = payTooHighError(job.payMin, 'annual')
+  const maxHigh = payTooHighError(job.payMax, 'annual')
   const problems: string[] = []
   if (!job.title.trim()) problems.push('Add a title.')
   if (!job.hiringManagerId) problems.push('Pick a hiring manager.')
+  if (minHigh || maxHigh) problems.push('A pay range amount looks too high. Check the number.')
   if (job.payMin != null && job.payMax != null && job.payMin > job.payMax) problems.push('The pay range minimum is above the maximum.')
+  const sizeError = jobSizeError(job)
+  if (sizeError) problems.push(sizeError)
+  const descCount = jobDescCountText(job.description)
+  const remoteOnOffice = job.workMode === 'remote' && officeOnly(db.locations, job.locationIds)
+  const locationNote =
+    swappedTo && !remoteOnOffice
+      ? `Picked ${swappedTo} for a remote job. Add an office back if people also work there.`
+      : !remoteOnOffice
+        ? null
+        : db.locations.some((l) => l.kind === 'remote')
+          ? 'The posting and the offer letter use these locations. Pick a remote one unless people report to the office.'
+          : 'The posting and the offer letter use these locations, so a remote job would quote the office. Add a remote location in Settings > Org.'
 
   const create = () => {
     if (problems.length) {
@@ -246,12 +302,24 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
         }
       }
     })
-    if (ok) onClose(final.id)
+    if (ok) {
+      onClose(final.id)
+      focusNewJobPage(final.id)
+    }
   }
 
   const setFamilyLevel = (familyId: ID, levelId: ID) => {
     const b = effectiveBand(db, familyId, levelId)
-    setJob((j) => ({ ...j, familyId, levelId, payMin: b?.min ?? j.payMin, payMax: b?.max ?? j.payMax, ...(b ? { equityMinPct: b.equityMinPct, equityMaxPct: b.equityMaxPct } : {}) }))
+    setJob((j) => ({
+      ...j,
+      familyId,
+      levelId,
+      // The team follows the family (People and operations lands in Finance and operations) until picked by hand.
+      ...(!teamPicked && familyId !== j.familyId ? { departmentId: departmentForFamily(db, familyId) } : {}),
+      payMin: b?.min ?? j.payMin,
+      payMax: b?.max ?? j.payMax,
+      ...(b ? { equityMinPct: b.equityMinPct, equityMaxPct: b.equityMaxPct } : {}),
+    }))
   }
 
   return (
@@ -284,7 +352,7 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
                 value={templateId}
                 onChange={pickTemplate}
                 placeholder="Start blank"
-                options={templates.map((tpl) => ({ value: tpl.id, label: tpl.name }))}
+                options={templates.map((tpl) => ({ value: tpl.id, label: templateLabel(tpl) }))}
               />
             )}
           </Field>
@@ -304,10 +372,34 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
             </Field>
           </FormGrid>
           <FormGrid>
-            <Field label="Pay range minimum" id="nj-min">
-              {(id) => <MoneyInput id={id} value={job.payMin} onChange={(v) => set('payMin', v)} />}
+            <Field label="Team" id="nj-team" hint="Hires from this job join this team.">
+              {(id, hint) => (
+                <Select
+                  id={id}
+                  aria-describedby={hint}
+                  value={job.departmentId}
+                  onChange={(v) => {
+                    setTeamPicked(true)
+                    set('departmentId', v)
+                  }}
+                  options={db.departments.map((x) => ({ value: x.id, label: x.name }))}
+                />
+              )}
             </Field>
-            <Field label="Pay range maximum" id="nj-max" error={tried && job.payMin != null && job.payMax != null && job.payMin > job.payMax ? 'The maximum is below the minimum.' : undefined}>
+            <div>
+              <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Employment</p>
+              <ChipGroup label="Employment" value={job.employmentType} onChange={(v) => set('employmentType', v)} options={EMPLOYMENT_OPTIONS} />
+            </div>
+          </FormGrid>
+          <FormGrid>
+            <Field label="Pay range minimum" id="nj-min" error={tried ? minHigh : undefined}>
+              {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={job.payMin} onChange={(v) => set('payMin', v)} />}
+            </Field>
+            <Field
+              label="Pay range maximum"
+              id="nj-max"
+              error={tried ? (maxHigh ?? (job.payMin != null && job.payMax != null && job.payMin > job.payMax ? 'The maximum is below the minimum.' : undefined)) : undefined}
+            >
               {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={job.payMax} onChange={(v) => set('payMax', v)} />}
             </Field>
           </FormGrid>
@@ -344,14 +436,25 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
           <SectionLabel>Where and how</SectionLabel>
           <div>
             <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Locations</p>
-            <ChipMulti label="Locations" values={job.locationIds} onChange={(v) => set('locationIds', v)} options={db.locations.map((l) => ({ value: l.id, label: l.name }))} />
+            <ChipMulti
+              label="Locations"
+              values={job.locationIds}
+              onChange={(v) => {
+                set('locationIds', v)
+                setSwappedTo(null)
+              }}
+              options={db.locations.map((l) => ({ value: l.id, label: l.name }))}
+            />
+            <div aria-live="polite">
+              {locationNote && <p className="mt-1.5 text-[12.5px] text-ink-3">{locationNote}</p>}
+            </div>
           </div>
           <div>
             <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Work mode</p>
             <Segmented
               label="Work mode"
               value={job.workMode}
-              onChange={(v) => set('workMode', v)}
+              onChange={setWorkMode}
               options={[
                 { value: 'onsite', label: 'On site' },
                 { value: 'hybrid', label: 'Hybrid' },
@@ -382,8 +485,15 @@ function NewJobInner({ planSlotId, onClose }: { planSlotId: ID | null; onClose: 
 
         <section className="flex flex-col gap-3">
           <SectionLabel>Description and interview plan</SectionLabel>
-          <Field label="Job description" hint="The posting adds the pay range, benefits, the no-salary-history line and the Fair Chance and EEO statements." id="nj-desc">
-            {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={8} value={job.description} onChange={(e) => set('description', e.target.value)} />}
+          <Field
+            label="Job description"
+            hint={`The posting adds the pay range, benefits, the no-salary-history line and the Fair Chance and EEO statements.${descCount ? ` ${descCount}.` : ''}`}
+            error={tried ? sizeError : undefined}
+            id="nj-desc"
+          >
+            {(id, hint) => (
+              <TextArea id={id} aria-describedby={hint} rows={8} maxLength={JOB_DESC_MAX_CHARS} value={job.description} onChange={(e) => set('description', e.target.value)} />
+            )}
           </Field>
           <p className="text-[13.5px] text-ink-2">
             {job.stages.map((s) => s.name).join(', ')}.{' '}

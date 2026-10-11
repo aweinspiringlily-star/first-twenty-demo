@@ -1,6 +1,6 @@
 import { produce } from 'immer'
 import { describe, expect, it, vi } from 'vitest'
-import { closeOutRemaining, findTemplateFor, jobFromTemplate, markPosted, setCreditCheckBasis, setJobStatus } from './jobs'
+import { closeOutRemaining, departmentForFamily, findTemplateFor, jobFromTemplate, markPosted, setCreditCheckBasis, setJobStatus, templateLabel } from './jobs'
 import { fixtureDB, FRI, person } from './testkit'
 
 vi.mock('@/data/seed', async () => {
@@ -47,9 +47,36 @@ describe('jobFromTemplate', () => {
     expect(job).toMatchObject({ payMin: null, payMax: null, title: 'Chief of staff' })
   })
 
+  it('titles a job with the plain role name, never the posting qualifier in the hint', () => {
+    const db = fixtureDB()
+    const csm = db.settings.roleTemplates.find((t) => t.id === 'rt-csm')
+    expect(jobFromTemplate(db, csm, { date: FRI, hiringManagerId: 'p-founder' }).title).toBe('Customer success manager')
+    const acct = db.settings.roleTemplates.find((t) => t.id === 'rt-accounting-lead')
+    expect(jobFromTemplate(db, acct, { date: FRI, hiringManagerId: 'p-founder' }).title).toBe('Accounting lead')
+    // The picker still shows the qualifier next to the name.
+    expect(templateLabel(csm!)).toBe('Customer success manager (CPA preferred)')
+    expect(templateLabel({ name: 'Product designer' })).toBe('Product designer')
+  })
+
   it('leaves the title empty when there is no template and no title, so the sheet asks for one', () => {
     const job = jobFromTemplate(fixtureDB(), undefined, { date: FRI, hiringManagerId: 'p-founder' })
     expect(job.title).toBe('')
+  })
+
+  it('puts a blank job in the team its family belongs to, not Engineering', () => {
+    const db = fixtureDB()
+    const blank = (familyId: string) => jobFromTemplate(db, undefined, { date: FRI, hiringManagerId: 'p-founder', familyId, levelId: 'lv-l1', title: 'x' }).departmentId
+    expect(blank('f-ops')).toBe('d-ops')
+    expect(blank('f-acct')).toBe('d-ops')
+    expect(blank('f-gtm')).toBe('d-gtm')
+    expect(blank('f-design')).toBe('d-product')
+    expect(blank('f-exec')).toBe('d-exec')
+    expect(blank('f-ml')).toBe('d-eng')
+    expect(departmentForFamily(db, 'f-ops')).toBe('d-ops')
+    // A workspace without that department falls back to the first one on file; the template and an explicit pick still win.
+    expect(departmentForFamily({ families: db.families, departments: [{ id: 'd-custom', name: 'Everyone' }] }, 'f-ops')).toBe('d-custom')
+    expect(jobFromTemplate(db, undefined, { date: FRI, hiringManagerId: 'p-founder', familyId: 'f-ops', departmentId: 'd-eng' }).departmentId).toBe('d-eng')
+    expect(jobFromTemplate(db, findTemplateFor(db, 'f-ml', 'lv-l3'), { date: FRI, hiringManagerId: 'p-founder', familyId: 'f-ops' }).departmentId).toBe('d-eng')
   })
 })
 

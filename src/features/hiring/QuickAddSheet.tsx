@@ -1,8 +1,8 @@
 // Quick add (#hiring.add[.<jobId>]): one paste box parsed live (name, email, phone, LinkedIn, GitHub),
 // duplicates caught by email or profile URL (a phone-only match is a soft 'may be the same person'
 // note that never blocks: office lines get shared), a preselected job, source chips and an optional
-// desired pay (never pay history). Add lands the candidate in New with 'Review application, due in
-// 3 business days'. Paste plus Add: two actions.
+// desired pay (never pay history), per year or, for an hourly or part-time job, per hour. Add lands
+// the candidate in New with 'Review application, due in 3 business days'. Paste plus Add: two actions.
 import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
@@ -12,9 +12,9 @@ import { employedOn, fullName } from '@/domain/people'
 import type { Candidate, ID, SourceKind } from '@/domain/types'
 import { today } from '@/lib/dates'
 import { useDB } from '@/store/db'
-import { Button, Callout, ChipGroup, CitationChip, Field, focusFirstInvalid, FormGrid, MoneyInput, Select, Sheet, TextArea, TextInput, toast } from '@/ui'
+import { Button, Callout, ChipGroup, CitationChip, Field, focusFirstInvalid, FormGrid, MoneyInput, NumberInput, Segmented, Select, Sheet, TextArea, TextInput, toast } from '@/ui'
 import { commit } from './actions'
-import { compareJobs, guessTimezone, type QuickAddFields, quickAddMatches, quickAddProblems } from './logic'
+import { compareJobs, guessTimezone, hourlyDesiredFits, payTooHighError, type QuickAddFields, quickAddMatches, quickAddProblems, switchDesiredUnit } from './logic'
 import { NotLegalAdvice } from './parts'
 
 const FIELD_LABELS: Array<[keyof QuickAddFields, string]> = [
@@ -49,6 +49,12 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
   const [referrerId, setReferrerId] = useState<ID | ''>('')
   const [agency, setAgency] = useState('')
   const [desiredPay, setDesiredPay] = useState<number | null>(null)
+  // Per hour for a job posted with an hourly range (or part time), so a part-time figure reads as one.
+  const hourlyRangeOf = (id: ID | '') => {
+    const j = db.jobs.find((x) => x.id === id)
+    return !!j && j.payMax != null && j.payMax < 1000
+  }
+  const [desiredUnit, setDesiredUnit] = useState<'year' | 'hour'>(() => (hourlyRangeOf(job) ? 'hour' : 'year'))
   const [sponsorship, setSponsorship] = useState<Candidate['sponsorship']>('unknown')
   const [tried, setTried] = useState(false)
 
@@ -76,6 +82,8 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
   // A match the viewer may not see: never name it, never attach it. Admin adds them instead.
   if (hiddenDupe) problems.unshift('This person may already be on file. Ask an admin to add them to this job.')
   const selectedJob = db.jobs.find((j) => j.id === job)
+  const showUnit = hourlyDesiredFits([selectedJob]) || desiredUnit === 'hour'
+  const payHigh = payTooHighError(desiredPay, desiredUnit === 'hour' ? 'hourly' : 'annual')
   const team = employedOn(db, t)
     .sort((a, b) => fullName(a).localeCompare(fullName(b)))
     .map((p) => ({ value: p.id, label: fullName(p) }))
@@ -99,6 +107,11 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
       focusFirstInvalid()
       return
     }
+    if (payHigh) {
+      setTried(true)
+      focusFirstInvalid()
+      return
+    }
     const result: { id?: ID } = {}
     const label = selectedJob ? `Added ${name} to ${selectedJob.title}` : `Added ${name} to the talent pool`
     const ok = commit(label, (d) => {
@@ -118,7 +131,7 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
           source,
           ...(source === 'agency' && agency.trim() ? { sourceDetail: agency.trim() } : {}),
           ...(source === 'referral' && referrerId ? { referrerId } : {}),
-          ...(desiredPay != null ? { desiredPay } : {}),
+          ...(desiredPay != null ? { desiredPay, ...(desiredUnit === 'hour' ? { desiredPayUnit: 'hour' as const } : {}) } : {}),
           sponsorship,
         },
         { date: t, ...(job ? { jobId: job } : {}), ...(selectedJob ? { ownerId: selectedJob.hiringManagerId } : {}) },
@@ -261,7 +274,11 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
             <Select<string>
               id={id}
               value={job}
-              onChange={(v) => setJob(v)}
+              onChange={(v) => {
+                setJob(v)
+                // Nothing typed yet: the unit follows the job's posted range.
+                if (desiredPay == null) setDesiredUnit(hourlyRangeOf(v) ? 'hour' : 'year')
+              }}
               options={[...(viewer.role === 'admin' ? [{ value: '', label: 'No job yet (talent pool)' }] : []), ...jobs.map((j) => ({ value: j.id, label: `${j.title}${j.status === 'open' ? '' : ` (${j.status === 'on_hold' ? 'on hold' : 'draft'})`}` }))]}
             />
           )}
@@ -298,13 +315,37 @@ function QuickAddInner({ jobId, onClose }: { jobId: ID | null; onClose: (addedCa
         </div>
 
         <FormGrid>
-          <Field
-            label="Desired pay (optional)"
-            id="qa-pay"
-            hint="Ask about desired pay only. California bans asking about current or past pay."
-          >
-            {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={desiredPay} onChange={setDesiredPay} suffix="/ year" />}
-          </Field>
+          <div className="flex flex-col gap-2">
+            <Field
+              label="Desired pay (optional)"
+              id="qa-pay"
+              hint="Ask about desired pay only. California bans asking about current or past pay."
+              error={tried ? payHigh : undefined}
+            >
+              {(id, hint) =>
+                desiredUnit === 'hour' ? (
+                  <NumberInput id={id} aria-describedby={hint} prefix="$" suffix="/ hour" step={0.25} min={0} sensitive value={desiredPay} onChange={setDesiredPay} />
+                ) : (
+                  <MoneyInput id={id} aria-describedby={hint} value={desiredPay} onChange={setDesiredPay} suffix="/ year" />
+                )
+              }
+            </Field>
+            {showUnit && (
+              <Segmented
+                size="sm"
+                label="Desired pay per"
+                value={desiredUnit}
+                onChange={(u) => {
+                  setDesiredUnit(u)
+                  setDesiredPay((v) => switchDesiredUnit(v, u))
+                }}
+                options={[
+                  { value: 'year', label: 'Per year' },
+                  { value: 'hour', label: 'Per hour' },
+                ]}
+              />
+            )}
+          </div>
           <div className="flex flex-col gap-1.5">
             <p className="text-[13.5px] font-semibold text-ink-2">Needs visa sponsorship</p>
             <ChipGroup<Candidate['sponsorship']>

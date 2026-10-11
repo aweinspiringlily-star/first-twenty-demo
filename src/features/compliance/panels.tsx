@@ -173,10 +173,13 @@ export function ThresholdPreview({ startDate, extra }: { startDate: string; extr
         {headline}
       </p>
       {impact.rules.length > 0 && (
-        <ul className="mt-1.5 flex flex-col gap-1 pl-6">
+        // Each link is a full 40px row (hit targets, ARCHITECTURE accessibility), so the rows need no gap.
+        <ul className="mt-0.5 flex flex-col pl-6">
           {impact.rules.map((r) => (
             <li key={r.id} className="list-disc">
-              <TextLink href={links.rule(r.id)}>{r.title}</TextLink>
+              <TextLink href={links.rule(r.id)} hitArea={false} className="inline-flex min-h-10 items-center">
+                {r.title}
+              </TextLink>
             </li>
           ))}
         </ul>

@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   businessDayOnOrBefore,
   businessDaysBetween,
+  desiredAnnual,
+  desiredHourly,
+  desiredPayOf,
   isHire,
   isPacificDaylight,
   median,
@@ -90,5 +93,17 @@ describe('small helpers', () => {
     expect(isHire({ status: 'active', conditionalOfferOn: '2026-10-07' })).toBe(true)
     expect(isHire({ status: 'rejected', conditionalOfferOn: '2026-10-07' })).toBe(false)
     expect(isHire({ status: 'active' })).toBe(false)
+  })
+
+  it('reads desired pay in its own unit, a year when none is stored', () => {
+    expect(desiredPayOf({})).toBeUndefined()
+    expect(desiredPayOf({ desiredPay: 62_000 })).toEqual({ amount: 62_000, unit: 'year' })
+    const hourly = desiredPayOf({ desiredPay: 30, desiredPayUnit: 'hour' })
+    expect(hourly).toEqual({ amount: 30, unit: 'hour' })
+    expect(desiredAnnual(hourly)).toBe(62_400)
+    expect(desiredHourly(hourly)).toBe(30)
+    expect(desiredAnnual({ amount: 62_000, unit: 'year' })).toBe(62_000)
+    expect(desiredHourly({ amount: 52_000, unit: 'year' })).toBe(25)
+    expect(desiredAnnual(undefined)).toBeUndefined()
   })
 })

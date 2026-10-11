@@ -596,6 +596,85 @@ describe.skipIf(!available)('round trip against the real server', () => {
     }
   })
 
+  // r2-44: the server wins over an edit made on a copy from before another browser's delete.
+  it('a stale edit from another browser does not bring back a record this one deleted; Undo of the delete still does', async () => {
+    const { a, b } = await connectedPair()
+    const hasOps = (db: DB) => db.departments.some((x) => x.id === 'd-ops')
+    a.mutate((d) => {
+      d.departments = d.departments.filter((x) => x.id !== 'd-ops')
+    })
+    await a.sync()
+    // B has not pulled the delete when it saves a new name.
+    b.mutate((d) => {
+      d.departments.find((x) => x.id === 'd-ops')!.name = 'Finance and ops'
+    })
+    await b.sync()
+    expect(hasOps(b.db())).toBe(false)
+    expect(b.st()).toMatchObject({ refreshed: 1, refreshedKeys: [{ collection: 'departments', id: 'd-ops' }], pending: 0 })
+    await a.sync()
+    expect(hasOps(a.db())).toBe(false)
+    expect(a.st().refreshed).toBe(0)
+    const rows = (await db.query(`SELECT 1 FROM departments WHERE id = 'd-ops'`)) as { rows: unknown[] }
+    expect(rows.rows).toHaveLength(0)
+    // A's own Undo brings it back for everyone.
+    a.store.getState().undo()
+    await a.sync()
+    await b.sync()
+    expect(b.db().departments.find((x) => x.id === 'd-ops')?.name).toBe('Finance and operations')
+    expect(diffDB(a.db(), b.db())).toEqual([])
+  }, 60_000)
+
+  // r2-45: Chrome writes localStorage to disk in batches; a crash restores an older saved state.
+  it('a browser that died before saving its last answers replays the first one: no notice, and no activity row is deleted', async () => {
+    const storage = memoryStorage()
+    const wire: Wire = { losePushAnswers: 0 }
+    const inner = injectFetch(() => app, wire)
+    let current: ReturnType<typeof browser> | null = null
+    let disk: { data: Map<string, string>; db: DB } | null = null
+    const api = createApi({
+      fetch: async (url, init) => {
+        // The disk as it was when the first move left: the saved sync state and the saved store.
+        if (!disk && current && init?.method === 'POST' && url === '/api/changes' && String(init.body).includes('act-technical')) {
+          disk = { data: new Map(storage.data), db: current.db() }
+        }
+        return inner(url, init)
+      },
+    })
+    const start = makeDB()
+    start.people.push(makePerson('p-1', { title: 'Applied' }))
+    const a = browser(start, { reloadOf: { api, storage, wire } })
+    current = a
+    expect(await a.engine.signIn(h.ADMIN.email, h.ADMIN.password)).toMatchObject({ ok: true })
+    expect(await a.engine.uploadLocal()).toEqual({ ok: true })
+    await a.engine.whenIdle()
+    for (const [title, row] of [
+      ['Technical', 'act-technical'],
+      ['Onsite', 'act-onsite'],
+      ['Offer', 'act-offer'],
+    ] as const) {
+      a.store.getState().mutate(`Moved to ${title}`, (d) => {
+        d.people.find((p) => p.id === 'p-1')!.title = title
+        d.activity.push({ id: row, at: '2026-10-10T17:00:00.000Z', entityType: 'person', entityId: 'p-1', kind: 'edited', text: `Moved to ${title}` })
+      })
+      await a.sync()
+    }
+    a.engine.stop()
+    expect(disk).not.toBeNull()
+    const restored = memoryStorage()
+    for (const [k, v] of disk!.data) restored.data.set(k, v)
+    const before = (await db.query(`SELECT max(seq) AS seq FROM change_log`)) as { rows: Array<{ seq: unknown }> }
+    const b = browser(disk!.db, { reloadOf: { api, storage: restored, wire } })
+    b.engine.start()
+    await b.engine.whenIdle()
+    await b.sync()
+    expect(b.db().people.find((p) => p.id === 'p-1')?.title).toBe('Offer')
+    expect(b.st()).toMatchObject({ refreshed: 0, refreshedKeys: [], pending: 0, status: 'synced' })
+    const kept = (await db.query(`SELECT id FROM activity WHERE id IN ('act-technical', 'act-onsite', 'act-offer') ORDER BY id`)) as { rows: Array<{ id: string }> }
+    expect(kept.rows.map((r) => r.id)).toEqual(['act-offer', 'act-onsite', 'act-technical'])
+    const written = (await db.query(`SELECT collection, op FROM change_log WHERE seq > $1`, [Number(before.rows[0].seq)])) as { rows: unknown[] }
+    expect(written.rows).toEqual([])
+  }, 60_000)
+
   it('refuses to upload the sample company unless asked', async () => {
     const s = browser(makeDB({ sample: true, company: 'Ledgerlark' }))
     expect(await s.engine.signIn(h.ADMIN.email, h.ADMIN.password)).toMatchObject({ ok: true })

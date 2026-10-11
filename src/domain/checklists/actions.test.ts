@@ -170,6 +170,24 @@ describe('security training and policy acknowledgements stay in step with the ch
     })
   })
 
+  it('tracks the signed PIIA and the confidentiality agreement acknowledgement as one document', () => {
+    const db = withLena()
+    const policy = db.policies.find((p) => p.id === 'pl-confidentiality')
+    if (!policy) throw new Error('fixture')
+    // Marking the PIIA signed records the acknowledgement on the day it was done
+    const signed = produce(db, (d) => {
+      setTaskStatus(d, 'ck-lena', findTask(d as DB, 'ck-lena', 'on-piia').id, 'done', { date: '2026-05-26' })
+    })
+    expect(signed.acks.filter((a) => a.personId === 'p-lena')).toEqual([
+      expect.objectContaining({ policyId: 'pl-confidentiality', version: policy.version, acknowledgedOn: '2026-05-26' }),
+    ])
+    // Recording the acknowledgement elsewhere closes the PIIA task
+    const acked = produce(db, (d) => {
+      expect(closeAckTasks(d, 'p-lena', 'pl-confidentiality', '2026-05-27')).toBe(1)
+    })
+    expect(findTask(acked, 'ck-lena', 'on-piia')).toMatchObject({ status: 'done', doneOn: '2026-05-27' })
+  })
+
   it('closes the open acknowledgement task for that person and policy only', () => {
     const db = withLena()
     const next = produce(db, (d) => {

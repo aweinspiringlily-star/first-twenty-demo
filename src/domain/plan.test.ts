@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
 import { loadedCost, runRate } from '@/domain/pay'
-import { budgetVariance, headcountProjection, planCost, planRollup, planStatusCounts, planSummary, slotStatus } from '@/domain/plan'
+import { budgetVariance, headcountProjection, jobHasPlanLine, planCost, planRollup, planSlotForHire, planStatusCounts, planSummary, slotStatus } from '@/domain/plan'
 import type { CompRecord, DB, Job, Offer, Person, PlanSlot } from '@/domain/types'
 
 const D = '2026-10-09'
@@ -244,5 +244,100 @@ describe('budget variance and plan cost', () => {
     expect(atPlan.lines.filter((l) => l.kind === 'plan').map((l) => l.slotId).sort()).toEqual(['ps-draft', 'ps-open', 'ps-planned'])
     expect(atPlan.lines.filter((l) => l.kind === 'offer').map((l) => l.offerId)).toEqual(['o-dan'])
     expect(atPlan.lines.filter((l) => l.kind === 'incoming').map((l) => l.name).sort()).toEqual(['Ivan Test', 'Mei Tanaka'])
+  })
+})
+
+describe('budget variance with two hires from one job', () => {
+  /** Marcus and Priyanka hired from one job at $220K and $205K (band mid $205K), Rosa part time at $31 an hour for 30 hours, and a person added directly. */
+  function twoHireDB(): DB {
+    const db = planDB()
+    db.jobs.push(mkJob('j-fs', 'open'), mkJob('j-ops', 'filled'))
+    db.candidates.push(
+      { id: 'c-marcus', firstName: 'Marcus', lastName: 'Webb', email: 'mw@x.com', links: {}, source: 'outbound', sponsorship: 'no', tags: [], createdOn: '2026-09-01' },
+      { id: 'c-pri', firstName: 'Priyanka', lastName: 'Desai', email: 'pd@x.com', links: {}, source: 'inbound', sponsorship: 'no', tags: [], createdOn: '2026-09-01' },
+      { id: 'c-rosa', firstName: 'Rosa', lastName: 'Diaz', email: 'rd@x.com', links: {}, source: 'inbound', sponsorship: 'no', tags: [], createdOn: '2026-09-01' },
+    )
+    db.people.push(
+      mkPerson('p-marcus', 'Marcus', '2026-10-26', { fromCandidateId: 'c-marcus' }),
+      mkPerson('p-pri', 'Priyanka', '2026-10-30', { fromCandidateId: 'c-pri' }),
+      mkPerson('p-rosa', 'Rosa', '2026-10-19', { fromCandidateId: 'c-rosa', employmentType: 'part_time', hoursPerWeek: 30, flsa: 'non_exempt' }),
+      mkPerson('p-half', 'Hal', '2026-10-19', { employmentType: 'part_time', hoursPerWeek: 20 }),
+    )
+    db.comp.push(mkComp('p-half', '2026-10-19', 100_000))
+    db.offers.push(
+      { ...mkOffer('o-marcus', 'c-marcus', 'j-fs', 'accepted', 220_000, '2026-10-26'), personId: 'p-marcus' },
+      // Linked to Priyanka through her candidate record only.
+      { ...mkOffer('o-pri', 'c-pri', 'j-fs', 'accepted', 205_000, '2026-10-30'), createdOn: '2026-10-03' },
+      {
+        ...mkOffer('o-rosa', 'c-rosa', 'j-ops', 'accepted', 0, '2026-10-19'),
+        payType: 'hourly',
+        salary: undefined,
+        hourlyRate: 31,
+        hoursPerWeek: 30,
+        employmentType: 'part_time',
+        personId: 'p-rosa',
+      },
+    )
+    db.plan.push(
+      mkSlot('ps-fs', { jobId: 'j-fs', personId: 'p-marcus', status: 'filled' }),
+      // The line hireFromOffer added for the second hire from the same job.
+      mkSlot('ps-fs-2', { jobId: 'j-fs', personId: 'p-pri', status: 'filled' }),
+      mkSlot('ps-ops', { jobId: 'j-ops', personId: 'p-rosa', status: 'filled', budgetBase: 70_000 }),
+      // Someone added directly onto a line of the same job: no offer, so the hire record counts.
+      mkSlot('ps-fs-3', { jobId: 'j-fs', personId: 'p-half', status: 'filled' }),
+    )
+    return db
+  }
+
+  it("compares each line with its own hire's offer, not the job's first one", () => {
+    const db = twoHireDB()
+    const byId = Object.fromEntries(budgetVariance(db).rows.map((r) => [r.slotId, r]))
+    expect(byId['ps-fs']).toMatchObject({ budgetBase: 205_000, budgetFromBand: true, actualBase: 220_000, source: 'offer', variance: 15_000, offerId: 'o-marcus', personId: 'p-marcus' })
+    expect(byId['ps-fs-2']).toMatchObject({ budgetBase: 205_000, actualBase: 205_000, source: 'offer', variance: 0, offerId: 'o-pri', personId: 'p-pri' })
+    expect(byId['ps-fs-3']).toMatchObject({ source: 'comp', personId: 'p-half' })
+    expect(byId['ps-fs-3'].offerId).toBeUndefined()
+    const rows = planRollup(db)
+    expect(rows.find((r) => r.slot.id === 'ps-fs-2')).toMatchObject({ status: 'filled', offer: { id: 'o-pri' }, person: { id: 'p-pri' } })
+    expect(rows.find((r) => r.slot.id === 'ps-fs-3')?.offer).toBeUndefined()
+  })
+
+  it('restates part-time pay at full time before comparing it with the budget', () => {
+    const { rows, totals } = budgetVariance(twoHireDB())
+    const byId = Object.fromEntries(rows.map((r) => [r.slotId, r]))
+    // $31 x 40 x 52 = $64,480 at full time, not $48,360 for 30 hours.
+    expect(byId['ps-ops']).toMatchObject({ budgetBase: 70_000, actualBase: 64_480, restatedFromHours: 30, variance: -5_520 })
+    // A $100K salary for 20 hours a week is $200K at full time.
+    expect(byId['ps-fs-3']).toMatchObject({ budgetBase: 205_000, actualBase: 200_000, restatedFromHours: 20, variance: -5_000 })
+    // Full-time lines are not restated.
+    expect(byId['ps-fs'].restatedFromHours).toBeUndefined()
+    // The earlier lines (+$25,000 on $660,000) plus +$15,000, $0, -$5,520 and -$5,000.
+    expect(totals).toEqual({ budget: 1_345_000, actual: 1_374_480, variance: 29_480 })
+  })
+})
+
+describe('the plan line a hire fills', () => {
+  it("takes the job's own line, else a free line linked by jobId, never a filled or cut one", () => {
+    const db = planDB()
+    const job = (id: string) => db.jobs.find((j) => j.id === id)
+    // Linked by the line's jobId only
+    expect(planSlotForHire(db, { jobId: 'j-open' }, job('j-open'))?.id).toBe('ps-open')
+    // The job's planSlotId wins over an earlier line that names the job
+    db.plan.push(mkSlot('ps-open-own', { status: 'planned' }))
+    db.jobs.find((j) => j.id === 'j-open')!.planSlotId = 'ps-open-own'
+    expect(planSlotForHire(db, { jobId: 'j-open' }, job('j-open'))?.id).toBe('ps-open-own')
+    // Once the job's own line is held, the next free line on the job
+    Object.assign(db.plan.find((s) => s.id === 'ps-open-own')!, { status: 'filled', personId: 'p-a' })
+    expect(planSlotForHire(db, { jobId: 'j-open' }, job('j-open'))?.id).toBe('ps-open')
+    // Nothing free: a person on the line or a filled or cut status rules it out
+    Object.assign(db.plan.find((s) => s.id === 'ps-open')!, { personId: 'p-b' })
+    expect(planSlotForHire(db, { jobId: 'j-open' }, job('j-open'))).toBeUndefined()
+    expect(jobHasPlanLine(db, { jobId: 'j-open' }, job('j-open'))).toBe(true)
+    db.plan.push(mkSlot('ps-cut-2', { status: 'cut', jobId: 'j-acc' }), mkSlot('ps-filled-2', { status: 'filled', jobId: 'j-acc' }))
+    db.plan = db.plan.filter((s) => s.id !== 'ps-acc')
+    expect(planSlotForHire(db, { jobId: 'j-acc' }, job('j-acc'))).toBeUndefined()
+    // A job with no line at all
+    db.jobs.push(mkJob('j-new', 'open'))
+    expect(planSlotForHire(db, { jobId: 'j-new' }, job('j-new'))).toBeUndefined()
+    expect(jobHasPlanLine(db, { jobId: 'j-new' }, job('j-new'))).toBe(false)
   })
 })

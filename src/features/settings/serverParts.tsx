@@ -4,15 +4,25 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { href } from '@/app/router'
-import type { DB } from '@/domain/types'
 import { fmtDay } from '@/lib/dates'
 import { useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
 import { connect, type FlowResult, type HoldReason, type InspectResult, SAMPLE_MESSAGE, signOut, type SyncUser, useSyncStatus } from '@/sync'
-import { Button, Callout, Checkbox, ConfirmButton, DescriptionList, Field, focusFirstInvalid, IconButton, Panel, TextInput, toast } from '@/ui'
+import { Badge, Button, Callout, Checkbox, ConfirmButton, DescriptionList, Field, focusFirstInvalid, IconButton, Panel, TextInput, toast } from '@/ui'
 import { downloadBackup, setDemoClock } from './DataTab'
 import { ButtonLink, Row, RowList } from './kit'
-import { compareWorkspaces, describeCounts, plural, type WorkspaceSummary } from './serverLogic'
+import {
+  compareWorkspaces,
+  describeCounts,
+  describeDetail,
+  joinAnd,
+  missingRecords,
+  moreWorkIn,
+  plural,
+  recommendedCopy,
+  summarize,
+  type WorkspaceSummary,
+} from './serverLogic'
 
 // ---------------------------------------------------------------------------------------------
 // Shared helpers
@@ -56,15 +66,6 @@ export function rememberEmail(email: string): void {
   }
 }
 
-/** The summary of this browser's workspace that the connect step compares with the server's. */
-export function summarize(db: DB): WorkspaceSummary {
-  return {
-    companyName: db.company?.name ?? '',
-    sample: db.meta?.sample === true,
-    counts: { people: db.people.length, candidates: db.candidates.length, jobs: db.jobs.length },
-  }
-}
-
 /** An error from a server step, announced as soon as it appears. `n` changes per attempt, so a repeat is announced too. */
 export function FlowError({ error, title }: { error: { message: string; n: number } | null; title: string }) {
   return (
@@ -100,6 +101,7 @@ const BUSY_TEXT: Record<string, string> = {
   forget: 'Sending waiting changes, then removing this browser\'s data.',
   disconnect: 'Disconnecting.',
   sync: 'Syncing now.',
+  discard: 'Discarding the change and putting back what your server has.',
 }
 export function busyText(busy: string | null): string | null {
   return busy ? (BUSY_TEXT[busy] ?? 'Working.') : null
@@ -253,19 +255,24 @@ export function ConnectPanel({
   email,
   onConnected,
   onSignedOut,
+  onInspected,
 }: {
   email: string
   onConnected: (how: 'upload' | 'server' | 'replace') => void
   onSignedOut: () => void
+  /** Told whether the server is empty each time the panel looks (Start fresh then offers to upload). */
+  onInspected?: (empty: boolean) => void
 }) {
   const db = useDB((s) => s.db)
   const local = useMemo(() => summarize(db), [db])
   const [server, setServer] = useState<Inspected | null>(null)
   const [error, setError] = useState<{ message: string; n: number; kind: string } | null>(null)
   const { busy, run } = useBusy()
-  // The parent passes a new callback on every render; the inspect below must still run only once.
+  // The parent passes new callbacks on every render; the inspect below must still run only once.
   const signedOutRef = useRef(onSignedOut)
   signedOutRef.current = onSignedOut
+  const inspectedRef = useRef(onInspected)
+  inspectedRef.current = onInspected
 
   const inspect = useCallback(async () => {
     const res = await run('inspect', () => connect.inspectServer())
@@ -273,6 +280,7 @@ export function ConnectPanel({
     if (res.ok) {
       setServer(res)
       setError(null)
+      inspectedRef.current?.(res.empty)
     } else {
       setServer(null)
       setError({ message: res.message, n: Date.now(), kind: res.kind })
@@ -348,6 +356,29 @@ export function ConnectPanel({
 
 type Run = <T>(name: string, fn: () => Promise<T>) => Promise<T | undefined>
 
+/**
+ * One workspace in the connect step's comparison: name and counts, then what tells two copies with one
+ * name apart (when it was created, its last logged change, how much is filled in), and which one holds
+ * more of the work.
+ */
+function WorkspaceLine({ summary, recommended }: { summary: WorkspaceSummary; recommended: boolean }) {
+  const detail = describeDetail(summary)
+  return (
+    <>
+      <span className="block">
+        {summary.companyName || 'an unnamed company'}
+        {summary.sample ? ' (sample company)' : ''}: {describeCounts(summary.counts)}
+      </span>
+      {detail && <span className="mt-0.5 block text-[13px] text-ink-2">{detail}</span>}
+      {recommended && (
+        <Badge tone="good" icon="check" className="mt-1.5">
+          Recommended: has more of your work
+        </Badge>
+      )}
+    </>
+  )
+}
+
 /** What an upload sends, in words. */
 function UploadWhat({ local }: { local: WorkspaceSummary }) {
   return (
@@ -416,8 +447,15 @@ function ServerHasData({
   pendingError: { message: string; n: number } | null
   onDone: (res: FlowResult | undefined, how: 'server' | 'replace') => void
 }) {
-  const serverSummary: WorkspaceSummary = { companyName: server.companyName, sample: server.sample, counts: server.counts }
+  const serverSummary = useMemo(() => summarize(server.db), [server.db])
   const compare = compareWorkspaces(local, serverSummary)
+  // Two copies with one name: say which holds more of the work, and what each choice would lose.
+  const recommended = compare === 'same_name' ? recommendedCopy(local, serverSummary) : null
+  const onlyHere = moreWorkIn(local, serverSummary)
+  const onlyOnServer = moreWorkIn(serverSummary, local)
+  // Each copy holds records the other lacks: neither is recommended, and both losses are said up front.
+  const diverged =
+    compare === 'same_name' && recommended === null && missingRecords(local, serverSummary).length > 0 && missingRecords(serverSummary, local).length > 0
   const serverName = server.companyName || 'an unnamed company'
   const localName = local.companyName || 'an unnamed company'
   const useServer = async (discardPending: boolean) => onDone(await run('servercopy', () => connect.useServerCopy({ discardPending })), 'server')
@@ -428,10 +466,19 @@ function ServerHasData({
     <div className="flex flex-col gap-5">
       <DescriptionList
         items={[
-          { label: 'On your server', value: `${serverName}${server.sample ? ' (sample company)' : ''}: ${describeCounts(server.counts)}` },
-          { label: 'In this browser', value: `${localName}${local.sample ? ' (sample company)' : ''}: ${describeCounts(local.counts)}` },
+          { label: 'On your server', value: <WorkspaceLine summary={serverSummary} recommended={recommended === 'server'} /> },
+          { label: 'In this browser', value: <WorkspaceLine summary={local} recommended={recommended === 'local'} /> },
         ]}
       />
+      {diverged && (
+        <Callout tone="warn" title="Each copy has work the other does not">
+          <p>
+            This browser's copy has {joinAnd(onlyHere)} than your server's, which using the server's copy would lose. Your server's copy
+            has {joinAnd(onlyOnServer)} than this browser's, which replacing it would lose. Neither is recommended: download a backup of
+            this browser's copy first, whichever you choose.
+          </p>
+        </Callout>
+      )}
 
       <section aria-labelledby="server-choice-copy" className="flex flex-col gap-3 border-t border-line pt-4">
         <h3 id="server-choice-copy" className="text-[15.5px] font-bold text-ink">
@@ -456,7 +503,8 @@ function ServerHasData({
             }
           >
             <p>
-              Using the server's copy replaces it here ({describeCounts(local.counts)}). Download a backup first to keep it.
+              Using the server's copy replaces it here ({describeCounts(local.counts)}).
+              {onlyHere.length > 0 && ` This browser's copy has ${joinAnd(onlyHere)} than your server's.`} Download a backup first to keep it.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button size="sm" icon="download" onClick={() => downloadBackup()}>
@@ -472,7 +520,7 @@ function ServerHasData({
               <div className="mt-3">
                 <ConfirmButton
                   icon="trash"
-                  confirmLabel="Click again to discard them"
+                  confirmLabel="Press again to discard them"
                   onConfirm={() => !busy && void useServer(true)}
                   {...busyProps(busy)}
                 >
@@ -492,7 +540,7 @@ function ServerHasData({
               variant="primary"
               size="lg"
               icon="download"
-              confirmLabel="Click again to replace this browser's copy"
+              confirmLabel="Press again to replace this browser's copy"
               onConfirm={() => !busy && void useServer(false)}
               {...busyProps(busy)}
             >
@@ -514,7 +562,7 @@ function ServerHasData({
             <div className="flex flex-wrap gap-2">
               <ConfirmButton
                 variant="ghost"
-                confirmLabel={`Click again to replace ${serverName} with the sample for everyone`}
+                confirmLabel={`Press again to replace ${serverName} with the sample for everyone`}
                 onConfirm={() => !busy && void replace()}
                 {...busyProps(busy)}
               >
@@ -524,14 +572,22 @@ function ServerHasData({
           </>
         ) : (
           <>
-            <Callout tone="bad" title={`This removes ${serverName} from your server for everyone`}>
+            <Callout
+              tone="bad"
+              title={
+                compare === 'same_name'
+                  ? `This replaces your server's copy of ${serverName} for everyone`
+                  : `This removes ${serverName} from your server for everyone`
+              }
+            >
+              {onlyOnServer.length > 0 && <>The server's copy has {joinAnd(onlyOnServer)} than this browser's, and they would be lost. </>}
               Your server's {describeCounts(server.counts)} are replaced by {localName} from this browser, and every computer that syncs
               switches to it. The app cannot bring the server's copy back; only a database backup on the server can.
             </Callout>
             <div className="flex flex-wrap gap-2">
               <ConfirmButton
                 icon="upload"
-                confirmLabel="Click again to replace the server's workspace"
+                confirmLabel="Press again to replace the server's workspace"
                 onConfirm={() => !busy && void replace()}
                 {...busyProps(busy)}
               >
@@ -638,7 +694,7 @@ export function HoldPanel({
                   <ConfirmButton
                     variant="primary"
                     icon="download"
-                    confirmLabel="Click again to use the server's copy"
+                    confirmLabel="Press again to use the server's copy"
                     onConfirm={() => !busy && void useServer(false)}
                     {...busyProps(busy)}
                   >
@@ -646,7 +702,7 @@ export function HoldPanel({
                   </ConfirmButton>
                   <ConfirmButton
                     icon="upload"
-                    confirmLabel="Click again to replace the server's workspace"
+                    confirmLabel="Press again to replace the server's workspace"
                     onConfirm={() => !busy && void upload({ confirmReplace: true, includeSample: local.sample })}
                     {...busyProps(busy)}
                   >
@@ -667,7 +723,7 @@ export function HoldPanel({
                   <Button variant="ghost" icon="download" onClick={() => downloadBackup()}>
                     Download backup
                   </Button>
-                  <ConfirmButton icon="trash" confirmLabel="Click again to discard them" onConfirm={() => !busy && void useServer(true)} {...busyProps(busy)}>
+                  <ConfirmButton icon="trash" confirmLabel="Press again to discard them" onConfirm={() => !busy && void useServer(true)} {...busyProps(busy)}>
                     Use the server's copy and discard them
                   </ConfirmButton>
                 </div>
@@ -688,7 +744,7 @@ export function HoldPanel({
             actions={
               <ConfirmButton
                 icon="upload"
-                confirmLabel="Click again to replace the server's workspace"
+                confirmLabel="Press again to replace the server's workspace"
                 onConfirm={() => !busy && void upload({ confirmReplace: true, includeSample: local.sample })}
                 {...busyProps(busy)}
               >
@@ -706,7 +762,7 @@ export function HoldPanel({
                 </Button>
                 <ConfirmButton
                   icon="trash"
-                  confirmLabel="Click again to discard this browser's copy"
+                  confirmLabel="Press again to discard this browser's copy"
                   onConfirm={() => !busy && void useServer(true)}
                   {...busyProps(busy)}
                 >
@@ -732,7 +788,7 @@ export function HoldPanel({
                     <Button variant="ghost" icon="download" onClick={() => downloadBackup()}>
                       Download backup
                     </Button>
-                    <ConfirmButton icon="rotate-ccw" confirmLabel="Click again to take the server's copy" onConfirm={() => setDemoClock(null)}>
+                    <ConfirmButton icon="rotate-ccw" confirmLabel="Press again to take the server's copy" onConfirm={() => setDemoClock(null)}>
                       Go back to the real date
                     </ConfirmButton>
                   </>

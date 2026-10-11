@@ -28,7 +28,7 @@ import {
   toast,
 } from '@/ui'
 import { commit, EditSheet, Row, RowList } from './kit'
-import { localMinWage, usageOf, type UsageKind } from './logic'
+import { hintWithCount, localMinWage, SHORT_TEXT_MAX_CHARS, usageOf, type UsageKind } from './logic'
 
 const TRACK_LABELS: Record<Level['track'], string> = { ic: 'Individual contributor', manager: 'Manager', executive: 'Executive' }
 const FAMILY_TRACKS: Array<{ value: JobFamily['track']; label: string }> = [
@@ -552,9 +552,19 @@ function LevelsPanel() {
                   options={[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => ({ value: String(n), label: String(n) }))}
                 />
               </div>
-              <Field label="What this level means" hint="One or two sentences. Helps keep offers consistent.">
+              <Field
+                label="What this level means"
+                hint={hintWithCount('One or two sentences. Helps keep offers consistent.', d.description, SHORT_TEXT_MAX_CHARS)}
+              >
                 {(id, hint) => (
-                  <TextArea id={id} aria-describedby={hint} rows={3} value={d.description ?? ''} onChange={(e) => set({ description: e.target.value })} />
+                  <TextArea
+                    id={id}
+                    aria-describedby={hint}
+                    rows={3}
+                    maxLength={SHORT_TEXT_MAX_CHARS}
+                    value={d.description ?? ''}
+                    onChange={(e) => set({ description: e.target.value })}
+                  />
                 )}
               </Field>
             </>

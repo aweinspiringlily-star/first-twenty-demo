@@ -1,7 +1,8 @@
+import { produce } from 'immer'
 import { describe, expect, it } from 'vitest'
 import { addContractor, addMany, addPerson, ledgerlarkLite, makeDB } from '@/domain/compliance/testkit'
 import type { DB, Person, TrainingKind } from '@/domain/types'
-import { harassmentThresholdReachedOn, trainingMatrix, trainingRequirements } from './trainings'
+import { harassmentThresholdReachedOn, openTrainingRows, trainingMatrix, trainingRequirements } from './trainings'
 
 function row(db: DB, p: Person, date: string, course: 'harassment' | 'security_awareness' | 'wvpp') {
   const r = trainingRequirements(db, p, date).find((x) => x.course === course)
@@ -172,6 +173,53 @@ describe('after the last day', () => {
     }
     expect(rows.find((r) => r.course === 'harassment')).toMatchObject({ status: 'done', completedOn: '2025-06-01', nextDueOn: '2027-06-01' })
     expect(rows.find((r) => r.course === 'security_awareness')).toMatchObject({ status: 'not_required', dueOn: undefined })
+  })
+})
+
+describe('before a scheduled last day', () => {
+  /** 12 on site under a written WVPP plan (Oct 11), so on-site staff train by Nov 10. */
+  function wvppDB(): DB {
+    const db = makeDB()
+    addMany(db, 11, '2025-03-03')
+    db.locations[0].typicalMaxOnSite = 12
+    db.complianceStatus.wvpp = { actionsDone: { 'write-plan': '2026-10-11' } }
+    return db
+  }
+
+  it('a course due after the last day is not required, and drops from the open rows and the counts', () => {
+    const db = wvppDB()
+    const nikhil = addPerson(db, { id: 'p-nikhil', startDate: '2025-04-07', endDate: '2026-10-30', separation: { type: 'resigned_notice', reason: 'x', lastDay: '2026-10-30' } })
+    const elena = addPerson(db, { id: 'p-elena', startDate: '2025-04-07', endDate: '2026-10-11', separation: { type: 'terminated', reason: 'x', lastDay: '2026-10-11' } })
+    const stays = db.people[3]
+    const d = '2026-10-11'
+    expect(row(db, stays, d, 'wvpp')).toMatchObject({ required: true, dueOn: '2026-11-10', status: 'due' })
+    expect(row(db, nikhil, d, 'wvpp')).toMatchObject({ required: false, recommended: false, status: 'not_required', dueOn: undefined, reason: 'Leaves Oct 30, 2026, before it is due; not required.' })
+    expect(row(db, elena, d, 'wvpp')).toMatchObject({ required: false, reason: 'Leaves Oct 11, 2026, before it is due; not required.' })
+    const open = openTrainingRows(db, d, 'wvpp').map((r) => r.person.id)
+    expect(open).toContain(stays.id)
+    expect(open).not.toContain('p-nikhil')
+    expect(open).not.toContain('p-elena')
+    const m = trainingMatrix(db, d)
+    const without = trainingMatrix(produce(db, (x) => { x.people = x.people.filter((p) => p.id !== 'p-nikhil' && p.id !== 'p-elena') }), d)
+    expect(m.counts.due).toBe(without.counts.due)
+  })
+
+  it('harassment training due 6 months after hire is not required for someone leaving before then', () => {
+    const db = makeDB()
+    addMany(db, 5, '2025-02-03')
+    const p = addPerson(db, { id: 'p-short', startDate: '2026-08-03', endDate: '2026-12-18', separation: { type: 'resigned_notice', reason: 'x', lastDay: '2026-12-18' } })
+    expect(row(db, p, '2026-10-11', 'harassment')).toMatchObject({ required: false, status: 'not_required', reason: 'Leaves Dec 18, 2026, before it is due; not required.' })
+    // Due before the last day: still required.
+    const later = addPerson(db, { id: 'p-later', startDate: '2026-08-03', endDate: '2027-03-31', separation: { type: 'resigned_notice', reason: 'x', lastDay: '2027-03-31' } })
+    expect(row(db, later, '2026-10-11', 'harassment')).toMatchObject({ required: true, dueOn: '2027-02-03' })
+  })
+
+  it('a valid completion with its refresher after the last day still shows as done', () => {
+    const db = makeDB()
+    addMany(db, 5, '2025-02-03')
+    const p = addPerson(db, { id: 'p-done', startDate: '2025-03-03', endDate: '2026-10-30', separation: { type: 'resigned_notice', reason: 'x', lastDay: '2026-10-30' } })
+    complete(db, 'p-done', 'harassment_employee', '2025-06-01')
+    expect(row(db, p, '2026-10-11', 'harassment')).toMatchObject({ required: false, status: 'done', nextDueOn: '2027-06-01' })
   })
 })
 

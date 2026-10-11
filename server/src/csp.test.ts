@@ -39,6 +39,8 @@ describe('inline script hashes', () => {
     expect(csp).not.toMatch(/script-src[^;]*unsafe-inline/)
     expect(csp).toContain("style-src 'self' 'unsafe-inline'")
     expect(appCsp([])).toContain("script-src 'self';")
+    // Workers (the offline worker, /sw.js) only from the server itself.
+    expect(csp).toContain("worker-src 'self'")
   })
 
   it('finds every inline script of the built app, when it has been built', () => {

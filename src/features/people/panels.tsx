@@ -106,7 +106,12 @@ export function PersonChecklistsPanel({ personId, onlyMine }: { personId: ID; on
       const person = getPerson(db, cl.personId)
       for (const task of checklistStats(viewer, db, cl, t).tasks) {
         if (task.status !== 'open' || mootAfterExit(cl, task, person)) continue
-        const owns = task.assigneeId ? task.assigneeId === personId : task.ownerRole === 'employee' && cl.personId === personId
+        // An unassigned manager task (its manager left) belongs to whoever manages the person now.
+        const owns = task.assigneeId
+          ? task.assigneeId === personId
+          : task.ownerRole === 'employee'
+            ? cl.personId === personId
+            : task.ownerRole === 'manager' && person?.managerId === personId
         if (owns) rows.push({ checklist: cl, task })
       }
     }

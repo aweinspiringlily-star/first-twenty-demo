@@ -11,7 +11,7 @@ import { budgetVariance, headcountProjection, planCost, type PlanRow, planRollup
 import type { ID, PlanSlot } from '@/domain/types'
 import { addMonths, fmtDate, fmtQuarter, fmtShort, quarterOf, today } from '@/lib/dates'
 import { copyText, printHTML } from '@/lib/files'
-import { money, moneyShort } from '@/lib/format'
+import { money, moneyShort, plural } from '@/lib/format'
 import { newId } from '@/lib/id'
 import { logActivity, useDB } from '@/store/db'
 import {
@@ -39,7 +39,7 @@ import {
   toast,
   type Column,
 } from '@/ui'
-import { boardHTML, boardSummary, boardText, hiringManagerForSlot, PLAN_STATUS_LABEL, quarterStartPresets } from './helpers'
+import { boardHTML, boardSummary, boardText, hiringManagerForSlot, NOTE_MAX_CHARS, noteCountText, PLAN_STATUS_LABEL, quarterStartPresets } from './helpers'
 import { PlanStatusBadge } from './shared'
 
 function undoToast(text: string) {
@@ -58,6 +58,7 @@ export function PlanTab() {
   const summary = planSummary(db, date)
   const [editing, setEditing] = useState<PlanSlot | 'new' | null>(null)
   const varianceBySlot = new Map(variance.rows.map((r) => [r.slotId, r]))
+  const varianceLines = variance.rows.filter((r) => r.variance != null)
 
   const quarters = [...new Set(rows.map((r) => r.slot.quarter))].sort()
   const costByQuarter = new Map(cost.byQuarter.map((q) => [q.quarter, q]))
@@ -201,6 +202,8 @@ export function PlanTab() {
         return (
           <span className="whitespace-nowrap">
             <Money value={v.actualBase} />
+            {/* Budgets are full time, so part-time pay is compared at 40 hours a week (as Job and pay does). */}
+            {v.restatedFromHours != null && <span className="block text-[11.5px] text-ink-3">restated at full time</span>}
             {v.variance != null && v.variance !== 0 && (
               <span className={v.variance > 0 ? 'block text-[12px] font-semibold text-warn' : 'block text-[12px] text-good'}>
                 <Private>
@@ -237,19 +240,23 @@ export function PlanTab() {
             <p className="mt-2 text-[14px] text-ink-2">
               {cost.count > 0 ? (
                 <>
-                  The {cost.count} lines still to hire add <Money value={cost.monthly} short /> a month fully loaded.{' '}
+                  The {cost.count === 1 ? 'line' : `${cost.count} lines`} still to hire {cost.count === 1 ? 'adds' : 'add'}{' '}
+                  <Money value={cost.monthly} short /> a month fully loaded.{' '}
                 </>
-              ) : (
+              ) : db.plan.length > 0 ? (
                 'Every plan line is filled or cut. '
+              ) : (
+                'No plan lines yet. '
               )}
-              {variance.rows.some((r) => r.variance != null) && (
+              {varianceLines.length > 0 && (
                 <>
                   Offers and hires vs budget:{' '}
                   <Private>
                     {variance.totals.variance > 0 ? '+' : variance.totals.variance < 0 ? '-' : ''}
                     {money(Math.abs(variance.totals.variance))}
                   </Private>{' '}
-                  in base across {variance.rows.filter((r) => r.variance != null).length} lines.
+                  in base across {plural(varianceLines.length, 'line')}
+                  {varianceLines.some((r) => r.restatedFromHours != null) ? ', part-time pay restated at full time' : ''}.
                 </>
               )}
             </p>
@@ -377,6 +384,7 @@ function PlanLineForm({ slot, onClose }: { slot: PlanSlot | null; onClose: () =>
   const [isBackfill, setIsBackfill] = useState(!!slot?.isBackfill)
   const [backfillFor, setBackfillFor] = useState<ID | ''>(slot?.backfillForPersonId ?? '')
   const [rationale, setRationale] = useState(slot?.rationale ?? '')
+  const rationaleCount = noteCountText(rationale)
   const [tried, setTried] = useState(false)
   const band = bandFor(db, familyId, levelId)
   const levels = db.levels.filter((l) => db.bands.some((b) => b.familyId === familyId && b.levelId === l.id) || l.id === levelId)
@@ -511,8 +519,8 @@ function PlanLineForm({ slot, onClose }: { slot: PlanSlot | null; onClose: () =>
           </Field>
         )}
       </div>
-      <Field label="Why this role (optional)" hint="Dictation works here: Win+H on Windows, or dictation on a Mac.">
-        {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} value={rationale} onChange={(e) => setRationale(e.target.value)} />}
+      <Field label="Why this role (optional)" hint={`Dictation works here: Win+H on Windows, or dictation on a Mac.${rationaleCount ? ` ${rationaleCount}.` : ''}`}>
+        {(id, d) => <TextArea id={id} aria-describedby={d} rows={3} maxLength={NOTE_MAX_CHARS} value={rationale} onChange={(e) => setRationale(e.target.value)} />}
       </Field>
       {effectiveBase != null && (
         <p className="text-[13.5px] text-ink-2">

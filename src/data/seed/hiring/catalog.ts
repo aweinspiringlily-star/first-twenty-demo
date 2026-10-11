@@ -172,6 +172,11 @@ export type PlanSpec = {
   levelId: ID
   targetStart: ISODate
   budgetBase?: number
+  /**
+   * The stored status before the hire flow runs. A line a seeded hire fills through hireFromOffer is
+   * 'open' (as openJobFromPlan leaves it), since Hire takes only a line nobody holds yet; it reads
+   * 'filled' with the person on it once the hire is recorded. 'filled' here needs the personId.
+   */
   status: 'planned' | 'open' | 'offer' | 'filled' | 'cut'
   jobId: ID
   personId?: ID
@@ -214,8 +219,8 @@ export function planSpecs(): PlanSpec[] {
     { id: 'ps-q3-solutions', quarter: '2026-Q3', title: 'Solutions engineer', dept: 'acct', familyId: 'f-solutions', levelId: 'lv-l3', targetStart: '2026-07-06', budgetBase: 170_000, status: 'filled', jobId: 'j-solutions-eng', personId: 'p-chris', rationale: 'Sales needs a technical partner for NetSuite demos and security reviews.' },
     { id: 'ps-q3-staff-swe', quarter: '2026-Q3', title: 'Staff software engineer', dept: 'eng', familyId: 'f-eng', levelId: 'lv-l4', targetStart: '2026-08-03', budgetBase: 235_000, status: 'filled', jobId: 'j-staff-swe', personId: 'p-ravi', rationale: 'Senior technical lead for the agent platform as the team passes ten engineers.' },
     { id: 'ps-q3-csm', quarter: '2026-Q3', title: 'Customer success manager', dept: 'gtm', familyId: 'f-gtm', levelId: 'lv-l2', targetStart: '2026-09-08', budgetBase: 140_000, status: 'filled', jobId: 'j-csm', personId: 'p-aisha', rationale: 'Fourteen paying customers need an accounting-literate owner after go-live.' },
-    { id: 'ps-q3-data-backfill', quarter: '2026-Q3', title: 'Senior data engineer (backfill)', dept: 'eng', familyId: 'f-eng', levelId: 'lv-l3', targetStart: '2026-09-28', budgetBase: 190_000, status: 'filled', jobId: 'j-data-eng-backfill', isBackfill: true, backfillForPersonId: 'p-omar', rationale: 'Backfill for Omar Haddad, who left on Aug 28. ERP connectors cannot wait.' },
-    { id: 'ps-q4-ml-agents', quarter: '2026-Q4', title: 'Senior ML engineer, agents', dept: 'ai', familyId: 'f-ml', levelId: 'lv-l3', targetStart: '2026-11-02', budgetBase: 225_000, status: 'filled', jobId: 'j-ml-agents', rationale: 'Second engineer on the reconciliation and accrual agents.' },
+    { id: 'ps-q3-data-backfill', quarter: '2026-Q3', title: 'Senior data engineer (backfill)', dept: 'eng', familyId: 'f-eng', levelId: 'lv-l3', targetStart: '2026-09-28', budgetBase: 190_000, status: 'open', jobId: 'j-data-eng-backfill', isBackfill: true, backfillForPersonId: 'p-omar', rationale: 'Backfill for Omar Haddad, who left on Aug 28. ERP connectors cannot wait.' },
+    { id: 'ps-q4-ml-agents', quarter: '2026-Q4', title: 'Senior ML engineer, agents', dept: 'ai', familyId: 'f-ml', levelId: 'lv-l3', targetStart: '2026-11-02', budgetBase: 225_000, status: 'open', jobId: 'j-ml-agents', rationale: 'Second engineer on the reconciliation and accrual agents.' },
     { id: 'ps-q4-staff-ml', quarter: '2026-Q4', title: 'Staff ML engineer, agents and evals', dept: 'ai', familyId: 'f-ml', levelId: 'lv-l4', targetStart: '2026-11-30', budgetBase: 255_000, status: 'open', jobId: 'j-staff-ml', rationale: 'Technical lead for agent quality: evals, error analysis and safety reviews.' },
     { id: 'ps-q4-fullstack', quarter: '2026-Q4', title: 'Senior full-stack engineer', dept: 'eng', familyId: 'f-eng', levelId: 'lv-l3', targetStart: '2026-12-07', budgetBase: 207_000, status: 'open', jobId: 'j-fullstack', rationale: 'The review workspace is the product surface controllers live in during close.' },
     { id: 'ps-q4-solutions-acct', quarter: '2026-Q4', title: 'Solutions accountant (CPA)', dept: 'acct', familyId: 'f-acct', levelId: 'lv-l3', targetStart: '2026-12-14', budgetBase: 185_000, status: 'open', jobId: 'j-solutions-acct', rationale: 'Accounting expert for customer rollouts and eval labeling.' },

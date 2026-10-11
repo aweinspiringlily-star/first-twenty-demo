@@ -6,6 +6,7 @@ import { create } from 'zustand'
 import { blankDB } from '@/data/blank'
 import { buildSampleDB } from '@/data/seed'
 import { applyDueHandoffs } from '@/domain/handoff'
+import { expireOffers } from '@/domain/hiring/offers'
 import { applyScheduledChanges } from '@/domain/lifecycle'
 import type { DB } from '@/domain/types'
 import { daysBetween, shiftDatesDeep, today } from '@/lib/dates'
@@ -42,18 +43,34 @@ function entry(db: DB, label: string): HistoryEntry {
   return { db, label, id: historySeq, at: Date.now() }
 }
 
+/**
+ * How many days the sample's dates move so "today" in the story is `day`: whole weeks, so weekdays stay
+ * aligned (interviews stay on weekdays, starts on Mondays).
+ */
+function sampleShiftOn(anchor: string, day: string): number {
+  return Math.round(daysBetween(anchor, day) / 7) * 7
+}
+
 /** Loads the sample company with its dates shifted so "today" in the story is today. */
 export function loadSample(): DB {
   const db = buildSampleDB()
   const anchor = db.meta.sampleAnchor
   if (!anchor) return db
-  // Shift in whole weeks so weekdays stay aligned (interviews stay on weekdays, starts on Mondays).
-  const shift = Math.round(daysBetween(anchor, today()) / 7) * 7
+  const shift = sampleShiftOn(anchor, today())
   if (shift === 0) return db
   // Law, holiday and settings dates stay put; only the company's story moves.
   const shifted = shiftDatesDeep(db, shift, new Set(['settings', 'lastReviewedOn', 'holidays', 'timeOffPolicies', 'checklistTemplates']))
   shifted.meta = { ...shifted.meta, sampleAnchor: anchor, sampleShiftDays: shift }
   return shifted
+}
+
+/**
+ * True while the sample's dates match this week (what loadSample would give today). A sample that was
+ * saved (any edit) or uploaded loads with the dates it had then, so after a week it no longer does.
+ */
+export function sampleIsCurrent(db: Pick<DB, 'meta'>): boolean {
+  const { sample, sampleAnchor, sampleShiftDays } = db.meta
+  return !!sample && !!sampleAnchor && (sampleShiftDays ?? 0) === sampleShiftOn(sampleAnchor, today())
 }
 
 /** Fills collections added after a workspace was saved, so older saves keep loading. */
@@ -78,17 +95,23 @@ function readStored(): { db: DB | null; ok: boolean } {
   }
 }
 
-/** Applies effective-dated job and pay changes and leavers' hand-offs whose date has arrived (once per load). */
-function withScheduledChanges(db: DB): DB {
+/**
+ * The changes the app makes on its own when a workspace loads: effective-dated job and pay changes and
+ * leavers' hand-offs whose date has arrived, then sent offers past their expiry date. Run on every load
+ * and every replace here, and by the sync engine on a server copy (src/sync/index.ts uses this same
+ * function), so every device makes the same changes in the same order.
+ */
+export function applyLoadChanges(db: DB): DB {
   return produce(db, (d) => {
     applyScheduledChanges(d, today())
     applyDueHandoffs(d, today())
+    expireOffers(d, today())
   })
 }
 
 function initialState(): { db: DB; ok: boolean } {
   const stored = typeof window === 'undefined' ? { db: null, ok: true } : readStored()
-  return { db: withScheduledChanges(stored.db ?? loadSample()), ok: stored.ok }
+  return { db: applyLoadChanges(stored.db ?? loadSample()), ok: stored.ok }
 }
 
 const initial = initialState()
@@ -121,7 +144,7 @@ export const useDB = create<DBState>((set, get) => ({
   },
   replace: (db, label = 'Replace workspace') => {
     const prev = get().db
-    set((s) => ({ db: withScheduledChanges(db), past: [...s.past.slice(-(UNDO_LIMIT - 1)), entry(prev, label)] }))
+    set((s) => ({ db: applyLoadChanges(db), past: [...s.past.slice(-(UNDO_LIMIT - 1)), entry(prev, label)] }))
   },
 }))
 

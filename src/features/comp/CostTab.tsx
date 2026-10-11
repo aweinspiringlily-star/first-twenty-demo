@@ -4,15 +4,16 @@
 import { useMemo, useState } from 'react'
 import { links, navigate } from '@/app/router'
 import { LAW_SOURCES } from '@/data/law'
-import { latestOffers, offerMonthlyImpact, runRate, type RunRate, type RunRateInclude, type RunRateLine, runway } from '@/domain/pay'
+import { benefitsBasis, latestOffers, offerMonthlyImpact, runRate, type RunRate, type RunRateInclude, type RunRateLine, runway, runwayMonthsLabel } from '@/domain/pay'
 import { fmtDate, today } from '@/lib/dates'
-import { money, moneyShort, pct } from '@/lib/format'
+import { money, moneyShort, pct, plural } from '@/lib/format'
 import { useDB } from '@/store/db'
 import { Badge, BarList, Button, Callout, CitationChip, cx, DataTable, Money, Panel, Private, type Column } from '@/ui'
+import { scenarioDelta, scenarioDeltaParts } from './helpers'
 
 const SCENARIOS: Array<{ key: RunRateInclude; label: string; hint: string }> = [
   { key: 'now', label: 'Now', hint: 'Employed today' },
-  { key: 'with_incoming', label: 'With incoming', hint: 'Plus accepted offers not started' },
+  { key: 'with_incoming', label: 'With incoming', hint: 'Plus accepted offers not started, minus anyone leaving' },
   { key: 'with_offers', label: 'With offers', hint: 'Plus offers out' },
   { key: 'at_plan', label: 'At plan', hint: 'Plus open and planned lines' },
 ]
@@ -22,10 +23,6 @@ const KIND: Record<RunRateLine['kind'], { label: string; tone: 'neutral' | 'acce
   incoming: { label: 'Starting', tone: 'accent' },
   offer: { label: 'Offer out', tone: 'warn' },
   plan: { label: 'Plan line', tone: 'outline' },
-}
-
-function first(name: string) {
-  return name.split(' ')[0]
 }
 
 export function CostTab() {
@@ -60,19 +57,23 @@ export function CostTab() {
     [db, rates],
   )
 
-  const delta = (i: number) => {
-    if (i === 0) return null
-    const prev = rates[SCENARIOS[i - 1].key]
-    const cur = rates[SCENARIOS[i].key]
-    const added = cur.lines.filter((l) => !prev.lines.some((p) => p.key === l.key))
-    return { amount: cur.monthly - prev.monthly, names: added.map((l) => (l.kind === 'plan' ? l.name : first(l.name))) }
-  }
+  // Both directions, so the head counts add up: people joining and people leaving before then.
+  const delta = (i: number) => (i === 0 ? null : scenarioDeltaParts(scenarioDelta(rates[SCENARIOS[i - 1].key], rates[SCENARIOS[i].key])))
+
+  // Benefits follow Settings > Company: none with no group health plan, an assumption while it is not recorded.
+  const benefits = benefitsBasis(db.company)
+  const benefitsLabel =
+    benefits === 'none'
+      ? 'Benefits (no group health plan)'
+      : benefits === 'assumed'
+        ? `Benefits (${money(model.benefitsPerHeadMonthly)} a head, assumed: no health plan recorded)`
+        : `Benefits (${money(model.benefitsPerHeadMonthly)} a head)`
 
   const breakdown = [
     { key: 'base', label: 'Base pay', value: rr.breakdown.base },
     { key: 'variable', label: 'Variable at target', value: rr.breakdown.variable },
     { key: 'taxes', label: 'Employer taxes', value: rr.breakdown.employerTaxes },
-    { key: 'benefits', label: `Benefits (${money(model.benefitsPerHeadMonthly)} a head)`, value: rr.breakdown.benefits },
+    { key: 'benefits', label: benefitsLabel, value: rr.breakdown.benefits },
     { key: 'peo', label: `PEO and tools (${money(model.peoToolsPerHeadMonthly)} a head)`, value: rr.breakdown.peoTools },
     { key: 'wc', label: `Workers' comp (${pct(model.workersCompPct, 1)} of wages)`, value: rr.breakdown.workersComp },
   ]
@@ -108,7 +109,7 @@ export function CostTab() {
               )}
             >
               <span className="text-[13px] font-semibold text-ink-3">
-                {s.label} <span className="font-normal">({r.headcount} people)</span>
+                {s.label} <span className="font-normal">({plural(r.headcount, 'person', 'people')})</span>
               </span>
               <span className="num mt-1 font-display text-[26px] leading-none font-bold text-ink">
                 <Money value={r.monthly} short />
@@ -118,13 +119,13 @@ export function CostTab() {
                 <Money value={r.annual} short /> a year
               </span>
               <span className="mt-1.5 text-[12.5px] text-ink-3">
-                {d && d.names.length ? (
-                  <>
-                    <Private>
-                      +{moneyShort(d.amount)}
-                    </Private>{' '}
-                    for {d.names.length <= 3 ? d.names.join(', ') : `${d.names.length} more`}
-                  </>
+                {d && d.length ? (
+                  d.map((part, j) => (
+                    <span key={part.amount + part.text}>
+                      {j > 0 && ', '}
+                      <Private>{part.amount}</Private> {part.text}
+                    </span>
+                  ))
                 ) : d ? (
                   'No change'
                 ) : (
@@ -153,9 +154,13 @@ export function CostTab() {
           title={`Breakdown: ${SCENARIOS.find((s) => s.key === scenario)?.label.toLowerCase()}`}
           icon="coins"
           subtitle={
-            <>
-              Fully loaded cost runs about <Private>{multiplier.toFixed(2)}x</Private> base. W-2 only; contractors are below.
-            </>
+            baseAnnual > 0 ? (
+              <>
+                Fully loaded cost runs about <Private>{multiplier.toFixed(2)}x</Private> base. W-2 only; contractors are below.
+              </>
+            ) : (
+              'No base pay on record in this scenario, so there is no multiple of base. W-2 only; contractors are below.'
+            )
           }
           padded={false}
         >
@@ -246,13 +251,13 @@ export function CostTab() {
                   <div>
                     <div className="text-[12.5px] font-semibold text-ink-3">At today's burn</div>
                     <div className="num font-display text-[26px] leading-tight font-bold text-ink">
-                      {rwNow.months === Infinity ? 'Not shrinking' : `${Math.round(rwNow.months)} months`}
+                      {runwayMonthsLabel(rwNow.months)}
                     </div>
                   </div>
                   <div>
                     <div className="text-[12.5px] font-semibold text-ink-3">If the plan hires on schedule</div>
                     <div className="num font-display text-[26px] leading-tight font-bold text-ink">
-                      {rwPlan.months == null ? 'Not set' : rwPlan.months === Infinity ? 'Not shrinking' : `${Math.round(rwPlan.months)} months`}
+                      {rwPlan.months == null ? 'Not set' : runwayMonthsLabel(rwPlan.months)}
                     </div>
                   </div>
                 </div>
@@ -276,7 +281,10 @@ export function CostTab() {
                   </dd>
                   <dt className="text-ink-3">Revenue</dt>
                   <dd className="text-right">
-                    <Private>-{money(rwSel.monthlyRevenue)}/mo</Private>
+                    <Private>
+                      {rwSel.monthlyRevenue > 0 ? '-' : ''}
+                      {money(rwSel.monthlyRevenue)}/mo
+                    </Private>
                   </dd>
                   <dt className="font-semibold text-ink">Net burn</dt>
                   <dd className="text-right font-semibold">
@@ -340,7 +348,14 @@ export function CostTab() {
               <div>
                 <dt className="text-[12.5px] font-semibold text-ink-3">Benefits per head</dt>
                 <dd>
-                  <Money value={model.benefitsPerHeadMonthly} suffix=" a month" /> (30+ hours a week)
+                  {benefits === 'none' ? (
+                    'None: Settings records no group health plan'
+                  ) : (
+                    <>
+                      <Money value={model.benefitsPerHeadMonthly} suffix=" a month" /> (30+ hours a week)
+                      {benefits === 'assumed' && <span className="block text-[12.5px] text-ink-3">An assumption until the group health plan is recorded</span>}
+                    </>
+                  )}
                 </dd>
               </div>
               <div>
@@ -381,7 +396,7 @@ export function CostTab() {
         padded={false}
         actions={
           <Button size="sm" variant="ghost" icon={allLines ? 'chevron-up' : 'chevron-down'} aria-expanded={allLines} onClick={() => setAllLines((v) => !v)}>
-            {allLines ? 'Hide lines' : `Show ${rr.lines.length} lines`}
+            {allLines ? 'Hide lines' : `Show ${plural(rr.lines.length, 'line')}`}
           </Button>
         }
       >

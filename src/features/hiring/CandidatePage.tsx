@@ -3,7 +3,9 @@
 // retain-until date, Archive never Delete); per application a stage stepper, the required next step,
 // quick logs and Reject/Withdraw; interviews, offer and background check blocks; notes and timeline.
 // Panel-only viewers (and employees who interview) get a reduced profile: their interviews only.
-import { useMemo, useState } from 'react'
+// #candidate.<id>.offer.<applicationId> (links.candidateOffer, from 'Open offer' on a pipeline card)
+// puts focus on that application's offer: its next action (Make offer, Mark sent, Hire), not the title.
+import { useEffect, useMemo, useState } from 'react'
 import type { PageProps } from '@/app/routes'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
@@ -24,7 +26,7 @@ import {
 import { personNameById } from '@/domain/people'
 import type { Application, Candidate, Job } from '@/domain/types'
 import { fmtDate, fmtDay, fmtRelative, fmtShort, nowISO, today } from '@/lib/dates'
-import { plural } from '@/lib/format'
+import { money2, plural } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import {
   Badge,
@@ -41,8 +43,11 @@ import {
   Icon,
   Money,
   MoneyInput,
+  NumberInput,
   PageHeader,
   Panel,
+  Private,
+  Segmented,
   Select,
   Sheet,
   TextArea,
@@ -50,9 +55,26 @@ import {
   toast,
 } from '@/ui'
 import { CandidateBackground, CandidateOffer } from './offers'
+import { offerFocusTarget } from './offers/focus'
 import { CandidateInterviews } from './interviews'
 import { commit, logContact, moveTo } from './actions'
-import { candidateOfferOn, candidateTimeline, guessTimezone, POOL_TAGS, slaBadge, textIssueError, textIssues, visibleApplicationIds } from './logic'
+import { EditConflictCallout, focusEditConflict, useEditConflicts } from './EditConflict'
+import {
+  candidateOfferOn,
+  candidateTimeline,
+  guessTimezone,
+  hourlyDesiredFits,
+  NOTE_MAX_CHARS,
+  noteCountText,
+  noteLengthError,
+  payTooHighError,
+  POOL_TAGS,
+  slaBadge,
+  switchDesiredUnit,
+  textIssueError,
+  textIssues,
+  visibleApplicationIds,
+} from './logic'
 import { NextStepEditor } from './NextStepEditor'
 import { AppStatusBadge, ExternalLink, NotLegalAdvice, SlaPill, SourceChip, TextIssueNotes } from './parts'
 import { RejectFlow } from './RejectFlow'
@@ -67,6 +89,14 @@ export function CandidatePage({ route }: PageProps) {
   const [editing, setEditing] = useState(false)
   const visibleApps = useMemo(() => visibleApplicationIds(viewer, db), [viewer, db])
   const cand = db.candidates.find((c) => c.id === id)
+  // Opened for an offer: once the page has rendered (after the App's own scroll to the top and focus
+  // rescue), focus the offer's next action, which scrolls it into view. Without one, focus stays put.
+  const offerFor = route.segments[2] === 'offer' ? route.segments[3] : undefined
+  useEffect(() => {
+    if (!offerFor) return
+    const frame = requestAnimationFrame(() => offerFocusTarget(offerFor)?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [offerFor, route.raw])
 
   if (!cand) {
     return <EmptyState icon="search" title="That candidate does not exist" body="The link may be from before an import or reset." action={<a className="font-bold text-accent underline" href={links.hiring('candidates')}>Go to candidates</a>} />
@@ -207,7 +237,7 @@ function ApplicationPanel({ app, job, full }: { app: Application; job: Job; full
     <Panel
       title={
         full ? (
-          <a href={links.job(job.id)} className="hover:text-accent">
+          <a href={links.job(job.id)} className="-my-2 inline-flex min-h-10 items-center hover:text-accent">
             {job.title}
           </a>
         ) : (
@@ -397,8 +427,9 @@ function ProfilePanel({ candidate: c, reduced, payVisible }: { candidate: Candid
         <DescriptionList
           columns={1}
           items={[
-            { label: 'Email', value: c.email ? <a className="break-all text-accent underline" href={`mailto:${c.email}`}>{c.email}</a> : null, hidden: reduced },
-            { label: 'Phone', value: c.phone ? <a className="text-accent underline" href={`tel:${c.phone.replace(/[^\d+]/g, '')}`}>{c.phone}</a> : null, hidden: reduced },
+            // 40px-tall targets; the negative margins keep the rows compact.
+            { label: 'Email', value: c.email ? <a className="-my-2 inline-flex min-h-10 items-center break-all text-accent underline" href={`mailto:${c.email}`}>{c.email}</a> : null, hidden: reduced },
+            { label: 'Phone', value: c.phone ? <a className="-my-2 inline-flex min-h-10 items-center text-accent underline" href={`tel:${c.phone.replace(/[^\d+]/g, '')}`}>{c.phone}</a> : null, hidden: reduced },
             { label: 'Location and time zone', value: [c.location, tz].filter(Boolean).join(', ') || null },
             {
               label: 'Source',
@@ -409,7 +440,7 @@ function ProfilePanel({ candidate: c, reduced, payVisible }: { candidate: Candid
                   {c.referrerId ? (
                     <>
                       {', referred by '}
-                      <a className="text-accent underline" href={links.person(c.referrerId)}>
+                      <a className="-my-2 inline-flex min-h-10 items-center text-accent underline" href={links.person(c.referrerId)}>
                         {personNameById(db, c.referrerId)}
                       </a>
                     </>
@@ -421,7 +452,18 @@ function ProfilePanel({ candidate: c, reduced, payVisible }: { candidate: Candid
             { label: 'Needs visa sponsorship', value: c.sponsorship === 'yes' ? 'Yes' : c.sponsorship === 'no' ? 'No' : 'Unknown', hidden: reduced },
             {
               label: 'Desired pay',
-              value: c.desiredPay != null ? <Money value={c.desiredPay} /> : <span className="text-ink-3">Not asked yet</span>,
+              value:
+                c.desiredPay == null ? (
+                  <span className="text-ink-3">Not asked yet</span>
+                ) : c.desiredPayUnit === 'hour' ? (
+                  <>
+                    <Private>{money2(c.desiredPay)}</Private> an hour
+                  </>
+                ) : (
+                  <>
+                    <Money value={c.desiredPay} /> a year
+                  </>
+                ),
               hidden: reduced || !payVisible,
             },
             { label: 'Added', value: fmtDate(c.createdOn), hidden: reduced },
@@ -519,13 +561,18 @@ function ProfilePanel({ candidate: c, reduced, payVisible }: { candidate: Candid
 function NotesPanel({ candidate: c }: { candidate: Candidate }) {
   const offerOn = useDB((s) => candidateOfferOn(s.db, c.id))
   const [text, setText] = useState('')
+  const [tooLong, setTooLong] = useState<string | undefined>(undefined)
   const issues = textIssues(text, { conditionalOfferOn: offerOn })
-  const error = textIssueError(issues)
+  // A note is its own activity record, and each record syncs as at most 256 KB (docs/SYNC.md).
+  const error = textIssueError(issues) ?? tooLong
+  const count = noteCountText(text)
   const name = `${c.firstName} ${c.lastName}`
   const add = () => {
     const note = text.trim()
     if (!note) return
-    if (error) {
+    const long = noteLengthError(note)
+    if (long) setTooLong(long)
+    if (error || long) {
       focusFirstInvalid()
       return
     }
@@ -536,8 +583,20 @@ function NotesPanel({ candidate: c }: { candidate: Candidate }) {
   }
   return (
     <Panel title="Notes" subtitle="Notes go on the timeline. They are visible to admins and the hiring manager.">
-      <Field label="Add a note" hint="Tip: press Win+H to dictate (on a Mac, press Fn twice)." error={error} id={`note-${c.id}`}>
-        {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} value={text} onChange={(e) => setText(e.target.value)} />}
+      <Field label="Add a note" hint={`Tip: press Win+H to dictate (on a Mac, press Fn twice).${count ? ` ${count}.` : ''}`} error={error} id={`note-${c.id}`}>
+        {(id, hint) => (
+          <TextArea
+            id={id}
+            aria-describedby={hint}
+            rows={3}
+            maxLength={NOTE_MAX_CHARS}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value)
+              setTooLong(undefined)
+            }}
+          />
+        )}
       </Field>
       <TextIssueNotes issues={issues} className="mt-3" />
       <div className="mt-3">
@@ -620,9 +679,9 @@ const ZONES = [
   { value: 'Asia/Kolkata', label: 'India' },
 ]
 
-function EditCandidateSheet({ candidate: c, payVisible, onClose }: { candidate: Candidate; payVisible: boolean; onClose: () => void }) {
-  const offerOn = useDB((s) => candidateOfferOn(s.db, c.id))
-  const [f, setF] = useState({
+/** The Edit details form for a candidate record. */
+function detailsForm(c: Candidate) {
+  return {
     firstName: c.firstName,
     lastName: c.lastName,
     email: c.email,
@@ -638,46 +697,120 @@ function EditCandidateSheet({ candidate: c, payVisible, onClose }: { candidate: 
     summary: c.summary ?? '',
     sponsorship: c.sponsorship,
     desiredPay: c.desiredPay ?? null,
-  })
-  const set = <K extends keyof typeof f>(k: K, v: (typeof f)[K]) => setF((x) => ({ ...x, [k]: v }))
+    desiredPayUnit: c.desiredPayUnit === 'hour' ? ('hour' as const) : ('year' as const),
+  }
+}
+
+type DetailsForm = ReturnType<typeof detailsForm>
+
+const DETAIL_WORDS: Record<keyof DetailsForm, string> = {
+  firstName: 'the first name',
+  lastName: 'the last name',
+  email: 'the email',
+  phone: 'the phone',
+  location: 'the location',
+  timezone: 'the time zone',
+  currentTitle: 'the current title',
+  currentCompany: 'the current company',
+  linkedin: 'the LinkedIn link',
+  github: 'the GitHub link',
+  resume: 'the resume link',
+  portfolio: 'the portfolio link',
+  summary: 'the highlights',
+  sponsorship: 'the sponsorship answer',
+  desiredPay: 'the desired pay',
+  desiredPayUnit: 'whether desired pay is per year or per hour',
+}
+
+/**
+ * Edit details. Saves only the fields changed here, so a change another computer made while the sheet
+ * was open survives; a change to the same field asks first (Use theirs or Keep mine).
+ */
+function EditCandidateSheet({ candidate: opened, payVisible, onClose }: { candidate: Candidate; payVisible: boolean; onClose: () => void }) {
+  const c = useDB((s) => s.db.candidates.find((x) => x.id === opened.id)) ?? opened
+  const offerOn = useDB((s) => candidateOfferOn(s.db, c.id))
+  const edit = useEditConflicts(detailsForm(c))
+  const [f, setF] = useState<DetailsForm>(() => edit.base)
+  const set = <K extends keyof DetailsForm>(k: K, v: DetailsForm[K]) => setF((x) => ({ ...x, [k]: v }))
   const zones = f.timezone && !ZONES.some((z) => z.value === f.timezone) ? [...ZONES, { value: f.timezone, label: f.timezone }] : ZONES
   const summaryIssues = textIssues(f.summary, { conditionalOfferOn: offerOn })
-  const summaryError = textIssueError(summaryIssues)
+  const summaryError = textIssueError(summaryIssues) ?? noteLengthError(f.summary)
+  // Per hour is offered when one of their jobs is posted by the hour or part time (or it is set already).
+  const hourlyFits = useDB((s) => hourlyDesiredFits(s.db.applications.filter((a) => a.candidateId === c.id).map((a) => s.db.jobs.find((j) => j.id === a.jobId))))
+  const showUnit = hourlyFits || f.desiredPayUnit === 'hour'
+  const payError = payTooHighError(f.desiredPay, f.desiredPayUnit === 'hour' ? 'hourly' : 'annual')
+  // Desired pay is not on the form for viewers who cannot see it, so it never counts here.
+  const payKey = (k: keyof DetailsForm) => k === 'desiredPay' || k === 'desiredPayUnit'
+  const conflicts = edit.conflicts(f).filter((k) => payVisible || !payKey(k))
   const save = () => {
     if (!f.firstName.trim()) {
       toast({ text: 'Add a first name.', tone: 'bad' })
       return
     }
-    if (summaryError) {
+    if (summaryError || (payVisible && payError)) {
       focusFirstInvalid()
+      return
+    }
+    if (conflicts.length) {
+      toast({ text: 'These details changed on another computer. Pick Use theirs or Keep mine first.', tone: 'neutral' })
+      focusEditConflict()
+      return
+    }
+    const changed = edit.changed(f).filter((k) => payVisible || !payKey(k))
+    if (changed.length === 0) {
+      onClose()
       return
     }
     commit(`Updated details for ${f.firstName} ${f.lastName}`.trim(), (d) => {
       const x = d.candidates.find((y) => y.id === c.id)
       if (!x) return false
-      x.firstName = f.firstName.trim()
-      x.lastName = f.lastName.trim()
-      x.email = f.email.trim()
       const opt = (k: 'phone' | 'location' | 'timezone' | 'currentTitle' | 'currentCompany' | 'summary', v: string) => {
         if (v.trim()) x[k] = v.trim()
         else delete x[k]
       }
-      opt('phone', f.phone)
-      opt('location', f.location)
-      opt('timezone', f.timezone)
-      opt('currentTitle', f.currentTitle)
-      opt('currentCompany', f.currentCompany)
-      opt('summary', f.summary)
-      const links: Candidate['links'] = {}
-      if (f.linkedin.trim()) links.linkedin = f.linkedin.trim()
-      if (f.github.trim()) links.github = f.github.trim()
-      if (f.resume.trim()) links.resume = f.resume.trim()
-      if (f.portfolio.trim()) links.portfolio = f.portfolio.trim()
-      x.links = links
-      x.sponsorship = f.sponsorship
-      if (payVisible) {
-        if (f.desiredPay != null) x.desiredPay = f.desiredPay
-        else delete x.desiredPay
+      // Only the fields changed in this sheet: anything else keeps what is stored now.
+      for (const k of changed) {
+        switch (k) {
+          case 'firstName':
+          case 'lastName':
+          case 'email':
+            x[k] = f[k].trim()
+            break
+          case 'phone':
+          case 'location':
+          case 'timezone':
+          case 'currentTitle':
+          case 'currentCompany':
+          case 'summary':
+            opt(k, f[k])
+            break
+          case 'linkedin':
+          case 'github':
+          case 'resume':
+          case 'portfolio': {
+            // One link at a time, so a link added on another computer stays.
+            const next: Candidate['links'] = { ...x.links }
+            if (f[k].trim()) next[k] = f[k].trim()
+            else delete next[k]
+            x.links = next
+            break
+          }
+          case 'sponsorship':
+            x.sponsorship = f.sponsorship
+            break
+          case 'desiredPay':
+            if (f.desiredPay != null) x.desiredPay = f.desiredPay
+            else {
+              delete x.desiredPay
+              delete x.desiredPayUnit
+            }
+            break
+          case 'desiredPayUnit':
+            // A unit means nothing without an amount; a yearly figure stores no unit (the default).
+            if (f.desiredPayUnit === 'hour' && f.desiredPay != null) x.desiredPayUnit = 'hour'
+            else delete x.desiredPayUnit
+            break
+        }
       }
       logActivity(d, { entityType: 'candidate', entityId: c.id, kind: 'field_change', text: `Edited details for ${x.firstName} ${x.lastName}` })
     })
@@ -706,6 +839,12 @@ function EditCandidateSheet({ candidate: c, payVisible, onClose }: { candidate: 
       }
     >
       <div className="flex flex-col gap-4">
+        <EditConflictCallout
+          what="candidate"
+          lines={conflicts.map((k) => (k === 'email' ? `the email is now ${c.email}` : `${DETAIL_WORDS[k]} changed`))}
+          onTheirs={() => edit.takeTheirs(conflicts, setF)}
+          onMine={() => edit.keepMine(conflicts)}
+        />
         <FormGrid>
           {text('firstName', 'First name')}
           {text('lastName', 'Last name')}
@@ -738,12 +877,32 @@ function EditCandidateSheet({ candidate: c, payVisible, onClose }: { candidate: 
           />
         </div>
         {payVisible && (
-          <Field label="Desired pay" hint="Ask about desired pay only. California bans asking about current or past pay (Labor Code 432.3)." id="ec-pay">
-            {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={f.desiredPay} onChange={(v) => set('desiredPay', v)} suffix="/ year" />}
-          </Field>
+          <div className="flex flex-col gap-2">
+            <Field label="Desired pay" hint="Ask about desired pay only. California bans asking about current or past pay (Labor Code 432.3)." id="ec-pay" error={payError}>
+              {(id, hint) =>
+                f.desiredPayUnit === 'hour' ? (
+                  <NumberInput id={id} aria-describedby={hint} prefix="$" suffix="/ hour" step={0.25} min={0} sensitive value={f.desiredPay} onChange={(v) => set('desiredPay', v)} />
+                ) : (
+                  <MoneyInput id={id} aria-describedby={hint} value={f.desiredPay} onChange={(v) => set('desiredPay', v)} suffix="/ year" />
+                )
+              }
+            </Field>
+            {showUnit && (
+              <Segmented
+                size="sm"
+                label="Desired pay per"
+                value={f.desiredPayUnit}
+                onChange={(u) => setF((x) => ({ ...x, desiredPayUnit: u, desiredPay: switchDesiredUnit(x.desiredPay, u) }))}
+                options={[
+                  { value: 'year', label: 'Per year' },
+                  { value: 'hour', label: 'Per hour' },
+                ]}
+              />
+            )}
+          </div>
         )}
         <Field label="Highlights" hint="A few lines from their background. No pay history." error={summaryError} id="ec-summary">
-          {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} value={f.summary} onChange={(e) => set('summary', e.target.value)} />}
+          {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={3} maxLength={NOTE_MAX_CHARS} value={f.summary} onChange={(e) => set('summary', e.target.value)} />}
         </Field>
         <TextIssueNotes issues={summaryIssues} />
       </div>

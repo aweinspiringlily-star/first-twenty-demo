@@ -84,11 +84,18 @@ function useDisplayPrefs() {
   }, [reduced])
 }
 
-/** Ctrl/Cmd+Z undoes the last change when focus is not in a text field (listed in the ? sheet). */
+/**
+ * Ctrl/Cmd+Z undoes the last change when focus is not in a text field (listed in the ? sheet). Not while
+ * a sheet or dialog is open: its form is unsaved work, and the newest saved change is something behind it.
+ */
 function useUndoShortcut() {
   useShortcut(
     'mod+z',
     () => {
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
+        toast({ text: 'Close the open sheet or dialog to undo a saved change.', tone: 'neutral' })
+        return
+      }
       const label = useDB.getState().undo()
       toast(label ? { text: `Undid: ${label}`, tone: 'neutral' } : { text: 'Nothing to undo', tone: 'neutral' })
     },
@@ -212,9 +219,10 @@ export function App() {
         href="#main"
         onClick={(e) => {
           e.preventDefault()
-          document.getElementById('main')?.focus()
+          // The page title, not #main: #main also holds the header toolbar, so the next Tab reaches the page.
+          focusPageStart()
         }}
-        className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[70] focus:rounded-lg focus:bg-surface focus:px-3 focus:py-2"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[70] focus:inline-flex focus:min-h-10 focus:items-center focus:rounded-lg focus:bg-surface focus:px-3 focus:py-2.5"
       >
         Skip to content
       </a>

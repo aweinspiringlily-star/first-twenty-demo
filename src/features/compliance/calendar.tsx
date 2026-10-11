@@ -205,6 +205,11 @@ function CalendarRow({ item, db, overdue }: { item: CalendarItem; db: DB; overdu
         </div>
         <div className="min-w-0 flex-1">
           <p className="text-[15px] font-semibold text-ink">{item.title}</p>
+          {item.fileBy && !item.done && (
+            <p className="mt-0.5 text-[13.5px] font-semibold text-ink-2">
+              File by {fmtDay(item.fileBy)}: the deadline falls on a weekend or company holiday.
+            </p>
+          )}
           {item.detail && <p className="mt-0.5 text-[13.5px] text-ink-3">{item.detail}</p>}
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
             {overdue && (

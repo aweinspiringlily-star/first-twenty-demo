@@ -267,7 +267,7 @@ export function HiringMetricsPanel() {
                     .map((j) => (
                         <tr key={j.jobId} className="border-b border-line last:border-0">
                           <th scope="row" className="py-1 pr-2 text-left font-semibold">
-                            <a href={links.job(j.jobId)} className="text-ink hover:text-accent">
+                            <a href={links.job(j.jobId)} className="-my-2 inline-flex min-h-10 items-center text-ink hover:text-accent">
                               {j.title}
                             </a>{' '}
                             {j.status === 'open' && <Badge tone="accent">Open</Badge>}
@@ -372,7 +372,7 @@ function DrillList({ drill, onClose }: { drill: Drill; onClose: () => void }) {
           return (
             <li key={a.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 py-1.5 text-[13.5px]">
               {canSeeApplication(viewer, db, a) ? (
-                <a href={links.candidate(a.candidateId)} className="font-semibold text-ink hover:text-accent">
+                <a href={links.candidate(a.candidateId)} className="-my-2 inline-flex min-h-10 items-center font-semibold text-ink hover:text-accent">
                   {name}
                 </a>
               ) : (

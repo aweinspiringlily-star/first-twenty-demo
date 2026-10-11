@@ -1,5 +1,5 @@
 // Changes the app makes on its own when a workspace loads (effective-dated job and pay changes, leavers'
-// hand-offs: src/store/db.ts withScheduledChanges) have to reach the server like any edit, or a comp row
+// hand-offs, offer expiry: src/store/db.ts applyLoadChanges) have to reach the server like any edit, or a comp row
 // syncs as "applied" while the person row never gets the new title. Every device that opens the workspace
 // on or after the effective date makes the same change, so the activity rows it logs must get the same id
 // on every device; otherwise each device (and each reload) would add its own copy. Pure.

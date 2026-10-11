@@ -81,7 +81,22 @@ export function payRangeLine(job: Pick<Job, 'payMin' | 'payMax' | 'flsa' | 'empl
   return `Pay range: ${fmt(job.payMin)} to ${fmt(job.payMax)} ${basis}. This is a good-faith estimate of what we expect to pay.`
 }
 
-function benefitsLine(db: DB, year: number): string {
+/**
+ * True when the company has a group health plan in place on the date (Settings > Company). The runway
+ * cost assumption (costModel.benefitsPerHeadMonthly) says nothing about what the company offers, so a
+ * posting promises health coverage only from the recorded plan start.
+ */
+export function offersHealthPlanOn(db: Pick<DB, 'company'>, date: ISODate): boolean {
+  const on = db.company.groupHealthPlanStartedOn
+  return typeof on === 'string' && on !== '' && on <= date
+}
+
+/** Not recorded yet (undefined), as opposed to recorded as no plan (null): the posting asks for it. */
+export function healthPlanUnrecorded(db: Pick<DB, 'company'>): boolean {
+  return db.company.groupHealthPlanStartedOn === undefined
+}
+
+function benefitsLine(db: DB, year: number, asOf: ISODate): string {
   const vacation = db.timeOffPolicies.find((p) => p.kind === 'vacation' || p.kind === 'flexible_vacation')
   const vac =
     vacation?.kind === 'flexible_vacation' || vacation?.method === 'flexible'
@@ -91,7 +106,7 @@ function benefitsLine(db: DB, year: number): string {
         : 'paid vacation'
   const holidays = db.holidays.filter((h) => h.date.startsWith(String(year))).length
   const parts = [vac, 'California paid sick leave']
-  if (db.company.costModel?.benefitsPerHeadMonthly > 0) parts.unshift('medical, dental and vision coverage')
+  if (offersHealthPlanOn(db, asOf)) parts.unshift('medical, dental and vision coverage')
   if (holidays > 0) parts.push(`${holidays} paid company holidays`)
   return `Benefits: ${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}.`
 }
@@ -124,7 +139,8 @@ export function postingText(db: DB, jobId: ID, date?: ISODate): string {
   const job = db.jobs.find((j) => j.id === jobId)
   if (!job) return ''
   const name = db.company.name
-  const year = Number((date ?? job.openedOn ?? job.postedOn ?? db.meta.createdOn).slice(0, 4))
+  const asOf = (date ?? job.openedOn ?? job.postedOn ?? db.meta.createdOn).slice(0, 10)
+  const year = Number(asOf.slice(0, 4))
   const band = db.bands.find((b) => b.familyId === job.familyId && b.levelId === job.levelId)
   const lines: string[] = []
   lines.push(job.title)
@@ -155,7 +171,7 @@ export function postingText(db: DB, jobId: ID, date?: ISODate): string {
       `Equity: stock options of ${pct(eqMin)} to ${pct(eqMax)} of fully diluted shares, ${vestingText(db.settings.defaultVestingMonths, db.settings.defaultCliffMonths)}.`,
     )
   }
-  lines.push(benefitsLine(db, year))
+  lines.push(benefitsLine(db, year, asOf))
   lines.push('We never ask about salary history.')
   lines.push('')
   lines.push(sponsorshipLine(job))

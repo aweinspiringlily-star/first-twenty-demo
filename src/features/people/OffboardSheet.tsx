@@ -1,17 +1,16 @@
 // Offboarding wizard: separation type, last day (and notice date for a resignation), the live final
 // pay deadline under Labor Code 201-203 with the waiting time penalty warning and payout rules,
 // vested options and the exercise deadline, rehire eligibility and reports to reassign. Confirm runs
-// startOffboarding (Undo available), then offers 'Backfill?': a draft job on a backfill plan line (helpers.backfillPlanFor).
+// offboardPerson (Undo available), says what the exit cancelled or closed (a promotion scheduled after the
+// last day, time off after it), then offers 'Backfill?': a draft job on a backfill plan line (helpers.backfillPlanFor).
 import { useEffect, useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
-import { setTaskStatus } from '@/domain/checklists/actions'
 import { finalPayDeadline, payoutRules, waitingTimePenaltyNote } from '@/domain/checklists/finalPay'
 import { generateChecklist } from '@/domain/checklists/generate'
-import { TASK_IDS } from '@/domain/checklists/templates'
 import { HANDOFF_KIND_ORDER, type HandoffKind, leaverRoles, recordHandoffs } from '@/domain/handoff'
-import { changeJobOrPay, openJobFromPlan, startOffboarding } from '@/domain/lifecycle'
-import { directReports, employedOn, founder, fullName, getPerson, incomingOn } from '@/domain/people'
+import { exitCleanupLines, offboardPerson, openJobFromPlan, reassignReportsAtExit, reportsAsOf } from '@/domain/lifecycle'
+import { employedOn, founder, fullName, getPerson, incomingOn } from '@/domain/people'
 import { vacationPayout } from '@/domain/timeoff'
 import type { DB, Handoff, ID, SeparationType } from '@/domain/types'
 import { LAW_SOURCES } from '@/data/law'
@@ -37,7 +36,7 @@ import {
   TextInput,
   toast,
 } from '@/ui'
-import { backfillJobSummary, backfillPlanFor, dayLabel, equityAtExit, nextFriday, prepareBackfillSlot } from './helpers'
+import { backfillJobSummary, backfillPlanFor, dayLabel, equityAtExit, LINE_MAX_CHARS, nextFriday, prepareBackfillSlot } from './helpers'
 import { NotLegalAdvice, undoToast } from './parts'
 import { SeveranceRelease } from './SeveranceRelease'
 
@@ -82,6 +81,8 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
   const [handoffNow, setHandoffNow] = useState(false)
   const [step, setStep] = useState<'form' | 'done'>('form')
   const [checklistId, setChecklistId] = useState<ID | null>(null)
+  // What starting offboarding cancelled or closed, in plain sentences for the summary.
+  const [cleanupLines, setCleanupLines] = useState<string[]>([])
   const [backfillJobId, setBackfillJobId] = useState<ID | null>(null)
   const [tried, setTried] = useState(false)
   // The page stays mounted across sheet routes, so start each open from a clean form.
@@ -98,12 +99,15 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
     setHandoffNow(false)
     setStep('form')
     setChecklistId(null)
+    setCleanupLines([])
     setBackfillJobId(null)
     setTried(false)
   }, [open, personId])
 
   const resigned = type === 'resigned_notice' || type === 'resigned_no_notice'
-  const reports = useMemo(() => (person ? directReports(db, person.id).filter((r) => r.id !== person.id) : []), [db, person])
+  // Who reports to them the day after the last day, by the job history (a move scheduled away from them
+  // before then is left out; one scheduled to them is in).
+  const reports = useMemo(() => (person ? reportsAsOf(db, person.id, addDays(lastDay, 1)) : []), [db, person, lastDay])
   const managers = useMemo(
     () =>
       [...employedOn(db, t), ...incomingOn(db, t)]
@@ -134,12 +138,12 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
         anchorDate: lastDay,
         createdOn: t,
         separationType: type,
-        extra: { hasEquity: hadEquity },
+        extra: { hasEquity: hadEquity, supervisor: reports.length > 0 },
       }).tasks
     } catch {
       return []
     }
-  }, [db, person, lastDay, type, t, hadEquity])
+  }, [db, person, lastDay, type, t, hadEquity, reports.length])
 
   if (!person) return null
   const name = fullName(person)
@@ -167,28 +171,22 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
     }
     const label = `Started offboarding for ${name}`
     let id: ID = ''
+    let lines: string[] = []
     useDB.getState().mutate(label, (d) => {
-      id = startOffboarding(
+      const result = offboardPerson(
         d,
         personId,
         { type, reason: finalReason, lastDay, ...(resigned ? { noticeGivenOn: notice } : {}), rehireEligible: rehire === 'yes' },
         { date: today(), actorId: viewer.personId },
       )
-      const effectiveOn = addDays(lastDay, 1)
-      let moved = 0
-      for (const r of reports) {
-        const to = reassign[r.id] ?? defaultManager
-        if (!to || to === personId) continue
-        changeJobOrPay(d, r.id, { effectiveOn, reason: 'manager_change', managerId: to, ...(viewer.personId ? { approvedById: viewer.personId } : {}) }, { date: today(), actorId: viewer.personId })
-        moved += 1
-      }
-      if (reports.length && moved === reports.length) {
-        const cl = d.checklists.find((c) => c.id === id)
-        const task = cl?.tasks.find((x) => x.templateTaskId === TASK_IDS.reassignReports)
-        if (cl && task && task.status === 'open') {
-          setTaskStatus(d, cl.id, task.id, 'done', { date: today(), byId: viewer.personId, note: `New manager from ${fmtDate(effectiveOn)}, recorded in the offboarding wizard.` })
-        }
-      }
+      id = result.checklistId
+      lines = exitCleanupLines(result.cleanup)
+      reassignReportsAtExit(d, personId, lastDay, (reportId) => reassign[reportId] ?? defaultManager, {
+        date: today(),
+        actorId: viewer.personId,
+        approvedById: viewer.personId,
+        checklistId: id,
+      })
       const handoffs: Handoff[] = roles
         .map((r) => ({ kind: r.kind, id: r.id, toId: handTo[r.kind] ?? defaultManager }))
         .filter((h) => !!h.toId && h.toId !== personId)
@@ -196,6 +194,7 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
     })
     undoToast(label)
     setChecklistId(id)
+    setCleanupLines(lines)
     setStep('done')
   }
 
@@ -226,7 +225,7 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
       {backfillJobId && backfillSummary ? (
         <Callout tone="accent" title={backfillSummary.title}>
           {backfillSummary.carried}{' '}
-          <a href={links.job(backfillJobId)} className="font-semibold text-accent underline">
+          <a href={links.job(backfillJobId)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline">
             Open the job
           </a>{' '}
           to {backfillSummary.next}
@@ -234,7 +233,7 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
       ) : backfillPlan.kind === 'live' ? (
         <p className="text-[14px] text-ink-2">
           The {backfillPlan.slot.title} backfill line already has a live job.{' '}
-          <a href={links.job(backfillPlan.jobId)} className="font-semibold text-accent underline">
+          <a href={links.job(backfillPlan.jobId)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline">
             Open the job
           </a>
         </p>
@@ -272,6 +271,19 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
           </p>
         )}
       </Callout>
+      {cleanupLines.length > 0 && (
+        <section aria-label="What the exit cancelled">
+          <SectionLabel>Cancelled and closed</SectionLabel>
+          <ul className="mt-2 flex flex-col gap-1.5 text-[14px] text-ink-2">
+            {cleanupLines.map((line) => (
+              <li key={line} className="flex items-start gap-2">
+                <Icon name="check" size={16} className="mt-0.5 shrink-0 text-ink-3" />
+                <span>{line}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       {(checklistId || offboardChecklist) && (
         <a href={links.checklist(checklistId ?? offboardChecklist?.id ?? '')} className="inline-flex min-h-11 items-center gap-2 font-semibold text-accent hover:underline">
           <Icon name="clipboard-check" size={18} />
@@ -347,6 +359,7 @@ export function OffboardSheet({ personId, open, onClose }: { personId: ID; open:
                     aria-required
                     aria-invalid={tried && otherMissing ? true : undefined}
                     aria-describedby={tried && otherMissing ? 'off-other-reason-error' : undefined}
+                    maxLength={LINE_MAX_CHARS}
                     value={otherReason}
                     onChange={(e) => setOtherReason(e.target.value)}
                     placeholder="One line"

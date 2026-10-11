@@ -24,7 +24,11 @@ one prints before moving on.
 - **One admin login** that protects the data (see [One admin login](#one-admin-login-and-the-path-to-team-logins)).
 - **Nightly backups** of the database, kept for 14 days, optionally copied to S3.
 - **Offline keeps working.** The browser keeps its own copy, queues changes while offline, and catches up
-  when the connection returns.
+  when the connection returns. Once a browser has opened the app from your server's address, it opens it
+  again even while the server cannot be reached (a new tab, a laptop restart): a small offline worker
+  keeps the app page, never your data, and the app starts from the browser's own copy and says Offline.
+  The worker always asks your server first: a browser whose offline storage is broken or full still
+  opens the app normally, it just has no offline copy.
 
 The kit lives in `server/deploy/`, plus `.env.example` in the project root:
 
@@ -777,6 +781,8 @@ Caddy is up but the server is not answering on `127.0.0.1:8787`.
 - `curl -s http://127.0.0.1:8787/api/health` on the instance. If this works, compare `PORT` in
   `/etc/first-twenty/env` with the `reverse_proxy` line in `/etc/caddy/Caddyfile`.
 - A 502 for a few seconds during `deploy.sh` is normal while the service restarts.
+- Meanwhile a browser that opened the app from this address before still opens it (the offline worker's
+  copy of the page, `/sw.js`) and shows Offline; its changes wait there and sync once the server answers.
 
 ### The site does not load over HTTPS
 
@@ -857,6 +863,15 @@ or `http://`. The cookie is also limited to its own site: a copy of the app open
 `localhost` cannot sign in to the server. Open the app from the server's address. (Through an SSH tunnel
 to `http://localhost:8787`, Chrome and Firefox accept the Secure cookie too; other browsers may not.)
 
+To see whether the server counts a browser as signed in, open `https://hr.example.com/api/auth/session`
+in it: `{"user":{...}}` when it is, `{"user":null}` when it is not. The app asks the same on every page
+load; the answer is never a 401, so a browser that is not signed in shows no errors in its console.
+(`/api/auth/me` answers 401 instead and stays for older copies of the app.) Signed in, open
+`https://hr.example.com/api/workspace/status` to see whether the server holds a workspace yet:
+`{"empty":true}` before the first upload, else its history id and change count. The app asks that,
+not `/api/workspace` (which answers 404 while the server is empty), so an empty server logs no errors
+either.
+
 On an sslip.io name, if every page of the site fails with an error after you opened another
 `*.sslip.io` site, clear the site data for `sslip.io` (see
 [A free sslip.io name instead](#a-free-sslipio-name-instead)).
@@ -929,6 +944,8 @@ passwords.
 **Stays in each browser:** display preferences (look, text size, theme, shortcuts) and the sync queue.
 Each signed-in browser also keeps a full copy of the workspace so it works offline, so treat a laptop
 that has signed in like any device holding HR data: disk encryption on, sign out on shared computers.
+A browser that opened the app from your server's address also keeps a copy of the app page itself (the
+offline worker's cache), which holds no workspace data.
 
 **Other copies:** nightly dumps in `/var/backups/first-twenty` (and S3 if you set it up), and Caddy's
 access log in `/var/log/caddy` (addresses, paths and browser names; no bodies, and Caddy hides cookies).

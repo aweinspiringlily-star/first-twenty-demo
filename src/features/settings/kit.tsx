@@ -1,15 +1,128 @@
 // Small building blocks shared by the Settings tabs: the commit helper (mutate + activity + Undo
 // toast), a panel that shows a summary and switches to an edit form, an edit sheet for list items,
 // list rows, a date picker with field-specific chips and a wrapper that blurs amounts while editing.
+// The edit forms keep the value they opened with, take in what another computer saves meanwhile
+// (mergeIncoming in ./logic), and hand onSave the fields the user changed, so a save writes only those.
 import type { Draft } from 'immer'
-import type { ReactNode } from 'react'
-import { useEffect, useId, useRef, useState } from 'react'
+import type { ReactNode, RefObject } from 'react'
+import { Fragment, useEffect, useId, useRef, useState } from 'react'
 import type { DB, EntityType } from '@/domain/types'
 import { addDays, type ISODate, today } from '@/lib/dates'
+import { listJoin } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
-import { Button, cx, DateChips, Icon, type IconName, Panel, Sheet, toast } from '@/ui'
+import { Button, Callout, cx, DateChips, Icon, type IconName, Panel, Private, Sheet, toast } from '@/ui'
 import { produce } from 'immer'
+import { changedKeys, conflictValueText, mergeIncoming, resolveConflicts } from './logic'
+
+/** What an edit form's Save passes along: the fields the user changed since it opened. */
+export type SaveInfo<T> = { changed: Array<keyof T> }
+
+/** Field names for the conflict notice ("Cash on hand and Cash as of"). */
+export type FieldLabels<T> = Partial<Record<keyof T, string>>
+
+/**
+ * How the conflict notice says a field's stored value, when conflictValueText's plain words do not fit: a
+ * function for a value that needs words ('Every two weeks' for 'biweekly', '$1,200,000'), 'private' for
+ * text the privacy blur hides (a policy number), or false to name the field only (a number kept masked).
+ * Numbers are always under the blur.
+ */
+export type FieldValues<T> = { [K in keyof T]?: 'private' | false | ((value: T[K]) => string) }
+
+/**
+ * The opened and draft copies of an edit form, kept current with the stored value. `set` applies a patch on
+ * top of the merged draft; `resolve` settles conflicts; `changed` is what Save should write.
+ */
+function useEditCopy<T extends object>(current: T, openWith?: T) {
+  const [edit, setEdit] = useState<{ opened: T; draft: T } | null>(() =>
+    openWith ? { opened: structuredClone(openWith), draft: structuredClone(openWith) } : null,
+  )
+  const merged = edit ? mergeIncoming(edit.opened, edit.draft, current) : null
+  return {
+    merged,
+    open: (from: T) => setEdit({ opened: structuredClone(from), draft: structuredClone(from) }),
+    close: () => setEdit(null),
+    set: (patch: Partial<T>) =>
+      setEdit((e) => {
+        if (!e) return e
+        const m = mergeIncoming(e.opened, e.draft, current)
+        return { opened: m.opened, draft: { ...m.draft, ...patch } }
+      }),
+    resolve: (choice: 'theirs' | 'mine') =>
+      setEdit((e) => {
+        if (!e) return e
+        const m = mergeIncoming(e.opened, e.draft, current)
+        return resolveConflicts(m, current, m.conflicts, choice)
+      }),
+    changed: merged ? changedKeys(merged.opened, merged.draft) : [],
+  }
+}
+
+/**
+ * Shown in an edit form when a field the user changed was also saved from another computer. It says what
+ * was saved there ('One-line description is now "Close in a day"'), so Use theirs is not a blind choice;
+ * a field without a label or a short value is only named.
+ */
+function ConflictNotice<T>({
+  keys,
+  labels,
+  values,
+  current,
+  onResolve,
+  keepRef,
+}: {
+  keys: Array<keyof T>
+  labels?: FieldLabels<T>
+  values?: FieldValues<T>
+  /** The stored value, with what the other computer saved. */
+  current: T
+  onResolve: (choice: 'theirs' | 'mine') => void
+  keepRef: RefObject<HTMLButtonElement | null>
+}) {
+  const said: Array<{ key: keyof T; label: string; text: string; blurred: boolean }> = []
+  const named: Array<keyof T> = []
+  for (const key of keys) {
+    const label = labels?.[key]
+    const how = values?.[key]
+    const raw = current[key]
+    const text =
+      !label || how === false ? null : typeof how === 'function' ? (how as (v: unknown) => string)(raw) : conflictValueText(raw)
+    if (label && text !== null) said.push({ key, label, text, blurred: how === 'private' || typeof raw === 'number' })
+    else named.push(key)
+  }
+  const names = named.map((k) => labels?.[k]).filter((n): n is string => !!n)
+  const others = said.length > 0
+  const lead =
+    names.length === named.length
+      ? listJoin(names)
+      : named.length === 1
+        ? others
+          ? 'Another field you changed'
+          : 'A field you changed'
+        : `${named.length} ${others ? 'other ' : ''}fields you changed`
+  const one = keys.length === 1
+  return (
+    <Callout tone="warn" title="This changed on another computer while you were editing">
+      <p>
+        {said.map((s) => (
+          <Fragment key={String(s.key)}>
+            {s.label} is now {s.blurred ? <Private>{s.text}</Private> : s.text}.{' '}
+          </Fragment>
+        ))}
+        {named.length > 0 && `${lead} ${named.length === 1 ? 'was' : 'were'} also saved there. `}
+        Use theirs to take the saved {one ? 'value' : 'values'}, or keep mine to save yours over {one ? 'it' : 'them'}.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <Button size="sm" onClick={() => onResolve('theirs')}>
+          Use theirs
+        </Button>
+        <Button size="sm" ref={keepRef} onClick={() => onResolve('mine')}>
+          Keep mine
+        </Button>
+      </div>
+    </Callout>
+  )
+}
 
 /**
  * Applies a settings change through the store with an activity row and an Undo toast.
@@ -49,11 +162,15 @@ function useFocusFirst(ref: React.RefObject<HTMLElement | null>, active: boolean
   }, [active, ref])
 }
 
+const CONFLICT_FIRST = 'Choose Use theirs or Keep mine first.'
+
 /**
- * A panel that shows a summary and switches to an edit form in place. The draft is a copy of `value`;
- * Save hands it to `onSave` (which commits it), Cancel throws it away.
+ * A panel that shows a summary and switches to an edit form in place. The draft is a copy of `value` taken
+ * when Edit opens; fields another computer saves meanwhile come in unless the user changed them too (then a
+ * notice asks: Use theirs or Keep mine). Save hands the draft and the changed fields to `onSave`, which
+ * should write only those; Cancel throws the draft away.
  */
-export function EditablePanel<T>({
+export function EditablePanel<T extends object>({
   title,
   subtitle,
   icon,
@@ -66,6 +183,8 @@ export function EditablePanel<T>({
   validate,
   id,
   extraActions,
+  fieldLabels,
+  fieldValues,
 }: {
   title: ReactNode
   subtitle?: ReactNode
@@ -73,23 +192,28 @@ export function EditablePanel<T>({
   value: T
   view: ReactNode
   form: (draft: T, set: (patch: Partial<T>) => void) => ReactNode
-  onSave: (draft: T) => boolean | void
+  onSave: (draft: T, info: SaveInfo<T>) => boolean | void
   editLabel: string
   saveLabel: string
   validate?: (draft: T) => string | null
   id?: string
   extraActions?: ReactNode
+  fieldLabels?: FieldLabels<T>
+  fieldValues?: FieldValues<T>
 }) {
-  const [draft, setDraft] = useState<T | null>(null)
+  const copy = useEditCopy(value)
+  const draft = copy.merged?.draft ?? null
+  const conflicts = copy.merged?.conflicts ?? []
   // Problems show once Save is tried, so a fresh form never opens in red.
   const [tried, setTried] = useState(false)
   const formRef = useRef<HTMLFormElement>(null)
   const editBtn = useRef<HTMLButtonElement>(null)
+  const keepRef = useRef<HTMLButtonElement>(null)
   const editing = draft !== null
   useFocusFirst(formRef, editing)
   const error = draft !== null && validate ? validate(draft) : null
   const close = () => {
-    setDraft(null)
+    copy.close()
     setTried(false)
     setTimeout(() => editBtn.current?.focus(), 0)
   }
@@ -103,7 +227,7 @@ export function EditablePanel<T>({
         editing ? undefined : (
           <>
             {extraActions}
-            <Button ref={editBtn} icon="edit" onClick={() => setDraft(structuredClone(value))}>
+            <Button ref={editBtn} icon="edit" onClick={() => copy.open(value)}>
               {editLabel}
             </Button>
           </>
@@ -117,20 +241,24 @@ export function EditablePanel<T>({
           ref={formRef}
           onSubmit={(e) => {
             e.preventDefault()
-            if (error) {
+            if (error || conflicts.length) {
               setTried(true)
+              if (!error) keepRef.current?.focus()
               return
             }
             // A save that changes nothing still closes the form (commit says "Nothing changed").
-            onSave(draft)
+            onSave(draft, { changed: copy.changed })
             close()
           }}
           className="flex flex-col gap-4"
         >
-          {form(draft, (patch) => setDraft((d) => (d === null ? d : { ...d, ...patch })))}
-          {tried && error && (
+          {conflicts.length > 0 && (
+            <ConflictNotice keys={conflicts} labels={fieldLabels} values={fieldValues} current={value} onResolve={copy.resolve} keepRef={keepRef} />
+          )}
+          {form(draft, copy.set)}
+          {tried && (error || conflicts.length > 0) && (
             <p role="alert" className="text-[13.5px] font-semibold text-bad">
-              {error}
+              {error ?? CONFLICT_FIRST}
             </p>
           )}
           <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-3">
@@ -149,13 +277,15 @@ export function EditablePanel<T>({
 
 /**
  * Side sheet with a form for one list item. Render it with a `key` per item so the draft resets.
- * Enter in a text field saves; Escape or Cancel closes without saving.
+ * Enter in a text field saves; Escape or Cancel closes without saving. Pass `current` (the stored item,
+ * kept up to date) so changes saved on another computer while the sheet is open come in, as in EditablePanel.
  */
-export function EditSheet<T>({
+export function EditSheet<T extends object>({
   open,
   title,
   subtitle,
   initial,
+  current,
   onClose,
   onSave,
   saveLabel,
@@ -163,22 +293,32 @@ export function EditSheet<T>({
   children,
   width,
   footerExtra,
+  fieldLabels,
+  fieldValues,
 }: {
   open: boolean
   title: ReactNode
   subtitle?: ReactNode
   initial: T
+  current?: T
   onClose: () => void
-  onSave: (draft: T) => boolean | void
+  onSave: (draft: T, info: SaveInfo<T>) => boolean | void
   saveLabel: string
   validate?: (draft: T) => string | null
   children: (draft: T, set: (patch: Partial<T>) => void) => ReactNode
   width?: number
   footerExtra?: ReactNode
+  fieldLabels?: FieldLabels<T>
+  fieldValues?: FieldValues<T>
 }) {
-  const [draft, setDraft] = useState<T>(() => structuredClone(initial))
+  // The copy opens with the sheet (a sheet is rendered with a key per item, so each item starts fresh).
+  const [opened] = useState<T>(() => structuredClone(initial))
+  const copy = useEditCopy(current ?? opened, opened)
+  const draft = copy.merged?.draft ?? opened
+  const conflicts = copy.merged?.conflicts ?? []
   const formId = `es${useId().replace(/:/g, '')}`
   const formRef = useRef<HTMLFormElement>(null)
+  const keepRef = useRef<HTMLButtonElement>(null)
   // Runs after the Sheet's own focus trap (child effects first), so the first field gets focus, not Close.
   useFocusFirst(formRef, open)
   const [tried, setTried] = useState(false)
@@ -192,9 +332,9 @@ export function EditSheet<T>({
       width={width}
       footer={
         <>
-          {tried && error && (
+          {tried && (error || conflicts.length > 0) && (
             <p role="alert" className="mr-auto basis-full text-[13.5px] font-semibold text-bad sm:basis-auto">
-              {error}
+              {error ?? CONFLICT_FIRST}
             </p>
           )}
           {footerExtra}
@@ -212,16 +352,27 @@ export function EditSheet<T>({
         ref={formRef}
         onSubmit={(e) => {
           e.preventDefault()
-          if (error) {
+          if (error || conflicts.length) {
             setTried(true)
+            if (!error) keepRef.current?.focus()
             return
           }
-          onSave(draft)
+          onSave(draft, { changed: copy.changed })
           onClose()
         }}
         className="flex flex-col gap-4"
       >
-        {children(draft, (patch) => setDraft((d) => ({ ...d, ...patch })))}
+        {conflicts.length > 0 && (
+          <ConflictNotice
+            keys={conflicts}
+            labels={fieldLabels}
+            values={fieldValues}
+            current={current ?? opened}
+            onResolve={copy.resolve}
+            keepRef={keepRef}
+          />
+        )}
+        {children(draft, copy.set)}
       </form>
     </Sheet>
   )

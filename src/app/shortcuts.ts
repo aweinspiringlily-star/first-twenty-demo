@@ -48,6 +48,9 @@ function matches(e: KeyboardEvent, keys: string): boolean {
 /**
  * Registers a shortcut while the component is mounted.
  * keys: 'a', 'shift+n', 'mod+k', '?', '/'. Single keys respect the user's shortcuts setting.
+ * `enabled: false` turns the key off and takes it off the ? sheet. With `listed: true` it stays on the
+ * sheet while the component is mounted, even when off: a key that works only while focus is in one place
+ * (the pipeline board) is still listed after the ? sheet takes focus.
  */
 export function useShortcut(
   keys: string,
@@ -59,15 +62,18 @@ export function useShortcut(
     allowInInputs?: boolean
     /** For chords: leave the key to the text field while typing (Ctrl+Z undoes typing there). */
     ignoreInInputs?: boolean
+    /** Keep it on the ? sheet while mounted, even while `enabled` is false. */
+    listed?: boolean
   },
 ): void {
   const id = useId()
   const ref = useRef(handler)
   ref.current = handler
   const enabled = opts.enabled ?? true
+  const onSheet = enabled || !!opts.listed
 
   useEffect(() => {
-    if (!enabled) return
+    if (!onSheet) return
     useRegistry.setState((s) => ({ items: { ...s.items, [id]: { id, keys, description: opts.description, group: opts.group } } }))
     return () =>
       useRegistry.setState((s) => {
@@ -75,7 +81,7 @@ export function useShortcut(
         delete next[id]
         return { items: next }
       })
-  }, [id, keys, opts.description, opts.group, enabled])
+  }, [id, keys, opts.description, opts.group, onSheet])
 
   useEffect(() => {
     if (!enabled) return
@@ -97,13 +103,14 @@ export function useShortcut(
   }, [keys, enabled, opts.allowInInputs, opts.ignoreInInputs])
 }
 
-/** Human label for a key combo: 'mod+k' -> 'Ctrl K' (or Cmd on Mac). */
+/** Human label for a key combo: 'mod+k' -> 'Ctrl K' (or Cmd on Mac), 'arrowleft' -> '←', 'enter' -> 'Enter'. */
 export function keyLabel(keys: string): string[] {
   const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+  const named: Record<string, string> = { shift: 'Shift', esc: 'Esc', enter: 'Enter', arrowleft: '←', arrowright: '→', arrowup: '↑', arrowdown: '↓' }
   return keys.split('+').map((k) => {
     if (k === 'mod') return mac ? 'Cmd' : 'Ctrl'
-    if (k === 'shift') return 'Shift'
-    if (k === 'esc') return 'Esc'
+    const name = named[k]
+    if (name) return name
     return k.length === 1 ? k.toUpperCase() : k
   })
 }

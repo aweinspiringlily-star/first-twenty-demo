@@ -15,6 +15,7 @@ import { compOrFirst, hourlyRateOf } from '@/domain/pay'
 import { fullName, headcountOn, priorStint } from '@/domain/people'
 import type { DB, ID, Person, TimeOffKind, TimeOffPolicy, TimeOffRequest } from '@/domain/types'
 import { addDays, addMonths, daysBetween, fmtDate, fmtDay, type ISODate, isWeekday, nowISO } from '@/lib/dates'
+import { hoursText, hoursWithDays } from '@/lib/format'
 import { buildICS } from '@/lib/ics'
 import { newId } from '@/lib/id'
 import { logActivity } from '@/store/draft'
@@ -256,6 +257,27 @@ function usableFromDate(policy: TimeOffPolicy, person: Person, db?: Pick<DB, 'pe
   return addDays(person.startDate, days)
 }
 
+export type ServiceWait = { usableFrom: ISODate; days: number }
+
+/**
+ * When a request would start before the policy's service wait ends (sick leave's 90 days, 30 days for
+ * bereavement): the first usable day and the wait in days. Null when the policy has no wait, the wait is
+ * over by the start date, or a rehire within 12 months has none (Labor Code 246(g)(2)).
+ */
+export function serviceWait(db: DB, input: Pick<NewRequest, 'personId' | 'policyId' | 'startDate'>): ServiceWait | null {
+  const person = db.people.find((p) => p.id === input.personId)
+  const policy = db.timeOffPolicies.find((p) => p.id === input.policyId)
+  if (!person || !policy) return null
+  const usableFrom = usableFromDate(policy, person, db)
+  if (!usableFrom || input.startDate >= usableFrom) return null
+  return { usableFrom, days: serviceDaysRequired(policy) ?? 0 }
+}
+
+/** The unpaid leave policy that covers the person on the date, if the company has one. */
+export function unpaidPolicyFor(db: DB, person: Person, date: ISODate): TimeOffPolicy | undefined {
+  return policiesFor(db, person, date).find((p) => p.kind === 'unpaid')
+}
+
 /** "the 90th day of employment" for sick leave, "30 days after the start date" otherwise. */
 function waitText(policy: TimeOffPolicy): string {
   const days = serviceDaysRequired(policy) ?? 0
@@ -423,8 +445,16 @@ export type BalanceRow = {
   /** Hours still free to request (balance - scheduled, within any yearly use cap); null when not tracked. */
   available: number | null
   capReached: boolean
-  /** Policies with a service wait (sick leave's 90 days, 30 days for bereavement): the first usable day, while it is ahead. */
+  /**
+   * Policies with a service wait (sick leave's 90 days, 30 days for bereavement): the first usable day, while it
+   * is ahead. Before the start date a front-loaded policy with no wait (a rehire's sick leave) is usable from the start.
+   */
   usableFrom?: ISODate
+  /**
+   * Before the start date, for a front-loaded policy: what arrives on day 1 (the grant plus sick hours restored for a
+   * rehire within 12 months), with `hours` within any yearly use cap. The row's other numbers stay at 0 until then.
+   */
+  startsOn?: { date: ISODate; granted: number; restored: number; hours: number }
   perEventHours?: number
   note: string
 }
@@ -435,7 +465,10 @@ function yearBounds(date: ISODate): { start: ISODate; end: ISODate } {
 }
 
 function accrualRow(db: DB, policy: TimeOffPolicy, person: Person, date: ISODate): BalanceRow {
-  const sim = simulateAccrual(db, policy, person, date, false)
+  // From the last day on, the final pay period counts up to that day (vacation vests as it is earned), so an
+  // alumnus's balance is what was paid out at exit.
+  const ended = !!person.endDate && person.endDate <= date
+  const sim = simulateAccrual(db, policy, person, date, ended)
   const restored = person.startDate <= date ? restoredSickHours(db, person, policy) : 0
   if (restored > 0) {
     sim.balance = r2(sim.balance + restored)
@@ -484,12 +517,31 @@ function frontloadRow(db: DB, policy: TimeOffPolicy, person: Person, date: ISODa
   const balance = r2(Math.max(0, cap != null ? Math.min(pool - used, cap - used) : pool - used))
   const available = r2(Math.max(0, balance - scheduled))
   const capReached = cap != null && used >= cap - 0.005
-  const usable = usableFromDate(policy, person, db)
+  const hpd = hoursPerDayFor(person)
+  const notStarted = person.startDate > date
+  // Nothing is usable before the start date; a rehire within 12 months has no wait, so day 1 is the first usable day.
+  const usable = usableFromDate(policy, person, db) ?? (notStarted ? person.startDate : undefined)
   const waiting = usable && date < usable ? usable : undefined
-  let note = `${hoursLabel(policy.annualHours ?? 0, hoursPerDayFor(person))} each January 1 and at hire`
+  let note = `${hoursLabel(policy.annualHours ?? 0, hpd)} each January 1 and at hire`
   note += cap != null ? `, up to ${cap} hours used a year.` : '.'
-  if (waiting) note = `Usable from ${fmtDate(waiting)} (${waitText(policy)}). ${note}`
-  if (restored > 0) note = `${note} Includes ${hoursLabel(restored, hoursPerDayFor(person))} restored from before (rehired within 12 months, Labor Code 246), usable now.`
+  let startsOn: BalanceRow['startsOn']
+  if (notStarted) {
+    // What day 1 brings, so the 0 hours before the start never reads as a lost balance or a failed restore.
+    const grant = policy.annualHours ?? 0
+    const back = restoredSickHours(db, person, policy)
+    const pool = grant + back
+    startsOn = { date: person.startDate, granted: grant, restored: back, hours: r2(cap != null ? Math.min(pool, cap) : pool) }
+    const plus = back > 0 ? ` plus ${hoursLabel(back, hpd)} restored from before (rehired within 12 months, Labor Code 246)` : ''
+    const from = waiting && waiting > person.startDate ? `usable from ${fmtDate(waiting)} (${waitText(policy)})` : 'usable from day 1'
+    if (cap != null && pool > cap) {
+      // The number shown is what can be used, so say why it is less than the hours on the books.
+      note = `On ${fmtDate(person.startDate)}, the start date: ${hoursLabel(grant, hpd)}${plus}, ${hoursText(pool)} on the books; up to ${hoursWithDays(cap, hpd)} can be used a year under your policy, ${from}. ${hoursLabel(grant, hpd)} each January 1 and at hire.`
+    } else note = `On ${fmtDate(person.startDate)}, the start date: ${hoursLabel(grant, hpd)}${plus}, ${from}. ${note}`
+  } else if (waiting) note = `Usable from ${fmtDate(waiting)} (${waitText(policy)}). ${note}`
+  if (restored > 0) {
+    const trimmed = cap != null && pool > cap ? ` ${hoursText(pool)} on the books in all, of which up to ${hoursWithDays(cap, hpd)} can be used a year under your policy.` : ''
+    note = `${note} Includes ${hoursLabel(restored, hpd)} restored from before (rehired within 12 months, Labor Code 246), usable now.${trimmed}`
+  }
   if (capReached) note = `Used the ${cap}-hour yearly limit. Resets January 1.`
   return {
     policy,
@@ -503,6 +555,7 @@ function frontloadRow(db: DB, policy: TimeOffPolicy, person: Person, date: ISODa
     available,
     capReached,
     ...(waiting ? { usableFrom: waiting } : {}),
+    ...(startsOn ? { startsOn } : {}),
     note,
   }
 }
@@ -596,11 +649,13 @@ export function whoIsOut(db: DB, from: ISODate, to: ISODate): OutEntry[] {
   return out.sort((a, b) => a.from.localeCompare(b.from) || a.personId.localeCompare(b.personId))
 }
 
-/** Requests waiting for a decision, oldest first. Auto-approve policies (sick leave) never wait. */
+/**
+ * Requests waiting for a decision, oldest first. Auto-approve policies (sick leave) wait only when the
+ * request falls before the policy's service wait, for Admin to waive it or record it as unpaid.
+ */
 export function pendingApprovals(db: DB, opts: { managerId?: ID } = {}): TimeOffRequest[] {
-  const auto = new Set(db.timeOffPolicies.filter((p) => p.autoApprove).map((p) => p.id))
   return db.timeOffRequests
-    .filter((r) => r.status === 'pending' && !auto.has(r.policyId))
+    .filter((r) => r.status === 'pending')
     .filter((r) => !opts.managerId || db.people.find((p) => p.id === r.personId)?.managerId === opts.managerId)
     .sort((a, b) => a.requestedOn.localeCompare(b.requestedOn) || a.startDate.localeCompare(b.startDate))
 }
@@ -637,6 +692,8 @@ export type RequestCheck = {
   balanceAfter: number | null
   /** Warnings with a why. None of them blocks the request (only two hard stops exist in the app). */
   warnings: string[]
+  /** The request starts before the policy's service wait ends; `text` is the warning about it. */
+  wait?: ServiceWait & { text: string }
 }
 
 /** Hours and warnings for a request before it is saved ("balance impact is shown", projected to the start date). */
@@ -660,8 +717,8 @@ export function checkRequest(db: DB, input: NewRequest, date: ISODate): RequestC
       const when = asOf > date ? ` on ${fmtDay(asOf)}` : ''
       warnings.push(
         policy.method === 'frontload' && policy.usageCapHours != null
-          ? `This goes ${r2(-balanceAfter)} hours past the ${policy.usageCapHours}-hour yearly limit for ${policy.name.toLowerCase()}.`
-          : `This is ${r2(-balanceAfter)} hours more than the ${policy.name.toLowerCase()} balance${when}.`,
+          ? `This goes ${hoursText(-balanceAfter)} past the ${policy.usageCapHours}-hour yearly limit for ${policy.name.toLowerCase()}.`
+          : `This is ${hoursText(-balanceAfter)} more than the ${policy.name.toLowerCase()} balance${when}.`,
       )
     }
   }
@@ -669,10 +726,9 @@ export function checkRequest(db: DB, input: NewRequest, date: ISODate): RequestC
   const citeText = cite ? ` (${cite})` : ''
   // Service minimum for every kind of policy (sick leave's optional wait; 30 days for bereavement and
   // reproductive loss, Gov Code 12945.6 and 12945.7; 90 days for donor leave).
-  const usable = usableFromDate(policy, person, db)
-  if (usable && input.startDate < usable) {
-    warnings.push(`${policy.name} is usable from ${fmtDate(usable)} (${waitText(policy)}${cite ? `, ${cite}` : ''}).`)
-  }
+  const wait = serviceWait(db, input)
+  const waitWarning = wait ? `${policy.name} is usable from ${fmtDate(wait.usableFrom)} (${waitText(policy)}${cite ? `, ${cite}` : ''}).` : undefined
+  if (waitWarning) warnings.push(waitWarning)
   // Per-event limits written in whole days (40 hours = 5 days) are counted in workdays, so a part-timer's
   // shorter days do not stretch the limit; limits in hours (voting time) are counted in hours.
   const reqDays = input.endDate >= input.startDate ? requestDaysWithin(db, input, input.startDate, input.endDate) : 0
@@ -699,21 +755,36 @@ export function checkRequest(db: DB, input: NewRequest, date: ISODate): RequestC
       r.endDate >= input.startDate,
   )
   if (overlap) warnings.push(`Overlaps an existing request (${datesText(overlap.startDate, overlap.endDate)}).`)
-  return { hours, workdays: days, balanceAfter, warnings }
+  return { hours, workdays: days, balanceAfter, warnings, ...(wait && waitWarning ? { wait: { ...wait, text: waitWarning } } : {}) }
+}
+
+export type CreateRequestOpts = {
+  date: ISODate
+  id?: ID
+  /**
+   * Sick leave that starts before the policy's service wait ends: 'hold' waits for Admin (to waive the
+   * wait with approveRequest or record it as unpaid with approveAsUnpaid), 'waive' records it approved
+   * with the wait waived. Left out, it is recorded as approved, as history written outside the request
+   * sheet already decided (the sample's own early sick day carries that decision note).
+   */
+  beforeWait?: 'hold' | 'waive'
 }
 
 /**
  * Creates a request with computed hours. Policies with autoApprove (sick leave: no reason asked) are
- * approved on the spot; everything else waits for a manager or admin.
+ * approved on the spot, except sick leave before the service wait ends, which follows `beforeWait`.
+ * Everything else waits for a manager or Admin.
  */
-export function createRequest(draft: Draft<DB>, input: NewRequest, opts: { date: ISODate; id?: ID }): TimeOffRequest {
+export function createRequest(draft: Draft<DB>, input: NewRequest, opts: CreateRequestOpts): TimeOffRequest {
   const db = draft as DB
   const person = db.people.find((p) => p.id === input.personId)
   const policy = db.timeOffPolicies.find((p) => p.id === input.policyId)
   if (!person) throw new Error('No person with that id.')
   if (!policy) throw new Error('No time off policy with that id.')
   const hours = requestHours(input.startDate, input.endDate, db.holidays, input.partial, hoursPerDayFor(person))
-  const auto = !!policy.autoApprove
+  const wait = policy.autoApprove && opts.beforeWait ? serviceWait(db, input) : null
+  const auto = !!policy.autoApprove && (!wait || opts.beforeWait === 'waive')
+  const decisionNote = wait ? waivedNote(wait) : 'Approved automatically'
   const req: TimeOffRequest = {
     id: opts.id ?? newId('tr'),
     personId: input.personId,
@@ -725,7 +796,7 @@ export function createRequest(draft: Draft<DB>, input: NewRequest, opts: { date:
     status: auto ? 'approved' : 'pending',
     ...(input.note ? { note: input.note } : {}),
     requestedOn: opts.date,
-    ...(auto ? { decidedOn: opts.date, decisionNote: 'Approved automatically' } : {}),
+    ...(auto ? { decidedOn: opts.date, decisionNote } : {}),
   }
   draft.timeOffRequests.push(req)
   const phrase = policyPhrase(policy)
@@ -736,7 +807,7 @@ export function createRequest(draft: Draft<DB>, input: NewRequest, opts: { date:
     relatedId: person.id,
     kind: auto ? 'timeoff_recorded' : 'timeoff_requested',
     text: auto
-      ? `${phrase.charAt(0).toUpperCase() + phrase.slice(1)} recorded for ${fullName(person)}, ${when}, approved automatically`
+      ? `${phrase.charAt(0).toUpperCase() + phrase.slice(1)} recorded for ${fullName(person)}, ${when}, ${wait ? `with the ${wait.days}-day wait waived` : 'approved automatically'}`
       : `${fullName(person)} requested ${phrase}, ${when}`,
   })
   return req
@@ -767,9 +838,53 @@ function decide(draft: Draft<DB>, requestId: ID, status: 'approved' | 'declined'
   return true
 }
 
-/** Approves a pending request. Returns false when it is missing or not pending. */
+function waivedNote(wait: ServiceWait): string {
+  return `Approved: the ${wait.days}-day wait was waived for this request`
+}
+
+/** The service wait a pending request falls before (sick leave before day 90), else null. */
+function pendingWait(db: DB, requestId: ID): ServiceWait | null {
+  const req = db.timeOffRequests.find((r) => r.id === requestId)
+  const policy = req ? db.timeOffPolicies.find((p) => p.id === req.policyId) : undefined
+  return req && policy?.autoApprove ? serviceWait(db, req) : null
+}
+
+/**
+ * Approves a pending request. Returns false when it is missing or not pending. Approving sick leave
+ * that falls before the service wait waives the wait for that request, and the decision note says so.
+ */
 export function approveRequest(draft: Draft<DB>, requestId: ID, opts: DecisionOpts): boolean {
-  return decide(draft, requestId, 'approved', opts, 'Approved')
+  const wait = opts.note ? null : pendingWait(draft as DB, requestId)
+  return decide(draft, requestId, 'approved', wait ? { ...opts, note: waivedNote(wait) } : opts, 'Approved')
+}
+
+/**
+ * Records a pending request that falls before the policy's service wait (sick leave before day 90) as
+ * unpaid leave instead: it moves to the unpaid leave policy when the company has one, else it keeps its
+ * policy with no hours, so nothing comes off the balance. Returns false when it is missing or not pending.
+ */
+export function approveAsUnpaid(draft: Draft<DB>, requestId: ID, opts: DecisionOpts): boolean {
+  const db = draft as DB
+  const req = draft.timeOffRequests.find((r) => r.id === requestId)
+  const person = req ? db.people.find((p) => p.id === req.personId) : undefined
+  if (!req || !person || req.status !== 'pending') return false
+  const wait = pendingWait(db, requestId)
+  const unpaid = unpaidPolicyFor(db, person, req.startDate)
+  if (unpaid) req.policyId = unpaid.id
+  else req.hours = 0
+  req.status = 'approved'
+  req.decidedOn = opts.date
+  if (opts.approverId) req.approverId = opts.approverId
+  req.decisionNote = opts.note ?? (wait ? `Recorded as unpaid: before the ${wait.days}-day wait ends on ${fmtDate(wait.usableFrom)}` : 'Recorded as unpaid')
+  // 'time off', never the leave type: activity can be seen outside Admin.
+  log(draft, {
+    entityType: 'timeoff',
+    entityId: req.id,
+    relatedId: req.personId,
+    kind: 'timeoff_approved',
+    text: `Recorded ${fullName(person)}'s time off as unpaid, ${datesText(req.startDate, req.endDate)}`,
+  })
+  return true
 }
 
 /** Declines a pending request. Returns false when it is missing or not pending. */
@@ -791,6 +906,8 @@ export type VacationPayout = {
   amount: number
   /** Final hourly rate of pay (salary / (hours per week x 52) for salaried staff). */
   rate: number
+  /** The day it was counted to: the date asked for, or the person's own last day when that comes first. */
+  asOf: ISODate
   rows: Array<{ policyId: ID; name: string; hours: number; amount: number }>
   note: string
 }
@@ -798,11 +915,14 @@ export type VacationPayout = {
 /**
  * Accrued, unused vacation owed at separation, at the final rate of pay (Labor Code 227.3). Vacation vests
  * as earned, so the pay period in progress counts up to the last day. Sick leave and flexible vacation pay nothing.
+ * A person whose recorded last day comes before `lastDay` is counted at their own last day: nothing is earned
+ * after it, so an alumnus's payout never grows.
  */
-export function vacationPayout(db: DB, personId: ID, lastDay: ISODate): VacationPayout {
+export function vacationPayout(db: DB, personId: ID, askedFor: ISODate): VacationPayout {
   const person = db.people.find((p) => p.id === personId)
-  const empty = { hours: 0, amount: 0, rate: 0, rows: [] }
+  const empty = { hours: 0, amount: 0, rate: 0, rows: [], asOf: askedFor }
   if (!person) return { ...empty, note: 'No person with that id.' }
+  const lastDay = person.endDate && person.endDate < askedFor ? person.endDate : askedFor
   const rec = compOrFirst(db, personId, lastDay)
   const rate = rec ? hourlyRateOf(rec, person.hoursPerWeek) : 0
   const asOfLast: Person = { ...person, endDate: lastDay }
@@ -823,7 +943,7 @@ export function vacationPayout(db: DB, personId: ID, lastDay: ISODate): Vacation
     : flexibleOnly
       ? 'Flexible vacation has no accrued balance, so nothing is paid out. Sick leave is not paid out.'
       : 'No vacation policy pays out for this person. Sick leave is not paid out.'
-  return { hours, amount, rate, rows, note }
+  return { hours, amount, rate, rows, note, asOf: lastDay }
 }
 
 // ---------------------------------------------------------------------------------------------

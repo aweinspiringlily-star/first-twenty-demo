@@ -111,6 +111,13 @@ export type ConnectionState = {
    * the uploaded record is still the one it was made on (missing for connections saved by older builds).
    */
   bases: Record<string, string>
+  /**
+   * "$doc:<key>" -> top-level field -> basePrint of that field in the server's copy the queued edit was
+   * made on, for every field this device changed while the document is pending. Present only when every
+   * change since the key was queued was recorded (a document is large and holds unrelated panels), so a
+   * conflict can keep this device's fields on top of the server's other fields (see handlePushResult).
+   */
+  fieldBases: Record<string, Record<string, string>>
   /** SYNC_SCHEMA of the build that last caught up with the server (null: unknown, resync on start). */
   schema: string | null
   /** See SYNC_MARK_KEY. */
@@ -121,6 +128,11 @@ export type ConnectionState = {
    * restored answers "resync" before anything is applied.
    */
   historyId: string | null
+  /**
+   * The user signed out on purpose (Sign out), as opposed to a session that ended on its own (a 401).
+   * Cleared by the next successful sign-in.
+   */
+  signedOutByUser: boolean
 }
 
 export type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -142,9 +154,11 @@ export function emptyConnection(): ConnectionState {
     hold: null,
     unconfirmed: {},
     bases: {},
+    fieldBases: {},
     schema: null,
     storeMark: 0,
     historyId: null,
+    signedOutByUser: false,
   }
 }
 
@@ -322,6 +336,15 @@ function sanitize(value: unknown): ConnectionState {
   if (v.bases && typeof v.bases === 'object') {
     for (const [k, p] of Object.entries(v.bases as Record<string, unknown>)) if (typeof p === 'string' && p !== '') bases[k] = p
   }
+  const fieldBases: Record<string, Record<string, string>> = {}
+  if (v.fieldBases && typeof v.fieldBases === 'object') {
+    for (const [k, f] of Object.entries(v.fieldBases as Record<string, unknown>)) {
+      if (!f || typeof f !== 'object' || Array.isArray(f)) continue
+      const fields: Record<string, string> = {}
+      for (const [name, p] of Object.entries(f as Record<string, unknown>)) if (typeof p === 'string' && p !== '') fields[name] = p
+      fieldBases[k] = fields
+    }
+  }
   return {
     v: SYNC_STATE_VERSION,
     mode: v.mode === 'server' ? 'server' : 'local',
@@ -336,9 +359,11 @@ function sanitize(value: unknown): ConnectionState {
     hold: v.hold === 'sample' || v.hold === 'server_empty' || v.hold === 'replaced' || v.hold === 'demo_clock' ? v.hold : null,
     unconfirmed,
     bases,
+    fieldBases,
     schema: typeof v.schema === 'string' ? v.schema : null,
     storeMark: typeof v.storeMark === 'number' && Number.isFinite(v.storeMark) && v.storeMark >= 0 ? v.storeMark : 0,
     historyId: typeof v.historyId === 'string' && v.historyId !== '' ? v.historyId : null,
+    signedOutByUser: v.signedOutByUser === true,
   }
 }
 

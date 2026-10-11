@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { blankDB } from '@/data/blank'
 import { buildSampleDB } from '@/data/seed'
-import type { EquityGrant } from '@/domain/types'
+import type { CompRecord, EquityGrant } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
 import {
   bandErrors,
   bandFieldErrors,
+  changeParts,
   boardHTML,
   boardSummary,
   boardText,
@@ -20,16 +22,22 @@ import {
   mlPremium,
   nextLevel,
   nextPayPeriodStart,
+  NOTE_MAX_CHARS,
+  noteCountText,
   overtimeStatusText,
+  payLimitProblem,
   peopleInBand,
+  premiumRangeText,
   quarterStartPresets,
+  scenarioDelta,
+  scenarioDeltaParts,
   snapTo1K,
   splitMoneyText,
   stepChartSVG,
   variableLabel,
   vestingMilestones,
 } from './helpers'
-import { compTable } from '@/domain/pay'
+import { compTable, type RunRate } from '@/domain/pay'
 
 const D = '2026-10-09'
 
@@ -53,6 +61,24 @@ function grant(over: Partial<EquityGrant> = {}): EquityGrant {
     ...over,
   }
 }
+
+describe('scheduled change summary', () => {
+  it('names what changes against the record before it, pay as its own part', () => {
+    const db = buildSampleDB()
+    const [a, b] = db.people.filter((p) => !p.isFounder)
+    const prev: CompRecord = { id: 'cr-1', personId: a.id, effectiveOn: '2026-01-05', payType: 'salary', salary: 168_000, title: 'Solutions engineer', levelId: db.levels[1].id, managerId: 'p-founder', departmentId: db.departments[0].id, flsa: 'exempt', reason: 'hire' }
+    const move: CompRecord = { ...prev, id: 'cr-2', effectiveOn: '2026-10-16', managerId: b.id, reason: 'manager_change' }
+    expect(changeParts(db, move, prev)).toEqual([{ kind: 'manager', text: `reports to ${b.preferredName || b.firstName} ${b.lastName}` }])
+    const promo: CompRecord = { ...prev, id: 'cr-3', title: 'Senior solutions engineer', levelId: db.levels[2].id, salary: 185_000, variablePct: 0.1, reason: 'promotion' }
+    expect(changeParts(db, promo, prev)).toEqual([
+      { kind: 'title', text: 'title Senior solutions engineer' },
+      { kind: 'level', text: `level ${db.levels[2].code}` },
+      { kind: 'pay', text: 'base $185,000' },
+      { kind: 'variable', text: 'variable 10%' },
+    ])
+    expect(changeParts(db, promo, undefined)).toEqual([])
+  })
+})
 
 describe('labels', () => {
   it('describes variable pay and equity guidelines', () => {
@@ -141,6 +167,17 @@ describe('equity wording', () => {
     for (let i = 1; i < pts.length; i++) expect(pts[i].vested).not.toBe(pts[i - 1].vested)
     expect(combinedVesting([])).toEqual([])
   })
+  it("ends a leaver's vesting line at the last day", () => {
+    // Last day Mar 20, 2027: 12,000 at the cliff, 14,000 by Mar 12, then flat (no cancellation recorded yet).
+    const pts = combinedVesting([grant()], () => '2027-03-20')
+    expect(pts.at(-1)).toEqual({ date: '2027-03-12', vested: 14_000 })
+    expect(vestingMilestones(pts, '2026-01-12', '2027-03-20')).toEqual([
+      { date: '2027-01-12', vested: 12_000 },
+      { date: '2027-03-20', vested: 14_000 },
+    ])
+    // Leaving before the cliff: one row, the last day, with nothing vested.
+    expect(vestingMilestones(combinedVesting([grant()], () => '2026-12-01'), '2026-01-12', '2026-12-01')).toEqual([{ date: '2026-12-01', vested: 0 }])
+  })
   it('lists yearly vesting milestones', () => {
     const pts = combinedVesting([grant()])
     expect(vestingMilestones(pts, '2026-01-12')).toEqual([
@@ -185,6 +222,15 @@ describe('bands', () => {
     expect(prem?.min).toBeGreaterThan(0)
     expect(prem?.byLevel.map((b) => b.levelId)).toEqual(['lv-l2', 'lv-l3', 'lv-l4'])
   })
+  it('words the premium range by sign', () => {
+    expect(premiumRangeText(0.05, 0.1)).toBe('5% to 10% above')
+    expect(premiumRangeText(-0.02, 0.1)).toBe('2% below to 10% above')
+    expect(premiumRangeText(-0.05, -0.02)).toBe('2% to 5% below')
+    expect(premiumRangeText(0.1, 0.1)).toBe('10% above')
+    expect(premiumRangeText(-0.031, -0.029)).toBe('3% below')
+    expect(premiumRangeText(0.001, -0.002)).toBe('the same as')
+    expect(premiumRangeText(0, 0.08)).toBe('0% to 8% above')
+  })
   it('lists the people in a band', () => {
     const db = buildSampleDB()
     const names = peopleInBand(db, { familyId: 'f-eng', levelId: 'lv-l4' }, D).map((r) => r.name)
@@ -203,6 +249,45 @@ describe('comp CSV', () => {
     expect(lines).toHaveLength(rows.length + 1)
     const luis = lines.find((l) => l.startsWith('Luis Ortega'))
     expect(luis).toContain('Hourly,30,37440')
+  })
+  it('puts hours and the full-time equivalent next to part-time pay, and says the band is full time', () => {
+    const db = buildSampleDB()
+    const csv = compTableCSV(db, compTable(db, D), D)
+    const lines = csv.split('\r\n')
+    const header = lines[0].split(',')
+    expect(header.slice(7, 10)).toEqual(['Annual base', 'Hours per week', 'Full-time equivalent base'])
+    expect(header).toEqual(expect.arrayContaining(['Band min (full-time)', 'Band mid (full-time)', 'Band max (full-time)', 'Compa-ratio (full-time)']))
+    // Luis: $30 an hour at 24 hours is $37,440 a year, $62,400 at full time.
+    expect(lines.find((l) => l.startsWith('Luis Ortega'))).toContain('Hourly,30,37440,24,62400')
+  })
+  it('says when out-of-band pay has no exception reason', () => {
+    const db = buildSampleDB()
+    const tomas = compTable(db, D).find((r) => r.name === 'Tomas Herrera')
+    if (!tomas?.band) throw new Error('Tomas has a band in the sample')
+    // A band edit that leaves his pay below the new minimum.
+    const below = { ...tomas, band: { ...tomas.band, min: tomas.fteBase + 1 } }
+    const header = compTableCSV(db, [tomas], D).split('\r\n')[0].split(',')
+    const col = header.indexOf('Exception reason')
+    expect(compTableCSV(db, [below], D).split('\r\n')[1].split(',')[col]).toBe('No exception reason')
+    expect(compTableCSV(db, [tomas], D).split('\r\n')[1].split(',')[col]).toBe('')
+  })
+})
+
+describe('cost scenarios', () => {
+  const line = (key: string, name: string, monthly: number, kind: 'employee' | 'incoming' | 'plan' = 'employee') => ({ key, name, monthly, kind })
+  const rate = (lines: Array<ReturnType<typeof line>>) => ({ lines }) as unknown as RunRate
+  it('counts people joining and leaving between scenarios', () => {
+    const now = rate([line('p:a', 'Ana Ruiz', 20_000), line('p:k', 'Kofi Mensah', 18_791), line('p:e', 'Elena Park', 19_469)])
+    const next = rate([line('p:a', 'Ana Ruiz', 20_000), line('p:l', 'Lucas Ferreira', 21_000, 'incoming'), line('s:1', 'Senior engineer', 24_000, 'plan')])
+    const d = scenarioDelta(now, next)
+    expect(d).toEqual({ added: { amount: 45_000, names: ['Lucas', 'Senior engineer'] }, removed: { amount: 38_260, names: ['Kofi', 'Elena'] } })
+    expect(scenarioDeltaParts(d)).toEqual([
+      { amount: '+$45K', text: 'for Lucas and Senior engineer' },
+      { amount: '-$38.3K', text: 'for Kofi and Elena leaving' },
+    ])
+    const many = scenarioDelta(rate([]), rate(['a', 'b', 'c', 'd'].map((k) => line(`s:${k}`, `Role ${k}`, 1_000, 'plan'))))
+    expect(scenarioDeltaParts(many)).toEqual([{ amount: '+$4K', text: 'for 4 joining' }])
+    expect(scenarioDeltaParts(scenarioDelta(now, now))).toEqual([])
   })
 })
 
@@ -223,6 +308,27 @@ describe('board print', () => {
     const html = boardHTML(s)
     expect(html).toContain('<svg')
     expect(html).toContain('Headcount plan')
+  })
+  it('says 1 employee and asks for cash on hand once', () => {
+    const db = blankDB({ companyName: 'Solo', founderFirstName: 'Maya', founderLastName: 'Raman', foundedOn: '2025-02-03' })
+    const s = boardSummary(db, D)
+    const text = boardText(s)
+    expect(text).toContain('Headcount: 1 employee, 0 contractors, 0 advisors.')
+    expect(text.split('Add cash on hand in Settings to see runway.')).toHaveLength(2)
+    const html = boardHTML(s)
+    expect(html).toContain('1 employee today, 0 contractors, 0 advisors.')
+    expect(html.split('Add cash on hand in Settings to see runway.')).toHaveLength(2)
+    // Two different runway sentences both print.
+    const both = { ...s, cost: { ...s.cost, runwayNow: 'About 27 months of runway at today\'s burn.', runwayAtPlan: 'About 20 months of runway if the plan hires on schedule.' } }
+    expect(boardText(both)).toContain("About 27 months of runway at today's burn. About 20 months of runway if the plan hires on schedule.")
+  })
+  it('counts variance lines and says when part-time pay was restated at full time', () => {
+    const s = boardSummary(buildSampleDB(), D)
+    const one = { ...s, variance: { budget: 70_000, actual: 64_480, variance: -5_520, lines: 1, restated: 1 } }
+    expect(boardText(one)).toContain('Offers vs budget on 1 plan line: -$5,520 in base (part-time pay restated at full time).')
+    expect(boardHTML(one)).toContain('Offered or hired base vs budget on 1 line: -$5,520 (part-time pay restated at full time).')
+    const three = { ...s, variance: { budget: 480_000, actual: 495_000, variance: 15_000, lines: 3, restated: 0 } }
+    expect(boardText(three)).toContain('Offers vs budget on 3 plan lines: +$15,000 in base.')
   })
   it('escapes names in the print view', () => {
     const db = buildSampleDB()
@@ -266,6 +372,29 @@ describe('change defaults', () => {
     expect(proposedBase('market', 240_000, band)).toBe(247_000)
     expect(proposedBase('merit', 200_000, band)).toBe(208_000)
     expect(proposedBase('title_only', 200_123, band)).toBe(200_123)
+  })
+})
+
+describe('pay limits and note length', () => {
+  it('blocks a mistyped amount even when it would only need an exception reason', () => {
+    // 210,000 with 215000 typed after it, against a $230K band maximum.
+    expect(payLimitProblem({ hourly: false, pay: 210_000_215_000, fte: 210_000_215_000, currentFte: 205_000, bandMax: 230_000 })).toBe(
+      'Check the amount: the new salary is over $5M a year.',
+    )
+    expect(payLimitProblem({ hourly: false, pay: 1_200_000, fte: 1_200_000, currentFte: 205_000, bandMax: 230_000 })).toBe(
+      'Check the amount: the new pay is more than 5 times the band maximum.',
+    )
+    // Above the band but plausible: the exception reason covers it.
+    expect(payLimitProblem({ hourly: false, pay: 260_000, fte: 260_000, currentFte: 205_000, bandMax: 230_000 })).toBeNull()
+    // No band: compared with current pay, unless there is none (an unpaid founder).
+    expect(payLimitProblem({ hourly: false, pay: 1_100_000, fte: 1_100_000, currentFte: 200_000 })).toBe('Check the amount: the new pay is more than 5 times current pay.')
+    expect(payLimitProblem({ hourly: false, pay: 1_100_000, fte: 1_100_000, currentFte: 0 })).toBeNull()
+    expect(payLimitProblem({ hourly: true, pay: 3_100, fte: 6_448_000, currentFte: 64_480, bandMax: 90_000 })).toBe('Check the amount: the new rate is over $1,000 an hour.')
+    expect(payLimitProblem({ hourly: true, pay: 34, fte: 70_720, currentFte: 64_480, bandMax: 90_000 })).toBeNull()
+  })
+  it('counts characters only near the note limit', () => {
+    expect(noteCountText('Report from Carta.')).toBeNull()
+    expect(noteCountText('x'.repeat(NOTE_MAX_CHARS - 1))).toBe('4,999 of 5,000 characters')
   })
 })
 

@@ -10,6 +10,7 @@ import { Badge, Button, EmptyState, Meter, Panel, Private, SectionLabel, TextLin
 import { LineItem } from './bits'
 import { SummaryExportButtons } from './SummaryExport'
 import {
+  availabilityText,
   type BalanceLine,
   daysAwayText,
   dayText,
@@ -145,7 +146,7 @@ function BalanceTile({ line }: { line: BalanceLine }) {
       {/* Proportional figures: a lone big number reads better without tabular spacing around the decimal point. */}
       <div className="ft-ministat__value mt-0.5 font-display text-[24px] leading-tight font-bold text-ink">{line.value}</div>
       <div className="mt-0.5 text-[13px] text-ink-3">
-        {line.hours == null ? line.note : `${line.days ? `${line.days} ` : ''}available${line.note ? `. ${line.note}` : ''}`}
+        {line.hours == null ? line.note : `${availabilityText(line)}${line.note ? `. ${line.note}` : ''}`}
       </div>
     </div>
   )
@@ -243,7 +244,7 @@ function ComingUp({ db, person }: { db: DB; person: Person }) {
             <LineItem
               key={o.personId}
               label={
-                <a href={links.person(o.personId)} className="font-semibold text-ink hover:text-accent">
+                <a href={links.person(o.personId)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-ink hover:text-accent">
                   {o.name}
                 </a>
               }
@@ -262,7 +263,7 @@ function ComingUp({ db, person }: { db: DB; person: Person }) {
             <LineItem
               key={p.id}
               label={
-                <a href={links.person(p.id)} className="font-semibold text-ink hover:text-accent">
+                <a href={links.person(p.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-ink hover:text-accent">
                   {p.preferredName || p.firstName} {p.lastName}
                 </a>
               }
@@ -278,7 +279,7 @@ function ComingUp({ db, person }: { db: DB; person: Person }) {
             <>
               {' '}
               Next:{' '}
-              <a href={links.person(nextNew.id)} className="font-semibold text-ink hover:text-accent">
+              <a href={links.person(nextNew.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-ink hover:text-accent">
                 {nextNew.preferredName || nextNew.firstName} {nextNew.lastName}
               </a>{' '}
               on {dayText(nextNew.startDate, date)}.

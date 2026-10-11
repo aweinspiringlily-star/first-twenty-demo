@@ -30,7 +30,7 @@ import {
   TextLink,
 } from '@/ui'
 import { Blurrable, commit, EditablePanel, EditSheet, NewOnlyNote, Row, RowList } from './kit'
-import { moveItem, urlProblem } from './logic'
+import { hintWithCount, linkProblem, moveItem, normalizeWebsite, TEXT_MAX_CHARS } from './logic'
 
 export function HiringTab() {
   const settings = useDB((s) => s.db.settings)
@@ -366,13 +366,15 @@ function CalendlyPanel({ calendly }: { calendly: string }) {
       value={{ url: calendly }}
       editLabel="Edit link"
       saveLabel="Save link"
-      validate={(d) => urlProblem(d.url)}
-      onSave={(d) =>
-        commit(d.url.trim() ? 'Updated the scheduling link' : 'Removed the scheduling link', (draft) => {
-          if (d.url.trim()) draft.company.linkOuts.calendly = d.url.trim()
+      validate={(d) => linkProblem(d.url)}
+      onSave={(d) => {
+        // A link typed without https:// is saved with it, as under Link-outs.
+        const url = normalizeWebsite(d.url)
+        return commit(url ? 'Updated the scheduling link' : 'Removed the scheduling link', (draft) => {
+          if (url) draft.company.linkOuts.calendly = url
           else delete draft.company.linkOuts.calendly
         })
-      }
+      }}
       view={
         calendly ? (
           <a href={calendly} target="_blank" rel="noreferrer noopener" className="font-semibold break-all text-accent underline">
@@ -383,7 +385,7 @@ function CalendlyPanel({ calendly }: { calendly: string }) {
         )
       }
       form={(d, set) => (
-        <Field label="Booking page link" error={urlProblem(d.url)} hint="Also listed under Link-outs.">
+        <Field label="Booking page link" error={linkProblem(d.url)} hint="Also listed under Link-outs.">
           {(id, hint) => (
             <TextInput id={id} aria-describedby={hint} inputMode="url" placeholder="https://calendly.com/you/intro" value={d.url} onChange={(e) => set({ url: e.target.value })} />
           )}
@@ -628,12 +630,18 @@ function TemplateForm({ d, set }: { d: EmailTemplate; set: (patch: Partial<Email
           />
         )}
       </Field>
-      <Field label="Message" required id={bodyId} hint="Tip: dictate with Win+H on Windows or the dictation key on a Mac.">
+      <Field
+        label="Message"
+        required
+        id={bodyId}
+        hint={hintWithCount('Tip: dictate with Win+H on Windows or the dictation key on a Mac.', d.body, TEXT_MAX_CHARS)}
+      >
         {(id, hint) => (
           <TextArea
             id={id}
             aria-describedby={hint}
             rows={9}
+            maxLength={TEXT_MAX_CHARS}
             value={d.body}
             onFocus={() => (lastField.current = 'body')}
             onChange={(e) => set({ body: e.target.value })}

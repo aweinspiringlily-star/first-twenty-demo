@@ -1,10 +1,12 @@
 import { produce } from 'immer'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
-import { addContractor, addOffer, addPerson, makeDB } from '@/domain/compliance/testkit'
-import type { Checklist, ChecklistTask, DB, Viewer } from '@/domain/types'
+import { RULES } from '@/domain/compliance'
+import { addContractor, addMany, addOffer, addPerson, makeDB } from '@/domain/compliance/testkit'
+import type { Checklist, ChecklistTask, DB, Job, Viewer } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
 import { welcomeEmail } from '@/domain/people'
+import { generateChecklist } from '@/domain/checklists/generate'
 import {
   ab5Result,
   applyInboxOp,
@@ -222,6 +224,41 @@ describe('inboxItems', () => {
     expect(byKey(items, 'timeoff:tr-ana')?.primary).toMatchObject({ label: 'Approve' })
   })
 
+  it("puts sick leave held before the 90-day wait in Admin's own inbox, not the manager's", () => {
+    const db = fixture()
+    const sick = db.timeOffPolicies.find((p) => p.autoApprove)!
+    db.timeOffRequests.push({ id: 'tr-sick', personId: 'p-ana', policyId: sick.id, startDate: '2026-11-16', endDate: '2026-11-16', hours: 8, status: 'pending', requestedOn: FRI })
+    // Weeks away and Ana has a manager, yet only Admin can decide it.
+    expect(byKey(inboxItems(db, admin(db), FRI, { now: NOW }), 'timeoff:tr-sick')).toMatchObject({ waitingOn: 'you', primary: { label: 'Waive the wait' } })
+    expect(byKey(inboxItems(db, manager(db), FRI, { now: NOW }), 'timeoff:tr-sick')).toBeUndefined()
+  })
+
+  it('offers the same choice as the Time off tab for sick leave before the wait: waive it or record it as unpaid', () => {
+    const db = fixture()
+    const sick = db.timeOffPolicies.find((p) => p.autoApprove)!
+    db.timeOffRequests.push({ id: 'tr-sick', personId: 'p-ana', policyId: sick.id, startDate: '2026-10-16', endDate: '2026-10-16', hours: 8, status: 'pending', requestedOn: FRI })
+    const item = byKey(inboxItems(db, admin(db), FRI, { now: NOW }), 'timeoff:tr-sick')
+    // Ana started Sep 8, so sick leave is usable from her 90th day, Sun Dec 6.
+    expect(item?.detail).toContain('Starts before sick leave is usable (Sun Dec 6, the 90-day wait).')
+    expect(item?.primary).toEqual({ kind: 'mutate', label: 'Waive the wait', op: { type: 'approve_timeoff', requestId: 'tr-sick' }, toast: "Waived the wait and approved Ana Lima's time off, Oct 16" })
+    const unpaid = item?.more?.find((a) => a.label === 'Record as unpaid')
+    expect(unpaid).toMatchObject({ kind: 'mutate', op: { type: 'approve_timeoff_unpaid', requestId: 'tr-sick' } })
+    const next = produce(db, (d) => {
+      if (unpaid?.kind !== 'mutate') throw new Error('no unpaid action')
+      expect(applyInboxOp(d, unpaid.op, { date: FRI, actorId: 'p-founder' })).toEqual({ ok: true })
+      expect(applyInboxOp(d, unpaid.op, { date: FRI, actorId: 'p-founder' }).ok).toBe(false)
+    })
+    const req = next.timeOffRequests.find((r) => r.id === 'tr-sick')
+    expect(req).toMatchObject({ status: 'approved', approverId: 'p-founder' })
+    expect(req?.decisionNote).toMatch(/^Recorded as unpaid/)
+    // A request after the wait keeps the plain Approve, with no unpaid option.
+    const later = fixture()
+    later.timeOffRequests.push({ id: 'tr-vac', personId: 'p-tomas', policyId: sick.id, startDate: '2026-10-16', endDate: '2026-10-16', hours: 8, status: 'pending', requestedOn: FRI })
+    const plain = byKey(inboxItems(later, admin(later), FRI, { now: NOW }), 'timeoff:tr-vac')
+    expect(plain?.primary.label).toBe('Approve')
+    expect(plain?.more?.some((a) => a.label === 'Record as unpaid')).toBe(false)
+  })
+
   it('tells the drafter when Admin asks for changes to their offer, or approves it', () => {
     const db = fixture()
     const offer = db.offers.find((o) => o.id === 'o-dan')
@@ -258,6 +295,55 @@ describe('inboxItems', () => {
     expect(items.some((i) => i.kind === 'offer_changes' || i.kind === 'offer_waiting')).toBe(false)
     expect(inboxItems(db, admin(db), FRI, { now: NOW }).some((i) => i.kind === 'offer_send')).toBe(false)
     expect(inboxItems(db, employee(db), FRI, { now: NOW }).some((i) => i.refs.offerId === 'o-dan')).toBe(false)
+  })
+
+  it('asks whoever sends an offer that needs no approval to send it once it is saved', () => {
+    const db = fixture()
+    const job: Job = {
+      id: 'j-1',
+      title: 'Engineer',
+      departmentId: 'd-eng',
+      familyId: 'f-swe',
+      levelId: 'lv-l3',
+      hiringManagerId: 'p-tomas',
+      panelIds: [],
+      locationIds: ['loc-hq'],
+      workMode: 'hybrid',
+      employmentType: 'full_time',
+      flsa: 'exempt',
+      payMin: 140000,
+      payMax: 170000,
+      status: 'open',
+      stages: [{ id: 'offer', kind: 'offer', name: 'Offer' }],
+      interviewPlan: [],
+      description: '',
+      sponsorship: 'no',
+      backgroundCheck: false,
+      priority: 'normal',
+    }
+    db.jobs.push(job)
+    const eve = addOffer(db, { id: 'o-eve', startDate: '2026-11-16', status: 'draft', draftedById: 'p-founder', draftedByRole: 'admin', createdOn: '2026-10-08' }, { firstName: 'Eve', lastName: 'Stone' })
+    const send = (v: Viewer) => byKey(inboxItems(db, v, FRI, { now: NOW }), 'offer-send:o-eve:v1')
+    // Admin drafted it in Admin view: no approval step, so the next thing is to send it.
+    expect(send(admin(db))).toMatchObject({
+      kind: 'offer_send',
+      title: 'Send the offer to Eve Stone (Engineer)',
+      detail: 'You drafted it Thu Oct 8. Generate the letter, send it, then mark it sent on the candidate page.',
+      group: 'this_week',
+      statutory: false,
+      waitingOn: 'you',
+      primary: { kind: 'navigate', label: 'Open offer', href: '#candidate.c-o-eve' },
+    })
+    // The job's hiring manager sends offers too; an employee never sees it.
+    expect(send(manager(db))?.detail).toMatch(/^Fay Founder drafted it Thu Oct 8\./)
+    expect(send(employee(db))).toBeUndefined()
+    // Marked sent, the nudge goes.
+    eve.status = 'sent'
+    expect(send(admin(db))).toBeUndefined()
+    // A hiring manager's draft goes to Admin for approval first: nothing to send yet, for anyone.
+    addOffer(db, { id: 'o-kai', startDate: '2026-11-16', status: 'draft', draftedById: 'p-tomas', draftedByRole: 'manager' }, { firstName: 'Kai', lastName: 'Moss' })
+    expect(inboxItems(db, manager(db), FRI, { now: NOW }).some((i) => i.refs.offerId === 'o-kai')).toBe(false)
+    expect(inboxItems(db, admin(db), FRI, { now: NOW }).some((i) => i.refs.offerId === 'o-kai')).toBe(false)
   })
 
   it('shows an employee only their own tasks', () => {
@@ -298,13 +384,25 @@ describe('inboxItems', () => {
     expect(filterItems(items, 'you').length + filterItems(items, 'them').length).toBe(items.length)
   })
 
+  it('gives the DE 1 its file-by day when the deadline lands on a weekend or holiday', () => {
+    const db = fixture()
+    db.company.firstPayrollOn = '2026-11-13'
+    const on = '2026-11-16'
+    const de1 = inboxItems(db, admin(db), on, { now: `${on}T19:00:00.000Z` }).find((i) => i.refs.ruleId === 'edd-registration')
+    expect(de1).toMatchObject({ dueOn: '2026-11-28', statutory: true, dueNote: 'Due Sat Nov 28, file by Wed Nov 25.' })
+  })
+
   it('leaves the First hire kit rules out of a solo founder inbox', () => {
     const db = blankDB({ companyName: 'Solo', founderFirstName: 'Sam', founderLastName: 'Solo', foundedOn: '2026-09-01' })
     expect(isSoloWorkspace(db, FRI)).toBe(true)
     const items = inboxItems(db, admin(db), FRI, { now: NOW })
     expect(items.some((i) => i.refs.ruleId && KIT_RULE_IDS.includes(i.refs.ruleId))).toBe(false)
     // Rules that apply from the first employee are set-up steps, grouped in one row, never overdue crossings.
-    expect(items.filter((i) => i.kind === 'rules_group')).toHaveLength(1)
+    const group = items.filter((i) => i.kind === 'rules_group')
+    expect(group).toHaveLength(1)
+    // The row counts only the rules it holds, and says the kit has the rest (Compliance lists them all).
+    expect(group[0].title).toMatch(/^\d+ more rules that apply at any size have open steps$/)
+    expect(group[0].detail).toMatch(/^Besides the \d+ in the First hire kit\. /)
     expect(items.some((i) => i.kind === 'rule' && i.group === 'overdue')).toBe(false)
     expect(isSoloWorkspace(fixture(), FRI)).toBe(false)
   })
@@ -518,5 +616,247 @@ describe('timestamps read as the local calendar day', () => {
     db.meta.lastExportedOn = '2026-10-02T03:00:00.000Z'
     const backup = inboxItems(db, admin(db), FRI, { now: NOW }).find((i) => i.kind === 'backup')
     expect(backup?.key).toBe('backup:2026-10-01')
+  })
+})
+
+describe('offers past their expiry', () => {
+  /** An offer for Mia Wong (sent, past its date), Lee Kim (closed as expired) and Ana Ruiz (still open). */
+  function offers(): DB {
+    const db = fixture()
+    const app = (id: string, status: 'active' | 'withdrawn' = 'active') =>
+      db.applications.push({ id: `a-${id}`, candidateId: `c-${id}`, jobId: 'j-1', stageId: 'offer', status, appliedOn: '2026-09-01', stageEnteredOn: '2026-10-01', history: [] })
+    addOffer(db, { id: 'o-mia', startDate: '2026-11-02', status: 'sent', expiresOn: '2026-10-07' }, { firstName: 'Mia', lastName: 'Wong' })
+    addOffer(db, { id: 'o-lee', startDate: '2026-11-02', status: 'expired', expiresOn: '2026-10-06', decidedOn: '2026-10-06' }, { firstName: 'Lee', lastName: 'Kim' })
+    addOffer(db, { id: 'o-gone', startDate: '2026-11-02', status: 'expired', expiresOn: '2026-10-05', decidedOn: '2026-10-05' }, { firstName: 'Gus', lastName: 'Gone' })
+    addOffer(db, { id: 'o-ana', startDate: '2026-11-09', status: 'sent', expiresOn: '2026-10-13' }, { firstName: 'Ana', lastName: 'Ruiz' })
+    app('o-mia')
+    app('o-lee')
+    app('o-gone', 'withdrawn')
+    app('o-ana')
+    return db
+  }
+
+  it('asks you to extend or close out an expired offer, never to send a nudge quoting a passed date', () => {
+    const db = offers()
+    const items = inboxItems(db, admin(db), FRI, { now: NOW })
+    const mia = byKey(items, 'offer-expired:o-mia:2026-10-07')
+    expect(mia).toMatchObject({
+      kind: 'offer_expiring',
+      title: "Mia Wong's offer expired Wed Oct 7",
+      detail: 'Extend it to reopen, or record that they declined.',
+      group: 'overdue',
+      statutory: false,
+      waitingOn: 'you',
+      primary: { kind: 'mutate', label: 'Extend 3 days', op: { type: 'extend_offer', offerId: 'o-mia', businessDays: 3 } },
+      more: [{ kind: 'navigate', label: 'Open offer', href: '#candidate.c-o-mia' }],
+    })
+    // An offer already closed as expired at load gets the same row while its application is open.
+    expect(byKey(items, 'offer-expired:o-lee:2026-10-06')?.title).toBe("Lee Kim's offer expired Tue Oct 6")
+    expect(items.some((i) => i.refs.offerId === 'o-gone')).toBe(false)
+    expect(items.some((i) => (i.refs.offerId === 'o-mia' || i.refs.offerId === 'o-lee') && i.primary.kind === 'copy')).toBe(false)
+    // An offer still open keeps the friendly check-in, waiting on the candidate.
+    expect(byKey(items, 'offer-expiring:o-ana:2026-10-13')).toMatchObject({ title: "Ana Ruiz's offer expires Tue Oct 13", waitingOn: 'them', waitingOnName: 'Ana' })
+  })
+
+  it('extends an expired offer from the row', () => {
+    const db = offers()
+    const next = produce(db, (d) => {
+      expect(applyInboxOp(d, { type: 'extend_offer', offerId: 'o-lee', businessDays: 3 }, { date: FRI, actorId: 'p-founder' }).ok).toBe(true)
+    })
+    const lee = next.offers.find((o) => o.id === 'o-lee')
+    expect(lee?.status).toBe('sent')
+    expect((lee?.expiresOn ?? '') > FRI).toBe(true)
+    expect(inboxItems(next, admin(next), FRI, { now: NOW }).some((i) => i.key.startsWith('offer-expired:o-lee'))).toBe(false)
+  })
+})
+
+describe('the EDD DE 1 clock on an estimate', () => {
+  /** The golden path: an unpaid founder since Jan 1 and a first hire who started Nov 2. */
+  function golden(): DB {
+    const db = makeDB('2026-01-01')
+    addPerson(db, { id: 'p-first', firstName: 'Sam', lastName: 'Rivera', startDate: '2026-11-02' })
+    db.comp.push({ id: 'cr-1', personId: 'p-first', effectiveOn: '2026-11-02', payType: 'salary', salary: 150000, title: 'Engineer', levelId: 'lv-l3', reason: 'hire' })
+    return db
+  }
+  const NOV20 = '2026-11-20'
+
+  it('asks for the first payroll date instead of showing a red legal deadline', () => {
+    const db = golden()
+    const items = inboxItems(db, admin(db), NOV20, { now: '2026-11-20T22:00:00.000Z' })
+    const edd = items.filter((i) => i.refs.ruleId === 'edd-registration')
+    expect(edd).toHaveLength(1)
+    expect(edd[0]).toMatchObject({
+      key: 'rule:edd-registration:estimated',
+      title: 'EDD employer registration (DE 1): add your first payroll date in Settings, Company',
+      chip: 'About Nov 17',
+      group: 'this_week',
+      statutory: false,
+      primary: { kind: 'navigate', label: 'Add the date', href: '#settings.company' },
+    })
+    expect(edd[0].dueOn).toBeUndefined()
+    expect(edd[0].detail).toMatch(/^Due about Tue Nov 17, 15 days after the first payroll\. Estimated from the first paid W-2 start on record: Sam Rivera on Nov 2, 2026\./)
+    expect(edd[0].more?.[0]).toMatchObject({ kind: 'mutate', label: 'Mark step done', op: { type: 'rule_action_done', ruleId: 'edd-registration', actionId: 'register' } })
+    // Nothing about DE 1 counts as an overdue legal deadline (the Tonight header would say so).
+    expect(items.some((i) => i.statutory && i.group === 'overdue' && i.refs.ruleId === 'edd-registration')).toBe(false)
+  })
+
+  it('becomes the legal deadline once the first payroll date is recorded', () => {
+    const db = golden()
+    db.company.firstPayrollOn = '2026-11-13'
+    const items = inboxItems(db, admin(db), '2026-11-30', { now: '2026-11-30T22:00:00.000Z' })
+    expect(byKey(items, 'rule:edd-registration:register')).toMatchObject({ statutory: true, dueOn: '2026-11-28', group: 'overdue' })
+    expect(byKey(items, 'rule:edd-registration:estimated')).toBeUndefined()
+  })
+
+  it('leaves the later step undated once registration is ticked', () => {
+    const db = golden()
+    db.complianceStatus['edd-registration'] = { actionsDone: { register: '2026-11-10' } }
+    const items = inboxItems(db, admin(db), NOV20, { now: '2026-11-20T22:00:00.000Z' })
+    const step = byKey(items, 'rule:edd-registration:save-account')
+    expect(step).toMatchObject({ statutory: false, group: 'this_week' })
+    expect(step?.dueOn).toBeUndefined()
+    expect(byKey(items, 'rule:edd-registration:estimated')).toBeUndefined()
+  })
+
+  it('drops the row once the EDD account number is saved', () => {
+    const db = golden()
+    db.company.eddAccountNumber = '123-4567-8'
+    expect(inboxItems(db, admin(db), NOV20, { now: '2026-11-20T22:00:00.000Z' }).some((i) => i.refs.ruleId === 'edd-registration')).toBe(false)
+  })
+})
+
+describe('file-by days on checklist rows', () => {
+  /** Tomas terminated Fri Oct 9 with his last day Sat Oct 10, and Lee's DE 34 due Sun Nov 8. */
+  function weekendDB(): DB {
+    const db = fixture()
+    const tomas = db.people.find((p) => p.id === 'p-tomas')!
+    tomas.endDate = '2026-10-10'
+    db.checklists.push(
+      generateChecklist(db, { id: 'ck-tomas-off', person: tomas, templateId: 'tpl-offboarding', anchorDate: '2026-10-10', createdOn: FRI, separationType: 'terminated' }),
+    )
+    const lee = db.checklists.find((c) => c.id === 'ck-lee')!
+    lee.tasks.push(task('t-lee-de34', { templateTaskId: 'on-de34', title: 'DE 34 new hire report filed', dueOn: '2026-11-08', statutory: true }))
+    return db
+  }
+
+  it('gives the last-day tasks of a Saturday termination their own date, with no earlier file-by day', () => {
+    const db = weekendDB()
+    const items = inboxItems(db, admin(db), FRI, { now: NOW })
+    const off = items.filter((i) => i.refs.checklistId === 'ck-tomas-off')
+    expect(off.length).toBeGreaterThan(0)
+    expect(off.filter((i) => i.dueOn === '2026-10-10').length).toBeGreaterThan(0)
+    expect(off.filter((i) => /file by/.test(i.dueNote ?? ''))).toEqual([])
+  })
+
+  it('still gives an agency filing due on a Sunday the Friday to file by', () => {
+    const db = weekendDB()
+    const items = inboxItems(db, admin(db), '2026-11-02', { now: '2026-11-02T18:00:00.000Z' })
+    expect(byKey(items, 'task:ck-lee:t-lee-de34')?.dueNote).toBe('Due Sun Nov 8, file by Fri Nov 6.')
+  })
+
+  it('keeps a contract end on its date (not a filing)', () => {
+    const db = fixture()
+    addContractor(db, { id: 'k-sat', name: 'Sat Contract', startOn: '2026-04-01', endOn: '2026-10-17' })
+    const row = inboxItems(db, admin(db), FRI, { now: NOW }).find((i) => i.kind === 'calendar' && i.dueOn === '2026-10-17')
+    expect(row).toBeDefined()
+    expect(row?.dueNote ?? '').not.toMatch(/file by/)
+  })
+})
+
+describe('payroll update rows name the change', () => {
+  const change = (id: string, anchorDate: string, dueOn: string): Checklist => ({
+    id,
+    personId: 'p-tomas',
+    kind: 'change',
+    templateId: 'tpl-change',
+    anchorDate,
+    createdOn: '2026-10-05',
+    tasks: [task(`${id}-pay`, { templateTaskId: 'ch-payroll', title: 'Payroll updated', dueOn })],
+  })
+
+  it('tells two changes for one person apart, without amounts', () => {
+    const db = fixture()
+    db.checklists.push(change('ck-promo', '2026-11-01', '2026-10-19'), change('ck-mgr', '2026-10-19', '2026-10-12'))
+    db.comp.push(
+      { id: 'cr-promo', personId: 'p-tomas', effectiveOn: '2026-11-01', payType: 'salary', salary: 210000, title: 'Staff engineer', levelId: 'lv-l4', reason: 'promotion' },
+      { id: 'cr-mgr', personId: 'p-tomas', effectiveOn: '2026-10-19', payType: 'salary', salary: 180000, title: 'Engineer', levelId: 'lv-l3', managerId: 'p-ana', reason: 'manager_change' },
+    )
+    const items = inboxItems(db, admin(db), FRI, { now: NOW })
+    expect(byKey(items, 'task:ck-promo:ck-promo-pay')?.title).toBe('Update payroll for Tomas Herrera: promotion to L4, effective Nov 1, by Mon Oct 19')
+    expect(byKey(items, 'task:ck-mgr:ck-mgr-pay')?.title).toBe('Update payroll for Tomas Herrera: manager change to Ana Lima, effective Oct 19, by Mon Oct 12')
+    expect(items.filter((i) => /210|180/.test(i.title))).toEqual([])
+  })
+
+  it('falls back to the plain title when no job or pay row matches the date', () => {
+    const db = fixture()
+    db.checklists.push(change('ck-x', '2026-11-01', '2026-10-19'))
+    expect(byKey(inboxItems(db, admin(db), FRI, { now: NOW }), 'task:ck-x:ck-x-pay')?.title).toBe("Update payroll for Tomas Herrera's change by Mon Oct 19")
+  })
+})
+
+describe("rules whose deadlines are each hire's checklist tasks", () => {
+  const NOV30 = '2026-11-30'
+  const AT = { now: '2026-11-30T22:00:00.000Z' }
+  const PER_PERSON = ['new-hire-reporting', 'form-i9', 'sb294-new-hire', 'wage-notice-2810-5']
+
+  /** The golden path: an unpaid founder since Jan 1 and Maria Gonzalez, the first hire, starting Mon Nov 2. */
+  function golden(): DB {
+    const db = makeDB('2026-01-01')
+    const maria = addPerson(db, { id: 'p-maria', firstName: 'Maria', lastName: 'Gonzalez', startDate: '2026-11-02' })
+    db.comp.push({ id: 'cr-1', personId: 'p-maria', effectiveOn: '2026-11-02', payType: 'salary', salary: 150000, title: 'Engineer', levelId: 'lv-l3', reason: 'hire' })
+    db.checklists.push(generateChecklist(db, { id: 'ck-maria', person: maria, templateId: 'tpl-onboarding', anchorDate: '2026-11-02', createdOn: '2026-10-11' }))
+    return db
+  }
+
+  it('shows each overdue legal deadline once, on the task, with the company steps grouped and undated', () => {
+    const db = golden()
+    const items = inboxItems(db, admin(db), NOV30, AT)
+    expect(byKey(items, 'task:ck-maria:t-maria-on-de34')).toMatchObject({
+      title: 'DE 34 for Maria Gonzalez was due Sun Nov 22: confirm your PEO filed it',
+      statutory: true,
+      group: 'overdue',
+      dueNote: 'Due Sun Nov 22, file by Fri Nov 20. 20 days after start.',
+    })
+    expect(byKey(items, 'task:ck-maria:t-maria-on-i9-section1')).toMatchObject({ statutory: true, group: 'overdue' })
+    // No second red row for the DE 34, I-9 or SB 294 rule.
+    expect(items.filter((i) => i.kind === 'rule' && PER_PERSON.includes(i.refs.ruleId ?? ''))).toEqual([])
+    const group = items.find((i) => i.kind === 'rules_group')
+    expect(group?.key.replace(/^rules-baseline:/, '').split(',')).toEqual(expect.arrayContaining(['new-hire-reporting', 'form-i9', 'sb294-new-hire']))
+    expect(group).toMatchObject({ statutory: false, group: 'this_week' })
+  })
+
+  it('lists a lone company step without a date or a red mark', () => {
+    const db = golden()
+    for (const r of RULES) if (r.id !== 'form-i9') db.complianceStatus[r.id] = { status: 'not_applicable', note: 'Out of this test' }
+    const items = inboxItems(db, admin(db), NOV30, AT).filter((i) => i.refs.ruleId === 'form-i9')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ key: 'rule:form-i9:current-edition', kind: 'rule', statutory: false, group: 'this_week' })
+    expect(items[0].dueOn).toBeUndefined()
+    expect(items[0].dueNote).toBeUndefined()
+  })
+
+  it('keeps a deadline recorded on the card as a dated row of its own', () => {
+    const db = golden()
+    db.complianceStatus['new-hire-reporting'] = { dueOn: '2026-12-04', note: 'From the PEO' }
+    const row = byKey(inboxItems(db, admin(db), NOV30, AT), 'rule:new-hire-reporting:confirm-provider')
+    expect(row).toMatchObject({ dueOn: '2026-12-04', statutory: true, group: 'this_week' })
+  })
+})
+
+describe('SB 553 workplace violence prevention plan row', () => {
+  it('says no plan is on file only until the plan step is done, then names the next step', () => {
+    const db = makeDB('2025-01-06')
+    addMany(db, 12, '2025-03-03')
+    db.locations[0].typicalMaxOnSite = 11
+    const row = () => inboxItems(db, admin(db), FRI, { now: NOW }).find((i) => i.refs.ruleId === 'wvpp')
+    expect(row()).toMatchObject({
+      title: '11 people are at the office at once on busy days, so a workplace violence prevention plan applies: none on file',
+      group: 'overdue',
+      statutory: true,
+    })
+    expect(row()?.detail).toMatch(/^Next: Write the plan and name who runs it\. 2 more steps after this\. /)
+    db.complianceStatus.wvpp = { actionsDone: { 'write-plan': '2026-10-01' } }
+    expect(row()).toMatchObject({ key: 'rule:wvpp:train', title: 'Workplace violence prevention plan (SB 553): train everyone, then every year' })
+    expect(row()?.detail).toMatch(/^1 more step after this\. /)
   })
 })

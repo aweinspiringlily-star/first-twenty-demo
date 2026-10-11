@@ -1,7 +1,8 @@
 // Form controls. Native elements throughout (they work with keyboard, screen readers and
 // input-automation tools); every control takes a stable id so labels and autofill stay wired.
-import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react'
-import { useEffect, useId, useState } from 'react'
+import type { InputHTMLAttributes, ReactNode, RefObject, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { isUsableDate } from '@/lib/dates'
 import { usePrefs } from '@/store/prefs'
 import { cx } from './cx'
 import { Icon } from './Icon'
@@ -37,13 +38,15 @@ export function Field({
   const id = idProp ?? `f${auto.replace(/:/g, '')}`
   const hintId = hint || error ? `${id}-hint` : undefined
   const invalid = !!error
-  // Expose required and invalid state on the control itself (screen readers announce them).
+  // Expose required and invalid state on the control itself (screen readers announce them). A
+  // NumberInput outside its min to max range, or a date field holding a date it cannot use
+  // (data-range-error), stays invalid too.
   useEffect(() => {
     const el = document.getElementById(id)
     if (!el || (!/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) && el.getAttribute('role') !== 'radiogroup')) return
     if (required) el.setAttribute('aria-required', 'true')
     else el.removeAttribute('aria-required')
-    if (invalid) el.setAttribute('aria-invalid', 'true')
+    if (invalid || el.hasAttribute('data-range-error')) el.setAttribute('aria-invalid', 'true')
     else el.removeAttribute('aria-invalid')
   })
   return (
@@ -124,7 +127,25 @@ export function Select<V extends string = string>({
 const BLURRED_VALUE = 'ft-input--blurred select-none text-transparent caret-ink [text-shadow:0_0_9px_var(--ink)]'
 const BLUR_TITLE = 'Hidden by privacy blur (press B or the eye button to show)'
 
-/** Number input that stores a number (or null when empty). */
+/**
+ * The message for a number outside min to max ('Enter a number from 1 to 60'), or null when it fits (or
+ * is empty: whether a value is required is the form's call).
+ */
+export function rangeError(value: number | null | undefined, min?: number | string, max?: number | string): string | null {
+  if (value == null || Number.isNaN(value)) return null
+  const lo = min === undefined || min === '' ? undefined : Number(min)
+  const hi = max === undefined || max === '' ? undefined : Number(max)
+  const n = (x: number) => x.toLocaleString('en-US')
+  if ((lo === undefined || value >= lo) && (hi === undefined || value <= hi)) return null
+  if (lo !== undefined && hi !== undefined) return `Enter a number from ${n(lo)} to ${n(hi)}`
+  return lo !== undefined ? `Enter a number of ${n(lo)} or more` : `Enter a number of ${n(hi as number)} or less`
+}
+
+/**
+ * Number input that stores a number (or null when empty). With min or max, a value outside the range is
+ * kept (the form's save check decides) but marked invalid with a message under the box once the field is
+ * left, and the message clears as soon as the value fits.
+ */
 export function NumberInput({
   value,
   onChange,
@@ -135,6 +156,7 @@ export function NumberInput({
   min,
   max,
   sensitive,
+  onBlur,
   ...rest
 }: Omit<InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'prefix'> & {
   value: number | null | undefined
@@ -151,22 +173,51 @@ export function NumberInput({
   const isSensitive =
     sensitive ?? (prefix === '$' || /option|share|of base/i.test(suffix ?? '') || (!suffix && Number(step) >= 500))
   const blurred = blurOn && isSensitive
+  const ref = useRef<HTMLInputElement>(null)
+  const auto = useId()
+  // Shown from the first blur on, then kept in step with the value.
+  const [checked, setChecked] = useState(false)
+  const message = checked ? rangeError(value, min, max) : null
+  const msgId = `${rest.id ?? `n${auto.replace(/:/g, '')}`}-range`
+  // aria-invalid is shared with Field (which sets it for a save error), so it is set by hand: on while out
+  // of range, and off again only when no Field error message is showing.
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    if (message) el.setAttribute('aria-invalid', 'true')
+    else if (!document.getElementById(`${el.id}-hint`)?.classList.contains('ft-field__error')) el.removeAttribute('aria-invalid')
+  }, [message])
+  const describedBy = [rest['aria-describedby'], message ? msgId : null].filter(Boolean).join(' ') || undefined
   return (
-    <div className="relative flex items-center">
-      {prefix && <span className="pointer-events-none absolute left-3 text-[14.5px] text-ink-3">{prefix}</span>}
-      <input
-        type="number"
-        inputMode="decimal"
-        step={step}
-        min={min}
-        max={max}
-        className={cx(INPUT, 'num h-11', prefix && 'pl-7', suffix && 'pr-12', blurred && BLURRED_VALUE, className)}
-        title={blurred ? BLUR_TITLE : rest.title}
-        value={value ?? ''}
-        onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))}
-        {...rest}
-      />
-      {suffix && <span className="pointer-events-none absolute right-3 text-[13.5px] text-ink-3">{suffix}</span>}
+    <div className="flex flex-col gap-1">
+      <div className="relative flex items-center">
+        {prefix && <span className="pointer-events-none absolute left-3 text-[14.5px] text-ink-3">{prefix}</span>}
+        <input
+          ref={ref}
+          type="number"
+          inputMode="decimal"
+          step={step}
+          min={min}
+          max={max}
+          className={cx(INPUT, 'num h-11', prefix && 'pl-7', suffix && 'pr-12', blurred && BLURRED_VALUE, className)}
+          title={blurred ? BLUR_TITLE : rest.title}
+          value={value ?? ''}
+          onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))}
+          onBlur={(e) => {
+            if (min !== undefined || max !== undefined) setChecked(true)
+            onBlur?.(e)
+          }}
+          {...rest}
+          aria-describedby={describedBy}
+          data-range-error={message ? '' : undefined}
+        />
+        {suffix && <span className="pointer-events-none absolute right-3 text-[13.5px] text-ink-3">{suffix}</span>}
+      </div>
+      {message && (
+        <p id={msgId} className="ft-field__error text-[12.5px] font-semibold text-bad">
+          {message}
+        </p>
+      )}
     </div>
   )
 }
@@ -177,6 +228,9 @@ export function MoneyInput({
   onChange,
   className,
   suffix,
+  onFocus,
+  onBlur,
+  onPointerDown,
   ...rest
 }: Omit<InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange'> & {
   value: number | null | undefined
@@ -184,6 +238,8 @@ export function MoneyInput({
   suffix?: string
 }) {
   const [focused, setFocused] = useState(false)
+  // A pointer press just before focus: a click keeps its caret, keyboard focus selects the value.
+  const pressed = useRef(false)
   // Every money field follows the privacy blur, so a prefilled salary never shows while screen sharing.
   const blurred = usePrefs((s) => s.privacyBlur)
   const display = value == null ? '' : focused ? String(value) : value.toLocaleString('en-US')
@@ -196,8 +252,30 @@ export function MoneyInput({
         title={blurred ? BLUR_TITLE : rest.title}
         className={cx(INPUT, 'num h-11 pl-7', suffix && 'pr-14', blurred && BLURRED_VALUE, className)}
         value={display}
-        onFocus={() => setFocused(true)}
-        onBlur={() => setFocused(false)}
+        onPointerDown={(e) => {
+          pressed.current = true
+          onPointerDown?.(e)
+        }}
+        onFocus={(e) => {
+          // Swapping '180,000' for '180000' drops the browser's select-all and leaves the caret at the
+          // end, so typing after Tab would append digits. Keyboard (or script) focus selects the value
+          // again once the new text is in, as every other field does; a click or tap keeps its caret.
+          const el = e.currentTarget
+          const viaPointer = pressed.current
+          pressed.current = false
+          setFocused(true)
+          if (!viaPointer) {
+            requestAnimationFrame(() => {
+              if (document.activeElement === el) el.select()
+            })
+          }
+          onFocus?.(e)
+        }}
+        onBlur={(e) => {
+          pressed.current = false
+          setFocused(false)
+          onBlur?.(e)
+        }}
         onChange={(e) => {
           const digits = e.target.value.replace(/[^\d.]/g, '')
           onChange(digits === '' ? null : Math.round(Number(digits)))
@@ -209,6 +287,33 @@ export function MoneyInput({
   )
 }
 
+/** Said under a date field while it holds a date that cannot be used (a 5- or 6-digit year). */
+const DATE_PROBLEM = 'Enter a date with a 4-digit year'
+
+/**
+ * What a date or date-and-time field shows: the value, or what was typed while it cannot be used (kept in
+ * the field and never passed on). It follows the value whenever that changes. Marks the control invalid
+ * while it holds such a date (aria-invalid is shared with Field, so it is set by hand, as in NumberInput).
+ */
+function useTypedDate(value: string, ref: RefObject<HTMLInputElement | null>) {
+  const [typed, setTyped] = useState<string | null>(null)
+  const [shownValue, setShownValue] = useState(value)
+  if (value !== shownValue) {
+    setShownValue(value)
+    setTyped(null)
+  }
+  // Empty while a date and time is half typed: kept, but not called wrong.
+  const bad = !!typed
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    if (bad) el.setAttribute('aria-invalid', 'true')
+    else if (!document.getElementById(`${el.id}-hint`)?.classList.contains('ft-field__error')) el.removeAttribute('aria-invalid')
+  }, [bad, ref])
+  return { shown: typed ?? value, bad, setTyped }
+}
+
+/** A typed date ('2026-03-16') reaches onChange only when it is usable, or empty (cleared). */
 export function DateInput({
   value,
   onChange,
@@ -218,17 +323,37 @@ export function DateInput({
   value: string | null | undefined
   onChange: (value: string) => void
 }) {
+  const ref = useRef<HTMLInputElement>(null)
+  const auto = useId()
+  const msgId = `${rest.id ?? `d${auto.replace(/:/g, '')}`}-date`
+  const { shown, bad, setTyped } = useTypedDate(value ?? '', ref)
   return (
-    <input
-      type="date"
-      className={cx(INPUT, 'num h-11', className)}
-      value={value ?? ''}
-      onChange={(e) => onChange(e.target.value)}
-      {...rest}
-    />
+    <div className="flex flex-col gap-1">
+      <input
+        ref={ref}
+        type="date"
+        className={cx(INPUT, 'num h-11', className)}
+        value={shown}
+        onChange={(e) => {
+          const v = e.target.value
+          if (v && !isUsableDate(v)) return setTyped(v)
+          setTyped(null)
+          onChange(v)
+        }}
+        {...rest}
+        aria-describedby={[rest['aria-describedby'], bad ? msgId : null].filter(Boolean).join(' ') || undefined}
+        data-range-error={bad ? '' : undefined}
+      />
+      {bad && (
+        <p id={msgId} className="ft-field__error text-[12.5px] font-semibold text-bad">
+          {DATE_PROBLEM}
+        </p>
+      )}
+    </div>
   )
 }
 
+/** A typed date and time reaches onChange (as a full ISO timestamp) only when its date is usable. */
 export function DateTimeInput({
   value,
   onChange,
@@ -239,20 +364,42 @@ export function DateTimeInput({
   value: string | null | undefined
   onChange: (iso: string) => void
 }) {
-  const local = value ? toLocalInput(value) : ''
+  const ref = useRef<HTMLInputElement>(null)
+  const auto = useId()
+  const msgId = `${rest.id ?? `dt${auto.replace(/:/g, '')}`}-date`
+  const { shown, bad, setTyped } = useTypedDate(value ? toLocalInput(value) : '', ref)
   return (
-    <input
-      type="datetime-local"
-      className={cx(INPUT, 'num h-11', className)}
-      value={local}
-      onChange={(e) => e.target.value && onChange(new Date(e.target.value).toISOString())}
-      {...rest}
-    />
+    <div className="flex flex-col gap-1">
+      <input
+        ref={ref}
+        type="datetime-local"
+        className={cx(INPUT, 'num h-11', className)}
+        value={shown}
+        onChange={(e) => {
+          const v = e.target.value
+          if (!v) return setTyped('')
+          // new Date('20266-03-16T10:00') is not a date, and toISOString() would throw on it.
+          const at = new Date(v)
+          if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) || !isUsableDate(v.slice(0, 10)) || Number.isNaN(at.getTime())) return setTyped(v)
+          setTyped(null)
+          onChange(at.toISOString())
+        }}
+        {...rest}
+        aria-describedby={[rest['aria-describedby'], bad ? msgId : null].filter(Boolean).join(' ') || undefined}
+        data-range-error={bad ? '' : undefined}
+      />
+      {bad && (
+        <p id={msgId} className="ft-field__error text-[12.5px] font-semibold text-bad">
+          {DATE_PROBLEM}
+        </p>
+      )}
+    </div>
   )
 }
 
 function toLocalInput(iso: string): string {
   const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }

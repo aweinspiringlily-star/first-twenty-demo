@@ -26,6 +26,7 @@ export const EMERGENCY_CONTACTS_TASK = 'on-emergency-contacts'
 export const ACK_TASK_FOR_POLICY: Record<string, string> = {
   'pl-handbook': 'on-ack-handbook',
   'pl-aup': 'on-ack-security',
+  'pl-confidentiality': 'on-piia',
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -327,6 +328,8 @@ export type BalanceLine = {
   text: string
   /** Hours free to request, when tracked. */
   hours: number | null
+  /** Sick leave before the 90-day wait ends: the hours are granted but usable only from this day. */
+  usableFrom?: ISODate
   note?: string
 }
 
@@ -343,8 +346,8 @@ function lineFor(row: BalanceRow, person: Person, kind: 'vacation' | 'sick'): Ba
       note: 'No balance to track. Agree dates with your manager.',
     }
   }
+  // The wait goes in the main line ("5 days, usable from Dec 6"), not in the notes.
   const notes: string[] = []
-  if (row.usableFrom) notes.push(`Usable from ${fmtDate(row.usableFrom)}`)
   if (row.scheduled > 0) notes.push(`${hoursWithDays(row.scheduled, perDay)} already booked`)
   if (row.pending > 0) notes.push(`${hoursWithDays(row.pending, perDay)} waiting for approval`)
   if (row.capReached) notes.push('At the cap, so earning is paused')
@@ -357,8 +360,16 @@ function lineFor(row: BalanceRow, person: Person, kind: 'vacation' | 'sick'): Ba
     days: daysFromHours(available, perDay),
     text: hoursWithDays(available, perDay),
     hours: row.available,
+    ...(row.usableFrom ? { usableFrom: row.usableFrom } : {}),
     ...(notes.length ? { note: notes.join('. ') + '.' } : {}),
   }
+}
+
+/** "5 days available" or, before the wait ends, "5 days, usable from Dec 6, 2026". */
+export function availabilityText(b: Pick<BalanceLine, 'days' | 'usableFrom'>, amount = b.days): string {
+  const lead = amount ? `${amount}` : ''
+  if (b.usableFrom) return `${lead ? `${lead}, usable` : 'Usable'} from ${fmtDate(b.usableFrom)}`
+  return lead ? `${lead} available` : 'available'
 }
 
 /** Vacation and California sick leave, kept separate (sick leave is never paid out and needs no reason). */
@@ -478,6 +489,10 @@ export function equityHeadline(db: DB, personId: ID, date: ISODate): EquityHeadl
     case 'fully_vested':
       title = 'Fully vested'
       break
+    case 'leaving':
+      // A last day is set and still ahead: vesting stops there.
+      title = s.exit ? `Vesting stops ${fmtDay(s.exit.lastDay)}` : 'Vesting stops on the last day'
+      break
     default:
       title = 'Vested options kept after leaving'
   }
@@ -496,6 +511,18 @@ export function equityHeadline(db: DB, personId: ID, date: ISODate): EquityHeadl
 // ---------------------------------------------------------------------------------------------
 // Pay and band
 // ---------------------------------------------------------------------------------------------
+
+/** The placeholder workspaces started before 2026-10-11 stored as the provider name (it names nobody). */
+const PROVIDER_PLACEHOLDER = 'Your payroll or PEO provider'
+
+/**
+ * The payroll or PEO provider's name for 'pay stubs live with ...' lines, or null when none is set:
+ * Start fresh leaves it empty, and older workspaces stored the placeholder as the name.
+ */
+export function payrollProviderName(db: Pick<DB, 'company'>): string | null {
+  const name = db.company.payrollProvider?.name?.trim()
+  return name && name !== PROVIDER_PLACEHOLDER ? name : null
+}
 
 export type MyPay = {
   record: CompRecord
@@ -562,7 +589,7 @@ export function summaryModel(db: DB, personId: ID, date: ISODate, now: ISODateTi
     manager: person.managerId ? personNameById(db, person.managerId, '') : '',
     location: locationName(db, person.locationId),
     level: levelLabel(db, pay?.record.levelId ?? person.levelId),
-    workEmail: person.workEmail,
+    workEmail: person.workEmail || 'Not set',
     companyName: db.company.name,
     date,
     pay: pay
@@ -603,9 +630,9 @@ function equityLines(m: SummaryModel, hide: boolean): string[] {
   return lines
 }
 
-/** "127.3 hours (15.9 days) available. Usable from Dec 7, 2026." */
+/** "127.3 hours (15.9 days) available." or, before the sick leave wait ends, "40 hours (5 days), usable from Dec 6, 2026." */
 function balanceSentence(b: BalanceLine): string {
-  const main = b.hours == null ? b.text : `${b.text} available`
+  const main = b.hours == null ? b.text : availabilityText(b, b.text)
   return b.note ? `${main}. ${b.note}` : `${main}.`
 }
 

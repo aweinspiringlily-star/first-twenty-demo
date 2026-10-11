@@ -1,6 +1,6 @@
 // One checklist: tasks grouped by phase (Before day 1, Day 1, Week 1, Month 1, Later; or by deadline
-// for offboarding), each with a due date that explains itself, the weekend-aware file-by day, the
-// citation, a legal deadline badge (red only when overdue) and one-tap Done with Undo.
+// for offboarding), each with a due date that explains itself, the weekend-aware file-by day for agency
+// filings, the citation, a legal deadline badge (red only when overdue) and one-tap Done with Undo.
 import { useState } from 'react'
 import type { PageProps } from '@/app/routes'
 import { links } from '@/app/router'
@@ -29,7 +29,7 @@ export function ChecklistPage({ route }: PageProps) {
         icon="search"
         title="No checklist with that link"
         action={
-          <a href={links.people('checklists')} className="font-bold text-accent underline">
+          <a href={links.people('checklists')} className="inline-flex min-h-10 items-center font-bold text-accent underline">
             All checklists
           </a>
         }
@@ -44,7 +44,7 @@ export function ChecklistPage({ route }: PageProps) {
         title="Not part of this view"
         body="Checklists are visible to Admin, the person themself and their manager line."
         action={
-          <a href={links.people()} className="font-bold text-accent underline">
+          <a href={links.people()} className="inline-flex min-h-10 items-center font-bold text-accent underline">
             Back to People
           </a>
         }
@@ -170,8 +170,8 @@ export function ChecklistPage({ route }: PageProps) {
         </div>
       )}
       <p className="mt-4 text-[13px] text-ink-3">
-        Business days skip weekends and company holidays. A legal deadline that lands on a weekend keeps its date and shows the business day before
-        it to file by. Red marks only a legal deadline that has passed.
+        Business days skip weekends and company holidays. A legal deadline keeps its date. An agency filing such as the DE 34 new hire report that is
+        due on a weekend or holiday also shows the business day before it to file by. Red marks only a legal deadline that has passed.
       </p>
       <NotLegalAdvice className="mt-1" />
     </>

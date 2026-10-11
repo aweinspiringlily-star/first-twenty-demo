@@ -1,11 +1,12 @@
 // Turns a checklist template into a person's checklist: decides which tasks apply (headcount,
 // supervisor, FLSA, remote, state, equity, separation type, leave kind) and computes due dates.
-// Business days skip weekends and company holidays. Statutory deadlines keep their real date and
-// get a weekend-aware "file by" label; other computed dates that land on a weekend or holiday move
-// to the next business day. Pure and deterministic: the date is always passed in.
+// Business days skip weekends and company holidays. Statutory deadlines keep their real date, and
+// agency filings among them (DE 34, other states' new hire reports, 83(b)) get a weekend-aware
+// "file by" label; other computed dates that land on a weekend or holiday move to the next business
+// day. Pure and deterministic: the date is always passed in.
 import { format } from 'date-fns'
 import { DEFAULT_CHECKLIST_TEMPLATES, TASK_IDS } from '@/domain/checklists/templates'
-import { headcountOn, isPeopleManager } from '@/domain/people'
+import { daysAway, headcountOn, isPeopleManager } from '@/domain/people'
 import type {
   Checklist,
   ChecklistKind,
@@ -96,13 +97,33 @@ export function fileBy(dueOn: ISODate, holidays: ISODate[] = []): ISODate | null
   return onOrBeforeBusinessDay(addDays(dueOn, -1), holidays)
 }
 
+/**
+ * The "file by" day for a checklist task: only an agency filing (TASK_IDS.agencyFilings: the DE 34,
+ * another state's new hire report, an 83(b) election) due on a weekend or holiday gets one, the business
+ * day before it. Final pay, notices handed over and last-day tasks happen on their date, so they never
+ * get an earlier day; nor does a filing whose day before would come ahead of the checklist itself (its
+ * creation or its anchor, such as a termination recorded that day).
+ */
+export function taskFileBy(
+  task: Pick<ChecklistTask, 'templateTaskId' | 'dueOn'>,
+  checklist: Pick<Checklist, 'createdOn' | 'anchorDate'>,
+  holidays: ISODate[] = [],
+): ISODate | null {
+  if (!(TASK_IDS.agencyFilings as readonly string[]).includes(task.templateTaskId ?? '')) return null
+  const by = fileBy(task.dueOn, holidays)
+  if (!by || by < checklist.createdOn || by < checklist.anchorDate) return null
+  return by
+}
+
 function shortDay(d: ISODate): string {
   return format(parseDate(d), 'EEE MMM d')
 }
 
-/** "due Mon Oct 26" or, on a weekend or holiday, "due Sun Nov 15, file by Fri Nov 13". */
-export function dueLabel(dueOn: ISODate, holidays: ISODate[] = []): string {
-  const by = fileBy(dueOn, holidays)
+/**
+ * "due Mon Oct 26" or, on a weekend or holiday, "due Sun Nov 15, file by Fri Nov 13". A checklist task
+ * passes its own `by` (taskFileBy), which is null for tasks that happen on their date.
+ */
+export function dueLabel(dueOn: ISODate, holidays: ISODate[] = [], by: ISODate | null = fileBy(dueOn, holidays)): string {
   return by ? `due ${shortDay(dueOn)}, file by ${shortDay(by)}` : `due ${shortDay(dueOn)}`
 }
 
@@ -266,8 +287,20 @@ export function election83bDueOn(db: Pick<DB, 'grants'>, personId: ID): ISODate 
 }
 
 /**
+ * Days a rehire was away from the company (between the earlier stint's last day and this start), or
+ * undefined when the person is not linked to an earlier record (rehireOfPersonId). Only the explicit
+ * link counts: a same-name match must never skip a legal filing.
+ */
+export function rehireDaysAway(db: Pick<DB, 'people'>, person: Pick<Person, 'rehireOfPersonId' | 'startDate'>): number | undefined {
+  const prior = person.rehireOfPersonId ? db.people.find((p) => p.id === person.rehireOfPersonId) : undefined
+  return prior?.endDate ? daysAway(prior.endDate, person.startDate) : undefined
+}
+
+/**
  * Overrides known from the data itself. The 83(b) deadline runs from the exercise date, so until an
- * exercise is recorded the task is a reminder with no legal date (not statutory, never red).
+ * exercise is recorded the task is a reminder with no legal date (not statutory, never red). A rehire
+ * back within 60 days needs no DE 34: EDD counts a rehire only after a separation of at least 60
+ * consecutive days (docs/LAW.md a-de34-1).
  */
 function derivedOverrides(db: DB, person: Person): Record<ID, TaskOverride> {
   const out: Record<ID, TaskOverride> = {}
@@ -275,6 +308,13 @@ function derivedOverrides(db: DB, person: Person): Record<ID, TaskOverride> {
   out[TASK_IDS.election83b] = due83b
     ? { dueOn: due83b, dueRuleText: '30 days after early exercise', statutory: true }
     : { dueRuleText: 'Within 30 days of an early exercise', statutory: false }
+  const away = rehireDaysAway(db, person)
+  if (away != null && away < 60) {
+    out[TASK_IDS.de34] = {
+      status: 'not_applicable',
+      note: `Not required: back after ${away} ${away === 1 ? 'day' : 'days'} away. EDD's new hire report covers a rehire only after a separation of at least 60 consecutive days.`,
+    }
+  }
   return out
 }
 
@@ -383,7 +423,7 @@ export type OpenTask = {
   task: ChecklistTask
   personId: ID
   overdue: boolean
-  /** Business day to act by when the due date is a weekend or holiday. */
+  /** Business day to file by when an agency filing is due on a weekend or holiday (taskFileBy). */
   fileBy: ISODate | null
 }
 
@@ -422,7 +462,7 @@ export function openTasks(db: DB, date: ISODate, filter: OpenTaskFilter = {}): O
       if (filter.ownerRole && task.ownerRole !== filter.ownerRole) continue
       if (filter.assigneeId && task.assigneeId !== filter.assigneeId) continue
       if (filter.dueBy && task.dueOn > filter.dueBy) continue
-      out.push({ checklist, task, personId: checklist.personId, overdue: task.dueOn < date, fileBy: fileBy(task.dueOn, holidays) })
+      out.push({ checklist, task, personId: checklist.personId, overdue: task.dueOn < date, fileBy: taskFileBy(task, checklist, holidays) })
     }
   }
   return out.sort((a, b) => a.task.dueOn.localeCompare(b.task.dueOn) || Number(b.task.statutory) - Number(a.task.statutory))

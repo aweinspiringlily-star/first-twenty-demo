@@ -1,4 +1,5 @@
-// Home: hiring pulse (one row per open job). Me: open roles with posted ranges and Refer someone.
+// Home: hiring pulse (one row per open job, plus a filled job with an offer still out). Me: open roles
+// with posted ranges and Refer someone.
 import { useState } from 'react'
 import { links } from '@/app/router'
 import { useViewer } from '@/app/useViewer'
@@ -6,7 +7,7 @@ import { canSeePipeline } from '@/domain/access'
 import { addCandidate } from '@/domain/hiring/candidates'
 import { findDuplicates } from '@/domain/hiring/parse'
 import { daysOpen, miniFunnel, stuckCount } from '@/domain/hiring/pipeline'
-import { candidateName, latestOffer } from '@/domain/hiring/util'
+import { candidateName } from '@/domain/hiring/util'
 import { departmentName, getPerson, locationName, personNameById } from '@/domain/people'
 import type { DB, ID, Job } from '@/domain/types'
 import { today } from '@/lib/dates'
@@ -14,16 +15,20 @@ import { plural } from '@/lib/format'
 import { logActivity, useDB } from '@/store/db'
 import { Badge, Button, EmptyState, Field, focusFirstInvalid, Money, MoneyRange, Sheet, TextArea, TextInput } from '@/ui'
 import { act, DICTATION_HINT } from './common'
-import { looksLikeEmail, offerPulseLine, referralRows, splitName } from './logic'
-import { textIssueError, textIssues } from '../logic'
+import { looksLikeEmail, pulseJobs, pulseOfferLines, referralRows, splitName } from './logic'
+import { NOTE_MAX_CHARS, noteCountText, textIssueError, textIssues } from '../logic'
 import { TextIssueNotes } from '../parts'
 
-/** Home: one row per open job with mini funnel, days open, stuck count, offers out. */
+/**
+ * Home: one row per open job with mini funnel, days open, stuck count, offers out. A filled job stays
+ * while an offer on it is still out (a second offer sent after the first hire filled it), or expired
+ * while that candidate is still active (pulseJobs).
+ */
 export function HiringPulse() {
   const db = useDB((s) => s.db)
   const viewer = useViewer()
   const date = today()
-  const jobs = db.jobs.filter((j) => j.status === 'open' && canSeePipeline(viewer, j)).sort((a, b) => (a.openedOn ?? '').localeCompare(b.openedOn ?? ''))
+  const jobs = pulseJobs(db).filter((j) => canSeePipeline(viewer, j))
   if (jobs.length === 0) {
     return (
       <EmptyState
@@ -49,11 +54,8 @@ function PulseRow({ job, date }: { job: Job; date: string }) {
   const open = daysOpen(job, date)
   const stuck = stuckCount(db, job, date)
   const backfill = job.isBackfill && job.backfillForPersonId ? getPerson(db, job.backfillForPersonId) : undefined
-  const offers = [...new Set(db.offers.filter((o) => o.jobId === job.id).map((o) => o.applicationId))]
-    .map((appId) => latestOffer(db, appId))
-    .filter((o) => !!o)
-    .map((o) => offerPulseLine(o, candidateName(db, o.candidateId), date))
-    .filter((x): x is string => !!x)
+  const offers = pulseOfferLines(db, job.id, date)
+  const filled = job.status === 'filled'
   const label = (s: { kind: string; name: string }) => (s.kind === 'new' ? 'applied' : s.name.toLowerCase())
   const funnelText = funnel.map((s) => `${s.total} ${label(s)}`).join(', ')
   return (
@@ -77,8 +79,14 @@ function PulseRow({ job, date }: { job: Job; date: string }) {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {open != null && <span className="num text-[13px] text-ink-3">{plural(open, 'day')} open</span>}
-          {stuck > 0 ? (
+          {filled ? (
+            <Badge tone="good" icon="check">
+              Filled
+            </Badge>
+          ) : (
+            open != null && <span className="num text-[13px] text-ink-3">{plural(open, 'day')} open</span>
+          )}
+          {filled && stuck === 0 ? null : stuck > 0 ? (
             <a
               href={links.job(job.id, 'sweep')}
               className="-my-2 inline-flex min-h-10 items-center rounded-full"
@@ -188,6 +196,8 @@ function ReferSheet({ jobId, onClose }: { jobId: ID; onClose: () => void }) {
   // nobody should pass on what a friend earns, so both pay and criminal history block the send.
   const whyIssues = textIssues(why, { blockPay: true })
   const whyError = textIssueError(whyIssues)
+  // Saved in the candidate's highlights or a timeline row, so capped like a note.
+  const whyCount = noteCountText(why)
 
   const submit = () => {
     setTried(true)
@@ -263,8 +273,8 @@ function ReferSheet({ jobId, onClose }: { jobId: ID; onClose: () => void }) {
         <Field label="LinkedIn" hint="Optional. A profile link helps the team avoid duplicates.">
           {(id, describedBy) => <TextInput id={id} type="url" inputMode="url" aria-describedby={describedBy} value={linkedin} onChange={(e) => setLinkedin(e.target.value)} placeholder="https://www.linkedin.com/in/" />}
         </Field>
-        <Field label="Why they would be great" hint={DICTATION_HINT} error={whyError}>
-          {(id, describedBy) => <TextArea id={id} rows={4} aria-describedby={describedBy} value={why} onChange={(e) => setWhy(e.target.value)} />}
+        <Field label="Why they would be great" hint={whyCount ? `${DICTATION_HINT} ${whyCount}.` : DICTATION_HINT} error={whyError}>
+          {(id, describedBy) => <TextArea id={id} rows={4} maxLength={NOTE_MAX_CHARS} aria-describedby={describedBy} value={why} onChange={(e) => setWhy(e.target.value)} />}
         </Field>
         <TextIssueNotes issues={whyIssues} />
         <p className="text-[13px] text-ink-3">You will see their stage here, not their interviews or notes. Never share what someone earns now: California bars asking about pay history.</p>

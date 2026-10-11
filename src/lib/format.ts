@@ -21,11 +21,12 @@ export function money2(n: number | null | undefined): string {
   return usd2.format(n)
 }
 
-/** "$185K", "$1.2M" */
+/** "$185K", "$1.2M", "$1.2B" (a mistyped amount still reads as what it is) */
 export function moneyShort(n: number | null | undefined): string {
   if (n == null || Number.isNaN(n)) return ''
   const abs = Math.abs(n)
   const sign = n < 0 ? '-' : ''
+  if (abs >= 1_000_000_000) return `${sign}$${trim(abs / 1_000_000_000, abs >= 10_000_000_000 ? 1 : 2)}B`
   if (abs >= 1_000_000) return `${sign}$${trim(abs / 1_000_000, abs >= 10_000_000 ? 1 : 2)}M`
   if (abs >= 1_000) return `${sign}$${trim(abs / 1_000, abs >= 100_000 ? 0 : 1)}K`
   return `${sign}$${int.format(abs)}`

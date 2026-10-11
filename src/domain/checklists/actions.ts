@@ -13,8 +13,11 @@ import { fmtDate, type ISODate } from '@/lib/dates'
 import { newId } from '@/lib/id'
 import { currentActorId, logActivity } from '@/store/draft'
 
-/** Onboarding tasks that stand for a policy acknowledgement, and the policy each one records. */
-export const ACK_TASK_POLICY: Record<string, ID> = { 'on-ack-handbook': 'pl-handbook', 'on-ack-security': 'pl-aup' }
+/**
+ * Onboarding tasks that stand for a policy acknowledgement, and the policy each one records. The signed
+ * PIIA is the confidential information and invention assignment agreement, so it is tracked once.
+ */
+export const ACK_TASK_POLICY: Record<string, ID> = { 'on-ack-handbook': 'pl-handbook', 'on-ack-security': 'pl-aup', 'on-piia': 'pl-confidentiality' }
 const SECURITY_TRAINING_TASK = 'on-security-training'
 
 /** The training tracker kind a checklist task completes, if any. */
@@ -120,7 +123,9 @@ function syncAck(draft: Draft<DB>, checklist: Draft<Checklist>, task: Draft<Chec
   const policy = draft.policies.find((p) => p.id === ACK_TASK_POLICY[task.templateTaskId ?? ''])
   const norm = (v: string) => v.trim().toLowerCase().replace(/^v/, '').replace(/(\.0+)+$/, '')
   if (!policy || draft.acks.some((a) => a.personId === checklist.personId && a.policyId === policy.id && norm(a.version) === norm(policy.version))) return
-  draft.acks.push({ id: newId('ack'), policyId: policy.id, version: policy.version, personId: checklist.personId, acknowledgedOn: date })
+  // One acknowledgement per person, policy and version, so the id can say which (and the sample stays deterministic).
+  const id = `ack-${checklist.personId}-${policy.id}-${policy.version}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-')
+  draft.acks.push({ id: draft.acks.some((a) => a.id === id) ? newId('ack') : id, policyId: policy.id, version: policy.version, personId: checklist.personId, acknowledgedOn: date })
 }
 
 /**

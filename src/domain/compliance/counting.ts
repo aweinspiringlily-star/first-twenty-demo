@@ -511,7 +511,8 @@ export type Phantom = { person: Person; offer: Offer; kind: 'incoming' | 'if_acc
 
 /**
  * Offers that are not yet people: accepted offers not converted by Hire (solid, 'incoming') and
- * sent or approved offers (hollow, 'if accepted'). Latest version per application; future starts only.
+ * sent or approved offers still open on the date (hollow, 'if accepted'; an offer past its expiry
+ * cannot be accepted). Latest version per application; future starts only.
  */
 export function offerPhantoms(db: DB, date: ISODate): Phantom[] {
   const latest = new Map<ID, Offer>()
@@ -524,7 +525,7 @@ export function offerPhantoms(db: DB, date: ISODate): Phantom[] {
     if (o.startDate <= date) continue
     let kind: Phantom['kind'] | null = null
     if (o.status === 'accepted' && !o.personId && !db.people.some((p) => p.fromApplicationId === o.applicationId)) kind = 'incoming'
-    else if (o.status === 'sent' || o.status === 'approved') kind = 'if_accepted'
+    else if ((o.status === 'sent' || o.status === 'approved') && (!o.expiresOn || o.expiresOn >= date)) kind = 'if_accepted'
     if (!kind) continue
     out.push({ person: personFromOffer(db, o), offer: o, kind })
   }
@@ -605,7 +606,57 @@ export function supervisorSince(db: DB, managerId: ID): ISODate | undefined {
   return best
 }
 
-export type EventHit = { date: ISODate; text: string; personId?: ID; contractorId?: ID }
+export type EventHit = {
+  date: ISODate
+  text: string
+  personId?: ID
+  contractorId?: ID
+  /** The date is an estimate from other data (no first payroll date in Settings), not a recorded fact. */
+  estimated?: boolean
+}
+
+const paid = (r: { payType: 'salary' | 'hourly'; salary?: number; hourlyRate?: number }): boolean =>
+  (r.payType === 'hourly' ? (r.hourlyRate ?? 0) : (r.salary ?? 0)) > 0
+
+/**
+ * When a person's W-2 wages start, for the first payroll estimate. An owner counts only from a pay record
+ * above $0 (a founder often works unpaid at first, and DE 1 is owed only once wages are paid); anyone else
+ * from their start date, since an employee is paid at least minimum wage whatever the pay field says.
+ */
+function wagesFrom(db: DB, p: Person, owners: Set<ID>): ISODate | undefined {
+  if (!owners.has(p.id)) return p.startDate
+  const first = db.comp
+    .filter((r) => r.personId === p.id && paid(r))
+    .map((r) => r.effectiveOn)
+    .sort()[0]
+  if (!first) return undefined
+  return first > p.startDate ? first : p.startDate
+}
+
+/**
+ * Employees on a date who are owed the yearly employee notices (the SB 294 rights notice, the survivors of
+ * violence leave notice): everyone employed then except an owner with no pay recorded by that date, the same
+ * exclusion as the first payroll estimate. A solo founder working unpaid has no one to send them to.
+ */
+export function paidEmployeesOn(db: DB, date: ISODate): Person[] {
+  const owners = ownerIds(db)
+  return employeesOn(db, date).filter((p) => {
+    if (!owners.has(p.id)) return true
+    const from = wagesFrom(db, p, owners)
+    return !!from && from <= date
+  })
+}
+
+/**
+ * The first day someone paidEmployeesOn counts was employed (on or before `through`): when the yearly employee
+ * notices start to apply. A solo founder working unpaid since founding has none until a first hire, or until
+ * their own pay record starts. undefined while there has been no one.
+ */
+export function firstPaidEmployeeOn(db: DB, through?: ISODate): ISODate | undefined {
+  const owners = ownerIds(db)
+  const starts = db.people.map((p) => wagesFrom(db, p, owners)).filter((d): d is ISODate => !!d && (!through || d <= through))
+  return [...new Set(starts)].sort().find((d) => paidEmployeesOn(db, d).length > 0)
+}
 
 function earliest<T>(items: T[], dateOf: (t: T) => ISODate | undefined): { item: T; date: ISODate } | undefined {
   let best: { item: T; date: ISODate } | undefined
@@ -622,14 +673,16 @@ export function eventHit(db: DB, event: ComplianceEvent, date: ISODate): EventHi
     case 'first_payroll': {
       const recorded = db.company.firstPayrollOn
       if (recorded) return { date: recorded, text: `First payroll on ${fmtDate(recorded)} (from Settings).` }
-      const e = earliest(db.people, (p) => p.startDate)
-      return (
-        e && {
-          date: e.date,
-          text: `Estimated from the first W-2 start on record: ${fullName(e.item)} on ${fmtDate(e.date)}. Add the first payroll date in Settings for an exact date.`,
-          personId: e.item.id,
-        }
-      )
+      const owners = ownerIds(db)
+      const e = earliest(db.people, (p) => wagesFrom(db, p, owners))
+      if (!e) return undefined
+      const unpaidOwners = db.people.some((p) => owners.has(p.id) && !wagesFrom(db, p, owners) && p.startDate < e.date)
+      return {
+        date: e.date,
+        text: `Estimated from the first paid W-2 start on record: ${fullName(e.item)} on ${fmtDate(e.date)}.${unpaidOwners ? ' Owners with no pay recorded are left out.' : ''} Add the first payroll date in Settings for an exact date.`,
+        personId: e.item.id,
+        estimated: true,
+      }
     }
     case 'first_non_owner_employee': {
       const owners = ownerIds(db)
@@ -746,7 +799,7 @@ export function eventHit(db: DB, event: ComplianceEvent, date: ISODate): EventHi
 export function eventNotYetText(event: ComplianceEvent, db: DB): string {
   switch (event) {
     case 'first_payroll':
-      return 'No one is on payroll yet.'
+      return db.people.length ? 'No one is paid yet: owners count once pay is recorded, or add the first payroll date in Settings.' : 'No one is on payroll yet.'
     case 'first_non_owner_employee':
       return 'Only owners are on payroll so far.'
     case 'first_contractor':

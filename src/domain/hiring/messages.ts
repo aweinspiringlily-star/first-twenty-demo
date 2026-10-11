@@ -1,11 +1,14 @@
 // Ready-to-send candidate messages: stage-aware rejections (kind or brief, founder signature, a call
-// suggested for final rounds), bulk close-out notes for a filled job (BCC list), and offer nudges.
+// suggested for final rounds), bulk close-out notes for a filled job (BCC list), offer nudges and
+// interview cancellations.
 // They open in the mail app (mailto) or get copied; nothing is sent from the app. Pure functions.
 import { founder, personNameById } from '@/domain/people'
 import type { DB, ID } from '@/domain/types'
+import type { ISODate, ISODateTime } from '@/lib/dates'
 import { fillTemplate, mailtoHref, pickRejectionTemplate, suggestCallForRejection } from '@/lib/email'
 import { stageKind } from './pipeline'
-import { candidateName, fmtDayPlain } from './util'
+import { formatDual } from './scheduling'
+import { candidateName, fmtDayPlain, lowerFirst } from './util'
 
 export type ComposedMessage = { to: string; subject: string; body: string; mailto: string }
 
@@ -47,15 +50,22 @@ export function rejectionMessage(
   }
 }
 
+/** The sender's work email, or '' when none is on file (never a guessed address). */
+export function senderEmail(db: DB, senderId?: ID): string {
+  const p = senderId ? db.people.find((x) => x.id === senderId) : founder(db)
+  return p?.workEmail?.trim() ?? ''
+}
+
 /**
  * Close-out note for everyone still open (or closed but not yet told) on a job: one message with the
- * candidates on BCC.
+ * candidates on BCC. It is addressed to the sender's own work email when one is on file; otherwise the
+ * To line stays empty (BCC only) and `from` is '' so the sheet can ask for the address.
  */
 export function closeOutMessage(
   db: DB,
   jobId: ID,
   opts: { senderId?: ID } = {},
-): { bcc: string[]; applicationIds: ID[]; subject: string; body: string; mailto: string } | null {
+): { bcc: string[]; applicationIds: ID[]; subject: string; body: string; mailto: string; from: string } | null {
   const job = db.jobs.find((j) => j.id === jobId)
   if (!job) return null
   const apps = db.applications.filter(
@@ -75,14 +85,19 @@ export function closeOutMessage(
     fields,
   )
   const bcc = [...emails.keys()]
-  const sender = opts.senderId ? db.people.find((p) => p.id === opts.senderId)?.workEmail : founder(db)?.workEmail
-  return { bcc, applicationIds: apps.map((a) => a.id), subject, body, mailto: mailtoHref(sender ?? '', subject, body, { bcc }) }
+  const from = senderEmail(db, opts.senderId)
+  return { bcc, applicationIds: apps.map((a) => a.id), subject, body, mailto: mailtoHref(from, subject, body, { bcc }), from }
 }
 
-/** A friendly nudge before an offer expires. */
-export function offerNudgeMessage(db: DB, offerId: ID, opts: { senderId?: ID } = {}): ComposedMessage | null {
+/**
+ * A friendly nudge before an offer expires. Pass `date` (today): an offer whose expiry has already
+ * passed, or that is marked expired, gets no nudge, since it would say the offer is open until a date
+ * gone by. Extend it instead.
+ */
+export function offerNudgeMessage(db: DB, offerId: ID, opts: { senderId?: ID; date?: ISODate } = {}): ComposedMessage | null {
   const offer = db.offers.find((o) => o.id === offerId)
   if (!offer) return null
+  if (offer.status === 'expired' || (opts.date && offer.expiresOn < opts.date)) return null
   const cand = db.candidates.find((c) => c.id === offer.candidateId)
   if (!cand) return null
   const template = db.emailTemplates.find((t) => t.kind === 'offer_nudge')
@@ -99,6 +114,38 @@ export function offerNudgeMessage(db: DB, offerId: ID, opts: { senderId?: ID } =
       'Hi {{firstName}},\n\nI wanted to check in on your offer for the {{jobTitle}} role. It is open until {{expiresOn}}. Happy to answer any questions or walk through the details together, including the equity.\n\n{{senderName}}',
     fields,
   )
+  return { to: cand.email, subject, body, mailto: mailtoHref(cand.email, subject, body) }
+}
+
+/**
+ * Note to the candidate that an interview is off: which one and when (Pacific, plus their time zone),
+ * a request to take it off their calendar, and that a new time follows. The subject reads like the
+ * confirmation's ('Cancelled: Intro call with Ledgerlark, Tue, Oct 13'). With `heldAt` (the call already
+ * happened earlier and was logged in its place) it says so instead of promising a new time. Copy or open
+ * in the mail app; nothing is sent from the app.
+ */
+export function interviewCancelMessage(db: DB, interviewId: ID, opts: { senderId?: ID; heldAt?: ISODateTime } = {}): ComposedMessage | null {
+  const interview = db.interviews.find((i) => i.id === interviewId)
+  if (!interview) return null
+  const app = db.applications.find((a) => a.id === interview.applicationId)
+  const cand = app ? db.candidates.find((c) => c.id === app.candidateId) : undefined
+  if (!cand) return null
+  const when = formatDual(interview.startsAt, cand.timezone)
+  const day = formatDual(interview.startsAt).split(',').slice(0, 2).join(',')
+  const subject = `Cancelled: ${interview.name} with ${db.company.name}, ${day}`
+  const body = opts.heldAt
+    ? `Hi ${cand.firstName},
+
+Thanks again for making time for the ${lowerFirst(interview.name)} on ${formatDual(opts.heldAt, cand.timezone)}. Since we already had it, the invite for ${when} is no longer needed, so please take it off your calendar.
+
+${senderName(db, opts.senderId)}`
+    : `Hi ${cand.firstName},
+
+The ${lowerFirst(interview.name)} with ${db.company.name} on ${when} is cancelled, so please take it off your calendar. Sorry for the change.
+
+I will be in touch soon about a new time.
+
+${senderName(db, opts.senderId)}`
   return { to: cand.email, subject, body, mailto: mailtoHref(cand.email, subject, body) }
 }
 

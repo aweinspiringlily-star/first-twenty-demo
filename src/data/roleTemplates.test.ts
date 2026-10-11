@@ -18,8 +18,8 @@ describe('DEFAULT_ROLE_TEMPLATES', () => {
       'Founding account executive',
       'Solutions engineer',
       'Implementation lead',
-      'Customer success manager (CPA preferred)',
-      'Accounting lead (CPA)',
+      'Customer success manager',
+      'Accounting lead',
       'Ops and people generalist',
     ])
     expect(new Set(T.map((t) => t.id)).size).toBe(13)
@@ -80,5 +80,13 @@ describe('DEFAULT_ROLE_TEMPLATES', () => {
       expect(text.includes(String.fromCharCode(0x2014)) || text.includes(String.fromCharCode(0x2013))).toBe(false)
       expect(t.name.charAt(0)).toBe(t.name.charAt(0).toUpperCase())
     }
+  })
+
+  it('keeps posting qualifiers out of the names (they become job, letter and employee titles)', () => {
+    for (const t of T) expect(t.name, t.id).not.toMatch(/\b(CPA|preferred|required)\b/i)
+    const csm = T.find((t) => t.id === 'rt-csm')
+    expect(csm).toMatchObject({ name: 'Customer success manager', hint: 'CPA preferred' })
+    expect(csm?.jdOutline).toContain('CPA license')
+    expect(T.find((t) => t.id === 'rt-accounting-lead')).toMatchObject({ name: 'Accounting lead', hint: 'CPA' })
   })
 })

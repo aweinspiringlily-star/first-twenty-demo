@@ -1,8 +1,13 @@
-// Edit a job (#job.<id>.edit): basics, pay range, stages and SLAs (Recruiter screen optional), panel,
-// interview plan, sponsorship, background check and the credit check (off by default; turning it on
-// needs a Labor Code 1024.5 basis and shows the written-notice rule). Saves in one undoable change.
+// Edit a job (#job.<id>.edit): basics, team, employment type, pay range, stages and SLAs (Recruiter
+// screen optional), panel, interview plan, sponsorship, background check and the credit check (off by
+// default; turning it on needs a Labor Code 1024.5 basis and shows the written-notice rule). Saves in
+// one undoable change, writing only the fields changed here: a change another computer made while the
+// sheet was open survives, and one that touches the same field asks first (EditConflict.tsx). The
+// description is capped and the whole job must fit one sync record. Picking Remote with only an office
+// as the location swaps in the workspace's remote location, as in the New job sheet.
 import { useState } from 'react'
 import { CREDIT_CHECK_BASES, creditCheckNoticeTask, effectiveBand, jobStages, mondayOnOrAfter, setCreditCheckBasis } from '@/domain/hiring'
+import { personNameById } from '@/domain/people'
 import type { Attribute, ID, InterviewStep, Job, JobStage } from '@/domain/types'
 import { addDays, fmtDate, today } from '@/lib/dates'
 import { moneyRange } from '@/lib/format'
@@ -32,12 +37,26 @@ import {
   toast,
 } from '@/ui'
 import { commit } from './actions'
-import { moveStage, stageRemovalBlock, teamOptions, withCustomStage, withRecruiterScreen } from './logic'
-import { NotLegalAdvice } from './parts'
+import { EditConflictCallout, focusEditConflict, useEditConflicts } from './EditConflict'
+import {
+  JOB_DESC_MAX_CHARS,
+  jobDescCountText,
+  jobSizeError,
+  moveStage,
+  officeOnly,
+  payTooHighError,
+  remoteLocationsFor,
+  stageRemovalBlock,
+  teamOptions,
+  withCustomStage,
+  withRecruiterScreen,
+} from './logic'
+import { EMPLOYMENT_OPTIONS, NotLegalAdvice } from './parts'
 
 type Draft = Pick<
   Job,
   | 'title'
+  | 'departmentId'
   | 'hiringManagerId'
   | 'panelIds'
   | 'locationIds'
@@ -56,6 +75,7 @@ type Draft = Pick<
 function toDraft(job: Job): Draft {
   return {
     title: job.title,
+    departmentId: job.departmentId,
     hiringManagerId: job.hiringManagerId,
     panelIds: [...job.panelIds],
     locationIds: [...job.locationIds],
@@ -80,29 +100,89 @@ export function JobEditSheet({ job, open, onClose }: { job: Job; open: boolean; 
   return <JobEditInner key={job.id} job={job} onClose={onClose} />
 }
 
-function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
+/** How a conflicting field reads in the 'changed on another computer' callout. */
+const FIELD_WORDS: Record<keyof Draft, string> = {
+  title: 'the title',
+  departmentId: 'the team',
+  hiringManagerId: 'the hiring manager',
+  panelIds: 'the interview panel',
+  locationIds: 'the locations',
+  workMode: 'the work mode',
+  employmentType: 'the employment type',
+  payMin: 'the pay range',
+  payMax: 'the pay range',
+  stages: 'the stages',
+  interviewPlan: 'the interview plan',
+  sponsorship: 'visa sponsorship',
+  backgroundCheck: 'the background check',
+  description: 'the job description',
+  priority: 'the priority',
+  targetStart: 'the target start',
+  creditOn: 'the credit check',
+  creditBasis: 'the credit check',
+}
+
+function JobEditInner({ job: opened, onClose }: { job: Job; onClose: () => void }) {
   const db = useDB((s) => s.db)
-  const [d, setD] = useState<Draft>(() => toDraft(job))
+  // The job as stored now (a pull may bring in another computer's change while the sheet is open).
+  const job = db.jobs.find((x) => x.id === opened.id) ?? opened
+  const current = toDraft(job)
+  const edit = useEditConflicts(current)
+  const [d, setD] = useState<Draft>(() => edit.base)
   const [newAttr, setNewAttr] = useState<Record<string, string>>({})
   const [tried, setTried] = useState(false)
+  // The remote location picked when Work mode became Remote (said under Locations).
+  const [swappedTo, setSwappedTo] = useState<string | null>(null)
   const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setD((x) => ({ ...x, [k]: v }))
+  const setWorkMode = (mode: Job['workMode']) => {
+    const remote = mode === 'remote' ? remoteLocationsFor(db.locations, d.locationIds) : undefined
+    setD((x) => ({ ...x, workMode: mode, ...(remote ? { locationIds: remote } : {}) }))
+    setSwappedTo(remote ? remote.map((id) => db.locations.find((l) => l.id === id)?.name ?? '').join(', ') : null)
+  }
   const t = today()
   const team = teamOptions(db, t)
   const band = effectiveBand(db, job.familyId, job.levelId)
+  const minHigh = payTooHighError(d.payMin, 'annual')
+  const maxHigh = payTooHighError(d.payMax, 'annual')
   const errors: string[] = []
   if (!d.title.trim()) errors.push('Add a title.')
   if (!d.hiringManagerId) errors.push('Pick a hiring manager.')
+  if (minHigh || maxHigh) errors.push('A pay range amount looks too high. Check the number.')
   if (d.payMin != null && d.payMax != null && d.payMin > d.payMax) errors.push('The pay range minimum is above the maximum.')
   if (d.creditOn && !d.creditBasis) errors.push('Pick a Labor Code 1024.5 basis or turn the credit check off.')
   if (d.stages.some((s) => !s.name.trim())) errors.push('Every stage needs a name.')
+  // The job as it would be stored: the description cap applies once it is edited, the sync record size always.
+  const { creditOn: _creditOn, creditBasis: _creditBasis, targetStart: _targetStart, ...stored } = d
+  const sizeError = jobSizeError({ ...job, ...stored }, { descriptionChanged: d.description !== edit.base.description })
+  if (sizeError) errors.push(sizeError)
+  const descCount = jobDescCountText(d.description)
   const noRange = d.payMin == null || d.payMax == null
+  const remoteOnOffice = d.workMode === 'remote' && officeOnly(db.locations, d.locationIds)
+  const locationNote =
+    swappedTo && !remoteOnOffice
+      ? `Picked ${swappedTo} for a remote job. Add an office back if people also work there.`
+      : !remoteOnOffice
+        ? null
+        : db.locations.some((l) => l.kind === 'remote')
+          ? 'The posting and the offer letter use these locations. Pick a remote one unless people report to the office.'
+          : 'The posting and the offer letter use these locations, so a remote job would quote the office. Add a remote location in Settings > Org.'
   // Shown on the fields after a failed save, so focusFirstInvalid() lands on the first one to fix.
   const err = {
     title: tried && !d.title.trim() ? 'Add a title.' : undefined,
     hm: tried && !d.hiringManagerId ? 'Pick a hiring manager.' : undefined,
-    range: tried && d.payMin != null && d.payMax != null && d.payMin > d.payMax ? 'The minimum is above the maximum.' : undefined,
+    min: tried ? minHigh : undefined,
+    range: tried ? (maxHigh ?? (d.payMin != null && d.payMax != null && d.payMin > d.payMax ? 'The minimum is above the maximum.' : undefined)) : undefined,
     credit: tried && d.creditOn && !d.creditBasis,
+    desc: tried ? sizeError : undefined,
   }
+  const conflicts = edit.conflicts(d)
+  const conflictLines = [
+    ...new Set(
+      conflicts.map((k) =>
+        k === 'title' ? `the title is now "${current.title}"` : k === 'hiringManagerId' ? `the hiring manager is now ${personNameById(db, current.hiringManagerId)}` : `${FIELD_WORDS[k]} changed`,
+      ),
+    ),
+  ]
 
   const save = () => {
     if (errors.length) {
@@ -111,27 +191,32 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
       focusFirstInvalid()
       return
     }
+    if (conflicts.length) {
+      toast({ text: 'This job changed on another computer. Pick Use theirs or Keep mine first.', tone: 'neutral' })
+      focusEditConflict()
+      return
+    }
+    const changed = edit.changed(d)
+    if (changed.length === 0) {
+      toast({ text: 'No changes to save.', tone: 'neutral' })
+      onClose()
+      return
+    }
     const basis = d.creditOn ? d.creditBasis : null
     const ok = commit(`Updated the ${d.title.trim()} job`, (draft) => {
       const j = draft.jobs.find((x) => x.id === job.id)
       if (!j) return false
-      j.title = d.title.trim()
-      j.hiringManagerId = d.hiringManagerId
-      j.panelIds = d.panelIds
-      j.locationIds = d.locationIds
-      j.workMode = d.workMode
-      j.employmentType = d.employmentType
-      j.payMin = d.payMin
-      j.payMax = d.payMax
-      j.stages = d.stages.map((s) => ({ ...s, name: s.name.trim() }))
-      j.interviewPlan = d.interviewPlan
-      j.sponsorship = d.sponsorship
-      j.backgroundCheck = d.backgroundCheck
-      j.description = d.description
-      j.priority = d.priority
-      if (d.targetStart) j.targetStart = d.targetStart
-      else delete j.targetStart
-      if ((j.creditCheckBasis ?? null) !== basis) {
+      // Only the fields changed in this sheet: anything else keeps what is stored now.
+      const target = j as unknown as Record<string, unknown>
+      for (const k of changed) {
+        if (k === 'title') j.title = d.title.trim()
+        else if (k === 'stages') j.stages = d.stages.map((s) => ({ ...s, name: s.name.trim() }))
+        else if (k === 'targetStart') {
+          if (d.targetStart) j.targetStart = d.targetStart
+          else delete j.targetStart
+        } else if (k !== 'creditOn' && k !== 'creditBasis') target[k] = d[k]
+      }
+      if ((changed.includes('creditOn') || changed.includes('creditBasis')) && (j.creditCheckBasis ?? null) !== basis) {
         const r = setCreditCheckBasis(draft, job.id, basis, { date: t })
         if (!r.ok) return false
       }
@@ -188,6 +273,12 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
       }
     >
       <div className="flex flex-col gap-6">
+        <EditConflictCallout
+          what="job"
+          lines={conflictLines}
+          onTheirs={() => edit.takeTheirs(conflicts, setD)}
+          onMine={() => edit.keepMine(conflicts)}
+        />
         <section className="flex flex-col gap-4">
           <SectionLabel>Basics</SectionLabel>
           <Field label="Title" required id="je-title" error={err.title}>
@@ -197,6 +288,15 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
             <Field label="Hiring manager" id="je-hm" error={err.hm}>
               {(id, hint) => <Select id={id} aria-describedby={hint} value={d.hiringManagerId} onChange={(v) => set('hiringManagerId', v)} options={team} placeholder={d.hiringManagerId ? undefined : 'Pick a hiring manager'} />}
             </Field>
+            <Field label="Team" id="je-team" hint="Hires from this job join this team.">
+              {(id, hint) => <Select id={id} aria-describedby={hint} value={d.departmentId} onChange={(v) => set('departmentId', v)} options={db.departments.map((x) => ({ value: x.id, label: x.name }))} />}
+            </Field>
+          </FormGrid>
+          <FormGrid>
+            <div>
+              <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Employment</p>
+              <ChipGroup label="Employment" value={d.employmentType} onChange={(v) => set('employmentType', v)} options={EMPLOYMENT_OPTIONS} />
+            </div>
             <div>
               <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Priority</p>
               <Segmented label="Priority" value={d.priority} onChange={(v) => set('priority', v)} options={[{ value: 'normal', label: 'Normal' }, { value: 'high', label: 'High' }]} />
@@ -207,7 +307,7 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
             <Segmented
               label="Work mode"
               value={d.workMode}
-              onChange={(v) => set('workMode', v)}
+              onChange={setWorkMode}
               options={[
                 { value: 'onsite', label: 'On site' },
                 { value: 'hybrid', label: 'Hybrid' },
@@ -217,7 +317,18 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
           </div>
           <div>
             <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Locations</p>
-            <ChipMulti label="Locations" values={d.locationIds} onChange={(v) => set('locationIds', v)} options={db.locations.map((l) => ({ value: l.id, label: l.name }))} />
+            <ChipMulti
+              label="Locations"
+              values={d.locationIds}
+              onChange={(v) => {
+                set('locationIds', v)
+                setSwappedTo(null)
+              }}
+              options={db.locations.map((l) => ({ value: l.id, label: l.name }))}
+            />
+            <div aria-live="polite">
+              {locationNote && <p className="mt-1.5 text-[12.5px] text-ink-3">{locationNote}</p>}
+            </div>
           </div>
           <div>
             <p className="mb-1.5 text-[13.5px] font-semibold text-ink-2">Target start</p>
@@ -238,8 +349,8 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
         <section className="flex flex-col gap-3">
           <SectionLabel>Pay range</SectionLabel>
           <FormGrid>
-            <Field label="Minimum base" id="je-min">
-              {(id) => <MoneyInput id={id} value={d.payMin} onChange={(v) => set('payMin', v)} />}
+            <Field label="Minimum base" id="je-min" error={err.min}>
+              {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={d.payMin} onChange={(v) => set('payMin', v)} />}
             </Field>
             <Field label="Maximum base" id="je-max" error={err.range}>
               {(id, hint) => <MoneyInput id={id} aria-describedby={hint} value={d.payMax} onChange={(v) => set('payMax', v)} />}
@@ -459,8 +570,15 @@ function JobEditInner({ job, onClose }: { job: Job; onClose: () => void }) {
 
         <section className="flex flex-col gap-3">
           <SectionLabel>Description</SectionLabel>
-          <Field label="Job description" hint="Pay range, benefits, the no-salary-history line, Fair Chance and EEO statements are added to the posting for you." id="je-desc">
-            {(id, hint) => <TextArea id={id} aria-describedby={hint} rows={10} value={d.description} onChange={(e) => set('description', e.target.value)} />}
+          <Field
+            label="Job description"
+            hint={`Pay range, benefits, the no-salary-history line, Fair Chance and EEO statements are added to the posting for you.${descCount ? ` ${descCount}.` : ''}`}
+            error={err.desc}
+            id="je-desc"
+          >
+            {(id, hint) => (
+              <TextArea id={id} aria-describedby={hint} rows={10} maxLength={JOB_DESC_MAX_CHARS} value={d.description} onChange={(e) => set('description', e.target.value)} />
+            )}
           </Field>
           {job.postedOn && <p className="text-[12.5px] text-ink-3">Posted {fmtDate(job.postedOn)}.</p>}
         </section>

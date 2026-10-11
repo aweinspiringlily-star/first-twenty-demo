@@ -2,7 +2,7 @@
 // mini funnel, a media-query hook, the 'Not legal advice' line and the free-text guardrail notes.
 import { useEffect, useState } from 'react'
 import type { FunnelStep, SlaDetail } from '@/domain/hiring'
-import type { Application, Candidate, Job, SourceKind } from '@/domain/types'
+import type { Application, Candidate, EmploymentType, Job, SourceKind } from '@/domain/types'
 import { Badge, Callout, CitationChip, cx, Icon, type IconName, Kbd, type Tone } from '@/ui'
 import { slaBadge, type TextIssue } from './logic'
 
@@ -37,6 +37,13 @@ export function TextIssueNotes({ issues, className }: { issues: TextIssue[]; cla
     </div>
   )
 }
+
+/** Employment type chips (job sheets and the offer builder); a ChipGroup gives them one Tab stop and arrows. */
+export const EMPLOYMENT_OPTIONS: Array<{ value: EmploymentType; label: string }> = [
+  { value: 'full_time', label: 'Full time' },
+  { value: 'part_time', label: 'Part time' },
+  { value: 'intern', label: 'Intern' },
+]
 
 export const JOB_STATUS: Record<Job['status'], { label: string; tone: Tone; icon: IconName }> = {
   open: { label: 'Open', tone: 'good', icon: 'check' },

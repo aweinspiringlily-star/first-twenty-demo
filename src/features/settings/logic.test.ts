@@ -1,32 +1,50 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
+import { DOC_KEYS, RECORD_COLLECTIONS } from '@/sync/collections'
 import type { DB } from '@/domain/types'
 import { setClockOverride } from '@/lib/dates'
 import {
-  backupFileName,
   buildFreshDB,
+  changedKeys,
+  charCountText,
+  COLLECTION_LABELS,
+  conflictValueText,
   dataWeDontKeep,
   describeCondition,
   diffDB,
   exemptFloorFrom,
+  exemptRecheck,
+  exemptRecheckText,
   fmtBytes,
   healthPlanChoice,
   healthPlanProblem,
+  hintWithCount,
   hostLabel,
   isCustomTask,
+  linkProblem,
   localMinWage,
   longestWorkday,
   maskDigits,
+  mergeIncoming,
   moveItem,
+  normalizeWebsite,
   packFileName,
   parseBackup,
+  payrollProviderName,
   setHealthPlan,
+  resolveConflicts,
   reviewedDate,
   sickLeaveMinimums,
   sickPolicyProblem,
+  SHORT_TEXT_MAX_CHARS,
+  STORAGE_DOC_LABELS,
+  storageLabel,
   storageUsage,
+  suggestedWorkEmail,
+  TEXT_MAX_CHARS,
   urlProblem,
   usageOf,
+  workEmailProblem,
 } from './logic'
 
 const TODAY = '2026-10-09'
@@ -121,6 +139,37 @@ describe('storage', () => {
   })
 })
 
+describe('storage labels (r3-11: raw keys such as timeOffPolicies showed)', () => {
+  it('names every collection and document in plain words', () => {
+    for (const key of RECORD_COLLECTIONS) expect(COLLECTION_LABELS[key], key).toBeTruthy()
+    for (const key of DOC_KEYS) expect(STORAGE_DOC_LABELS[key], key).toBeTruthy()
+    for (const key of [...RECORD_COLLECTIONS, ...DOC_KEYS]) {
+      const label = storageLabel(key)
+      // Lower case words, never a camelCase key.
+      expect(label, key).not.toMatch(/[a-z][A-Z]/)
+      expect(label.charAt(0), key).toBe(label.charAt(0).toLowerCase())
+    }
+    expect(storageLabel('timeOffPolicies')).toBe('time off policies')
+    expect(storageLabel('bands')).toBe('pay bands')
+    expect(storageLabel('checklistTemplates')).toBe('checklist templates')
+    expect(storageLabel('settings')).toBe('hiring settings and rules')
+  })
+})
+
+describe('free text caps (r3-17)', () => {
+  it('counts characters only near the limit', () => {
+    expect(TEXT_MAX_CHARS).toBe(20_000)
+    expect(charCountText('x'.repeat(17_999), TEXT_MAX_CHARS)).toBeNull()
+    expect(charCountText('x'.repeat(18_250), TEXT_MAX_CHARS)).toBe('18,250 of 20,000 characters')
+    expect(charCountText(undefined, SHORT_TEXT_MAX_CHARS)).toBeNull()
+    expect(charCountText('x'.repeat(1_850), SHORT_TEXT_MAX_CHARS)).toBe('1,850 of 2,000 characters')
+  })
+  it('adds the count to a hint, keeping the hint', () => {
+    expect(hintWithCount('One plain sentence.', 'Short', SHORT_TEXT_MAX_CHARS)).toBe('One plain sentence.')
+    expect(hintWithCount('One plain sentence.', 'x'.repeat(2_000), SHORT_TEXT_MAX_CHARS)).toBe('One plain sentence. 2,000 of 2,000 characters.')
+  })
+})
+
 describe('start fresh', () => {
   it('builds a one-person company with the founder as employee #1', () => {
     const db = buildFreshDB({
@@ -158,6 +207,42 @@ describe('start fresh', () => {
     expect(hq.name).toBe('San Francisco HQ')
     expect(db.company.hq.street).toBe('1 Market St')
     expect(db.people[0].title).toBe('Founder and CEO')
+  })
+  it('never makes up the founder email, and keeps the email and website they enter', () => {
+    const input = {
+      companyName: 'Ledgerline AI',
+      hqCity: 'San Jose',
+      hqState: 'CA',
+      hqZip: '95113',
+      firstName: 'Dana',
+      lastName: 'Lee',
+      title: 'Founder and CEO',
+      startDate: TODAY,
+    }
+    const blank = buildFreshDB(input)
+    expect(blank.people[0].workEmail).toBe('')
+    expect(blank.company.website).toBeUndefined()
+    expect(buildFreshDB({ ...input, workEmail: '   ' }).people[0].workEmail).toBe('')
+    const filled = buildFreshDB({ ...input, workEmail: ' dana@ledgerline.ai ', website: 'ledgerline.ai' })
+    expect(filled.people[0].workEmail).toBe('dana@ledgerline.ai')
+    expect(filled.company.website).toBe('https://ledgerline.ai')
+    // Programmatic callers (the sample and test kits) still get blankDB's address.
+    expect(base().people[0].workEmail).toBe('ada@acme.com')
+  })
+  it('checks the optional email and website on Start fresh', () => {
+    expect(workEmailProblem('')).toBeNull()
+    expect(workEmailProblem(undefined)).toBeNull()
+    expect(workEmailProblem('dana@ledgerline.ai')).toBeNull()
+    expect(workEmailProblem('dana@')).toBe('Enter an email like name@example.com, or leave it blank.')
+    expect(normalizeWebsite('  ')).toBe('')
+    expect(normalizeWebsite('ledgerline.ai')).toBe('https://ledgerline.ai')
+    expect(normalizeWebsite('http://ledgerline.ai/')).toBe('http://ledgerline.ai/')
+    expect(urlProblem(normalizeWebsite('ledgerline'))).toMatch(/domain/)
+    expect(suggestedWorkEmail('Dana', 'https://www.ledgerline.ai')).toBe('dana@ledgerline.ai')
+    expect(suggestedWorkEmail('Mary Jo', 'ledgerline.ai')).toBe('maryjo@ledgerline.ai')
+    expect(suggestedWorkEmail('', 'ledgerline.ai')).toBeNull()
+    expect(suggestedWorkEmail('Dana', '')).toBeNull()
+    expect(suggestedWorkEmail('Dana', 'ledgerline')).toBeNull()
   })
   it('finds local minimum wages by date', () => {
     expect(localMinWage('san jose')).toBe(18.45)
@@ -199,9 +284,7 @@ describe('labels and small helpers', () => {
     expect(reviewedDate(law, 'caMinWageHourly')).toBe(law.lastReviewedOn)
     expect(reviewedDate({ ...law, reviewedOn: { caMinWageHourly: '2027-01-04' } }, 'caMinWageHourly')).toBe('2027-01-04')
   })
-  it('names backup files and custom tasks', () => {
-    expect(backupFileName('Ledgerlark, Inc.', TODAY)).toBe('ledgerlark-inc-backup-2026-10-09.json')
-    expect(backupFileName('', TODAY)).toBe('first-twenty-backup-2026-10-09.json')
+  it('names custom tasks (backup file names: src/store/backup.test.ts)', () => {
     expect(isCustomTask('custom-t-123')).toBe(true)
     expect(isCustomTask('on-piia')).toBe(false)
   })
@@ -238,6 +321,34 @@ describe('dataWeDontKeep', () => {
     ])
     expect(rows[0].systemOfRecord).toBe('Acme PEO (PEO)')
     expect(rows[6].systemOfRecord).toContain('checks.example.com')
+  })
+
+  it('says "your payroll or PEO provider" while the provider has no name, or the old placeholder', () => {
+    const db = base()
+    db.company.payrollProvider = { name: '', kind: 'PEO', url: '' }
+    expect(dataWeDontKeep(db)[0].systemOfRecord).toBe('your payroll or PEO provider')
+    db.company.payrollProvider.name = 'Your payroll or PEO provider'
+    expect(dataWeDontKeep(db)[0].systemOfRecord).toBe('your payroll or PEO provider')
+  })
+})
+
+describe('link-outs (r2-41: a link without https:// was refused, the provider name held placeholder text)', () => {
+  it('checks a link as it will be saved, with https:// added when it was left off', () => {
+    expect(linkProblem('secure.justworks.com')).toBeNull()
+    expect(normalizeWebsite('secure.justworks.com')).toBe('https://secure.justworks.com')
+    expect(linkProblem('https://secure.justworks.com/login')).toBeNull()
+    expect(linkProblem('')).toBeNull()
+    expect(linkProblem('justworks')).toMatch(/domain/)
+  })
+
+  it('starts a new workspace with no provider name, and reads the old placeholder as none', () => {
+    const db = base()
+    expect(db.company.payrollProvider.name).toBe('')
+    expect(payrollProviderName(db.company)).toBe('')
+    db.company.payrollProvider.name = 'Your payroll or PEO provider'
+    expect(payrollProviderName(db.company)).toBe('')
+    db.company.payrollProvider.name = '  Justworks  '
+    expect(payrollProviderName(db.company)).toBe('Justworks')
   })
 })
 
@@ -289,6 +400,98 @@ describe('packFileName', () => {
   it('names a graduation CSV after the company, pack and date', () => {
     expect(packFileName('Ledgerlark, Inc.', 'people', '2026-10-10')).toBe('ledgerlark-inc-people-2026-10-10.csv')
     expect(packFileName('  ', 'equity-grants', '2026-10-10')).toBe('first-twenty-equity-grants-2026-10-10.csv')
+  })
+})
+
+describe('exempt recheck', () => {
+  const comp = (personId: string, salary: number) => ({
+    id: `cr-${personId}`,
+    personId,
+    effectiveOn: '2026-01-05',
+    payType: 'salary' as const,
+    salary,
+    title: 'Engineer',
+    levelId: 'lv-l3',
+    reason: 'hire' as const,
+  })
+  it('counts only exempt people with a salary on file and names the rest', () => {
+    const db = base()
+    // A fresh company: the founder is exempt with no job and pay record.
+    const solo = exemptRecheck(db, TODAY)
+    expect(solo).toEqual({ withSalary: [], noSalary: [{ personId: 'p-founder', name: 'Ada Lovelace', founder: true }] })
+    expect(exemptRecheckText(solo, 70_304)).toBe('No exempt salaries on file yet.')
+    db.comp.push(comp('p-founder', 150_000))
+    const one = exemptRecheck(db, TODAY)
+    expect(one.noSalary).toEqual([])
+    expect(exemptRecheckText(one, 70_304)).toBe("Ada Lovelace's salary clears the $70,304 floor and the computer professional minimum where it applies.")
+    db.people.push(
+      { ...db.people[0], id: 'p-b', firstName: 'Bo', isFounder: false, hireNumber: 2 },
+      { ...db.people[0], id: 'p-c', firstName: 'Cy', isFounder: false, hireNumber: 3 },
+      { ...db.people[0], id: 'p-hourly', firstName: 'Hal', flsa: 'non_exempt', isFounder: false, hireNumber: 4 },
+      { ...db.people[0], id: 'p-gone', firstName: 'Gil', endDate: '2026-06-30', isFounder: false, hireNumber: 5 },
+    )
+    db.comp.push(comp('p-b', 180_000), comp('p-gone', 180_000))
+    const many = exemptRecheck(db, TODAY)
+    expect(many.withSalary.map((p) => p.personId)).toEqual(['p-founder', 'p-b'])
+    expect(many.noSalary).toEqual([{ personId: 'p-c', name: 'Cy Lovelace', founder: false }])
+    expect(exemptRecheckText(many, 70_304)).toBe('All 2 exempt salaries clear the $70,304 floor and the computer professional minimum where it applies.')
+  })
+})
+
+describe('edit forms and saves from another computer', () => {
+  type Cash = { cashOnHand: number | null; cashAsOf: string; otherMonthlySpend: number | null }
+  const opened: Cash = { cashOnHand: 1_000_000, cashAsOf: '2026-10-01', otherMonthlySpend: 50_000 }
+
+  it('lists the fields the user changed', () => {
+    expect(changedKeys(opened, { ...opened })).toEqual([])
+    expect(changedKeys(opened, { ...opened, otherMonthlySpend: 60_000 })).toEqual(['otherMonthlySpend'])
+    expect(changedKeys({ a: [1, 2] }, { a: [1, 2] })).toEqual([])
+  })
+
+  it('takes in untouched fields saved elsewhere and flags the ones both changed', () => {
+    const draft = { ...opened, otherMonthlySpend: 60_000 }
+    // Nothing saved elsewhere: the same objects come back.
+    const quiet = mergeIncoming(opened, draft, { ...opened })
+    expect(quiet.opened).toBe(opened)
+    expect(quiet.draft).toBe(draft)
+    expect(quiet.conflicts).toEqual([])
+    // Cash on hand was updated on another computer; the user only changed spend.
+    const theirs = { ...opened, cashOnHand: 900_000, cashAsOf: '2026-10-09' }
+    const m = mergeIncoming(opened, draft, theirs)
+    expect(m.draft).toEqual({ cashOnHand: 900_000, cashAsOf: '2026-10-09', otherMonthlySpend: 60_000 })
+    expect(m.conflicts).toEqual([])
+    // So Save writes only spend, and the newer cash figure stays.
+    expect(changedKeys(m.opened, m.draft)).toEqual(['otherMonthlySpend'])
+    // Both changed spend: a conflict until one side is chosen.
+    const clash = mergeIncoming(opened, draft, { ...opened, otherMonthlySpend: 55_000 })
+    expect(clash.conflicts).toEqual(['otherMonthlySpend'])
+    const useTheirs = resolveConflicts(clash, { ...opened, otherMonthlySpend: 55_000 }, clash.conflicts, 'theirs')
+    expect(useTheirs.draft.otherMonthlySpend).toBe(55_000)
+    expect(changedKeys(useTheirs.opened, useTheirs.draft)).toEqual([])
+    const keepMine = resolveConflicts(clash, { ...opened, otherMonthlySpend: 55_000 }, clash.conflicts, 'mine')
+    expect(keepMine.draft.otherMonthlySpend).toBe(60_000)
+    expect(mergeIncoming(keepMine.opened, keepMine.draft, { ...opened, otherMonthlySpend: 55_000 }).conflicts).toEqual([])
+    expect(changedKeys(keepMine.opened, keepMine.draft)).toEqual(['otherMonthlySpend'])
+    // The same change on both sides is no conflict and nothing left to save.
+    const agreed = mergeIncoming(opened, draft, { ...opened, otherMonthlySpend: 60_000 })
+    expect(agreed.conflicts).toEqual([])
+    expect(changedKeys(agreed.opened, agreed.draft)).toEqual([])
+  })
+
+  it('says what the other computer saved, so Use theirs is not a blind choice (r2-42)', () => {
+    expect(conflictValueText('B: close in a day')).toBe('"B: close in a day"')
+    expect(conflictValueText('  Monthly  ')).toBe('"Monthly"')
+    expect(conflictValueText('2026-10-01')).toBe('Oct 1, 2026')
+    expect(conflictValueText(1_200_000)).toBe('1,200,000')
+    expect(conflictValueText('')).toBe('blank')
+    expect(conflictValueText(null)).toBe('blank')
+    // Long text is cut short; lists, records and yes or no are not said (the notice only names the field).
+    const long = conflictValueText('AI agents that close the books, reconcile every account and get audits ready in days')
+    expect(long).toBe('"AI agents that close the books, reconcile every account..."')
+    expect(conflictValueText(['a', 'b'])).toBeNull()
+    expect(conflictValueText({ a: 1 })).toBeNull()
+    expect(conflictValueText(true)).toBeNull()
+    expect(conflictValueText(Number.NaN)).toBeNull()
   })
 })
 

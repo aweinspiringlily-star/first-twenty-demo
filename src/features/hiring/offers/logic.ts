@@ -1,8 +1,10 @@
-// Pure helpers for offers, the position-in-band meter, background checks and the Offers tab.
+// Pure helpers for offers, the position-in-band meter, background checks and the Offers tab, plus the
+// in-memory cache of unsaved offer builder forms (one page load).
 // No store or React imports, so they can be unit tested (logic.test.ts).
 import { RULES } from '@/domain/compliance'
+import { type DesiredPay, desiredAnnual, desiredHourly } from '@/domain/hiring/util'
 import { isEmployedOn } from '@/domain/people'
-import type { Band, BackgroundCheck, CompRecord, ID, Offer, OfferStatus, Person } from '@/domain/types'
+import type { Band, BackgroundCheck, CompRecord, ID, Job, Offer, OfferStatus, Person } from '@/domain/types'
 import { addBusinessDays, addDays, fmtDay, fmtShort, type ISODate, parseDate } from '@/lib/dates'
 
 export const OFFER_STATUS: Record<OfferStatus, { label: string; tone: 'neutral' | 'accent' | 'good' | 'warn' | 'outline' }> = {
@@ -81,11 +83,16 @@ export type BandMeterGeometry = {
   clipped: (v: number) => boolean
 }
 
-/** Track geometry for the position-in-band meter: the band plus 12% padding each side. */
-export function bandMeterGeometry(band: Pick<Band, 'min' | 'max'>): BandMeterGeometry {
-  const span = Math.max(1, band.max - band.min)
-  const lo = band.min - span * 0.12
-  const hi = band.max + span * 0.12
+/**
+ * Track geometry for the position-in-band meter: the band plus 12% padding each side, widened to take
+ * in `include` (the job's posted range) so both ranges fit on one scale.
+ */
+export function bandMeterGeometry(band: Pick<Band, 'min' | 'max'>, include: number[] = []): BandMeterGeometry {
+  const from = Math.min(band.min, ...include)
+  const to = Math.max(band.max, ...include)
+  const span = Math.max(1, to - from)
+  const lo = from - span * 0.12
+  const hi = to + span * 0.12
   const raw = (v: number) => (v - lo) / (hi - lo)
   return {
     lo,
@@ -93,6 +100,125 @@ export function bandMeterGeometry(band: Pick<Band, 'min' | 'max'>): BandMeterGeo
     at: (v) => Math.max(0, Math.min(1, raw(v))),
     clipped: (v) => raw(v) < 0 || raw(v) > 1,
   }
+}
+
+/**
+ * The job's posted pay range as annual base for the band meter (a range under $1,000 is hourly, as the
+ * posting reads it, and is annualized at 2,080 hours). Null when the job has no range.
+ */
+export function postedRangeAnnual(job: Pick<Job, 'payMin' | 'payMax'> | undefined): { min: number; max: number } | null {
+  if (!job || job.payMin == null || job.payMax == null) return null
+  const scale = job.payMax < 1000 ? 2080 : 1
+  return { min: Math.round(job.payMin * scale), max: Math.round(job.payMax * scale) }
+}
+
+export type BandMeterFigures = {
+  /** 'hour' for an hourly offer: every figure is a rate. */
+  unit: 'year' | 'hour'
+  band: { min: number; mid: number; max: number }
+  offer: number | null
+  posted: { min: number; max: number } | null
+  desired: number | null
+  /** Set when the desired pay was given in this other unit and converted at 2,080 hours (the meter says so). */
+  desiredFrom?: 'year' | 'hour'
+}
+
+/**
+ * The band meter's figures in the offer's own terms, so it compares like with like. A salary reads in
+ * annual base (an hourly posted range, and an hourly desired pay, at 2,080 hours). An hourly offer reads
+ * in dollars an hour: its rate, an hourly posted range and an hourly desired pay as given, and the annual
+ * band, an annual range and a yearly desired pay divided by 2,080 hours (full-time equivalent), rounded
+ * to the cent. A plain number for `desired` is a yearly figure.
+ */
+export function bandMeterFigures(
+  offer: Pick<Offer, 'payType' | 'salary' | 'hourlyRate'>,
+  band: Pick<Band, 'min' | 'mid' | 'max'>,
+  job: Pick<Job, 'payMin' | 'payMax'> | undefined,
+  desired?: DesiredPay | number | null,
+): BandMeterFigures {
+  const want: DesiredPay | undefined = desired == null ? undefined : typeof desired === 'number' ? { amount: desired, unit: 'year' } : desired
+  if (offer.payType !== 'hourly') {
+    return {
+      unit: 'year',
+      band: { min: band.min, mid: band.mid, max: band.max },
+      offer: offer.salary || null,
+      posted: postedRangeAnnual(job),
+      desired: desiredAnnual(want) ?? null,
+      ...(want?.unit === 'hour' ? { desiredFrom: 'hour' as const } : {}),
+    }
+  }
+  const hourly = (n: number) => Math.round((n / 2080) * 100) / 100
+  const range = job && job.payMin != null && job.payMax != null ? (job.payMax < 1000 ? { min: job.payMin, max: job.payMax } : { min: hourly(job.payMin), max: hourly(job.payMax) }) : null
+  const rate = desiredHourly(want)
+  return {
+    unit: 'hour',
+    band: { min: hourly(band.min), mid: hourly(band.mid), max: hourly(band.max) },
+    offer: offer.hourlyRate || null,
+    posted: range,
+    desired: rate != null ? Math.round(rate * 100) / 100 : null,
+    ...(want?.unit === 'year' ? { desiredFrom: 'year' as const } : {}),
+  }
+}
+
+/**
+ * Unsaved offer builder forms, kept for this page load only (never stored): the builder writes its form
+ * here while it differs from what it opened with, so following one of its own links (Record a 409A,
+ * Check the cap table) and coming back brings the work back. Save and an explicit close clear it.
+ * Keyed by application and offer ('new' for an offer not created yet); a new offer's draft also keeps
+ * the version it was for, so it never comes back on a later version.
+ */
+const offerDrafts = new Map<string, { base: unknown; form: unknown; version?: number }>()
+
+function offerDraftKey(applicationId: ID, offerId?: ID): string {
+  return `${applicationId}:${offerId ?? 'new'}`
+}
+
+/** Keeps the builder's form (and the record it opened with, to spot changes made elsewhere since). */
+export function keepOfferDraft<T>(applicationId: ID, offerId: ID | undefined, draft: { base: T; form: T; version?: number }): void {
+  offerDrafts.set(offerDraftKey(applicationId, offerId), structuredClone(draft))
+}
+
+function findOfferDraft(applicationId: ID, offerId?: ID, version?: number) {
+  const kept = offerDrafts.get(offerDraftKey(applicationId, offerId))
+  if (!kept || (!offerId && version != null && kept.version != null && kept.version !== version)) return undefined
+  return kept
+}
+
+/** The kept draft for an application and offer, if any (for a new offer, only for the same version). */
+export function keptOfferDraft<T>(applicationId: ID, offerId?: ID, version?: number): { base: T; form: T } | undefined {
+  const kept = findOfferDraft(applicationId, offerId, version)
+  return kept ? (structuredClone(kept) as { base: T; form: T }) : undefined
+}
+
+/** True while unsaved builder changes are kept for the application and offer (the panel says so). */
+export function hasKeptOfferDraft(applicationId: ID, offerId?: ID, version?: number): boolean {
+  return !!findOfferDraft(applicationId, offerId, version)
+}
+
+export function dropOfferDraft(applicationId: ID, offerId?: ID): void {
+  offerDrafts.delete(offerDraftKey(applicationId, offerId))
+}
+
+/**
+ * A kept draft laid over the record as it is now: the fields the user changed come back, unless the
+ * record changed there too since (another computer, or the founder in another place), in which case
+ * the record's value wins and the field is listed in `dropped`.
+ */
+export function restoreOfferDraft<T extends object>(kept: { base: T; form: T }, current: T): { form: T; restored: Array<keyof T>; dropped: Array<keyof T> } {
+  const form = { ...current }
+  const restored: Array<keyof T> = []
+  const dropped: Array<keyof T> = []
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  for (const k of new Set([...Object.keys(kept.base), ...Object.keys(kept.form)]) as Set<keyof T>) {
+    if (same(kept.form[k], kept.base[k])) continue
+    if (!same(current[k], kept.base[k])) {
+      dropped.push(k)
+      continue
+    }
+    form[k] = kept.form[k]
+    restored.push(k)
+  }
+  return { form, restored, dropped }
 }
 
 /** Plain words for where a base sits: 'Below the band', 'Low in the band', 'Mid band', ... */
@@ -108,6 +234,8 @@ export function bandWords(base: number, band: Pick<Band, 'min' | 'mid' | 'max'>)
 /**
  * Annual base for employees at a family and level on a date (unnamed peers for the band meter).
  * Uses the comp row in effect; hourly rows are annualized at their hours. Excludes the given ids.
+ * With unit 'hour' (an hourly offer's meter) it gives rates instead: an hourly row's rate, a salary
+ * over 2,080 hours.
  */
 export function peerBases(
   people: Person[],
@@ -116,6 +244,7 @@ export function peerBases(
   levelId: ID,
   date: ISODate,
   exclude: ID[] = [],
+  unit: 'year' | 'hour' = 'year',
 ): number[] {
   const out: number[] = []
   for (const p of people) {
@@ -123,7 +252,14 @@ export function peerBases(
     const rows = comp.filter((c) => c.personId === p.id && c.effectiveOn <= date).sort((a, b) => a.effectiveOn.localeCompare(b.effectiveOn))
     const row = rows[rows.length - 1]
     if (!row || row.levelId !== levelId || p.familyId !== familyId) continue
-    const base = row.payType === 'hourly' ? Math.round((row.hourlyRate ?? 0) * (p.hoursPerWeek || 40) * 52) : (row.salary ?? 0)
+    const base =
+      unit === 'hour'
+        ? row.payType === 'hourly'
+          ? (row.hourlyRate ?? 0)
+          : Math.round(((row.salary ?? 0) / 2080) * 100) / 100
+        : row.payType === 'hourly'
+          ? Math.round((row.hourlyRate ?? 0) * (p.hoursPerWeek || 40) * 52)
+          : (row.salary ?? 0)
     if (base > 0) out.push(base)
   }
   return out.sort((a, b) => a - b)
@@ -153,7 +289,25 @@ export function backgroundStep(conditionalOfferOn: ISODate | undefined, bg: Back
   return bg.result === 'consider' ? 'consider' : 'clear'
 }
 
-export type OfferGroupKey = 'draft' | 'awaiting_approval' | 'approved' | 'sent' | 'accepted' | 'declined' | 'expired' | 'rescinded'
+export type OfferGroupKey = 'draft' | 'awaiting_approval' | 'approved' | 'sent' | 'accepted' | 'declined' | 'expired' | 'rescinded' | 'discarded'
+
+/**
+ * Where an offer stands for display: a sent offer past its expiry date reads 'expired' even before
+ * expireOffers marks it, and a rescinded offer that never went out reads 'discarded' (the candidate
+ * never received it).
+ */
+export function offerDisplayStatus(offer: Pick<Offer, 'status' | 'expiresOn' | 'sentOn'>, date?: ISODate): OfferGroupKey {
+  if (offer.status === 'sent' && date && offer.expiresOn < date) return 'expired'
+  if (offer.status === 'rescinded' && !offer.sentOn) return 'discarded'
+  return offer.status
+}
+
+/** The badge word for an offer: OFFER_STATUS, with 'Expired' for lapsed and 'Discarded' for unsent rescinds. */
+export function offerStatusLabel(offer: Pick<Offer, 'status' | 'expiresOn' | 'sentOn'>, date?: ISODate): { label: string; tone: (typeof OFFER_STATUS)[OfferStatus]['tone'] } {
+  const s = offerDisplayStatus(offer, date)
+  if (s === 'discarded') return { label: 'Discarded', tone: 'outline' }
+  return OFFER_STATUS[s]
+}
 
 /** Latest version per application, so revised offers do not show twice. */
 export function latestPerApplication(offers: Offer[]): Offer[] {
@@ -167,39 +321,69 @@ export function latestPerApplication(offers: Offer[]): Offer[] {
 
 /**
  * Offers tab groups. Accepted shows offers still to be hired or starting on or after `acceptedSince`;
- * declined, expired and rescinded show those decided on or after `since`. Older ones are counted
- * in `earlier` so nothing silently disappears.
+ * declined, expired, rescinded and discarded show those decided on or after `since`. Older ones are
+ * counted in `earlier` so nothing silently disappears. With `date`, a sent offer past its expiry sits
+ * under Expired (offerDisplayStatus); a rescinded draft that never went out sits under Discarded.
  */
 export function groupOffers(
   offers: Offer[],
   since: ISODate,
   people: Pick<Person, 'id' | 'startDate'>[],
   acceptedSince: ISODate = since,
+  date?: ISODate,
 ): { groups: Record<OfferGroupKey, Offer[]>; earlier: number } {
-  const groups: Record<OfferGroupKey, Offer[]> = { draft: [], awaiting_approval: [], approved: [], sent: [], accepted: [], declined: [], expired: [], rescinded: [] }
+  const groups: Record<OfferGroupKey, Offer[]> = { draft: [], awaiting_approval: [], approved: [], sent: [], accepted: [], declined: [], expired: [], rescinded: [], discarded: [] }
   let earlier = 0
   for (const o of latestPerApplication(offers)) {
-    if (o.status === 'accepted') {
+    const s = offerDisplayStatus(o, date)
+    if (s === 'accepted') {
       const p = o.personId ? people.find((x) => x.id === o.personId) : undefined
       const recent = !o.personId || (p ? p.startDate >= acceptedSince : (o.decidedOn ?? o.createdOn) >= acceptedSince)
       if (recent) groups.accepted.push(o)
       else earlier += 1
-    } else if (o.status === 'declined' || o.status === 'expired' || o.status === 'rescinded') {
-      if ((o.decidedOn ?? o.createdOn) >= since) groups[o.status].push(o)
+    } else if (s === 'declined' || s === 'expired' || s === 'rescinded' || s === 'discarded') {
+      if ((o.decidedOn ?? (o.status === 'sent' ? o.expiresOn : o.createdOn)) >= since) groups[s].push(o)
       else earlier += 1
     } else {
-      groups[o.status].push(o)
+      groups[s].push(o)
     }
   }
-  const byDate = (a: Offer, b: Offer) => (b.decidedOn ?? b.sentOn ?? b.createdOn).localeCompare(a.decidedOn ?? a.sentOn ?? a.createdOn)
+  const decided = (o: Offer) => o.decidedOn ?? (o.status === 'sent' ? o.expiresOn : (o.sentOn ?? o.createdOn))
+  const byDate = (a: Offer, b: Offer) => decided(b).localeCompare(decided(a))
   groups.sent.sort((a, b) => a.expiresOn.localeCompare(b.expiresOn))
-  for (const k of ['draft', 'awaiting_approval', 'approved', 'accepted', 'declined', 'expired', 'rescinded'] as const) groups[k].sort(byDate)
+  for (const k of ['draft', 'awaiting_approval', 'approved', 'accepted', 'declined', 'expired', 'rescinded', 'discarded'] as const) groups[k].sort(byDate)
   return { groups, earlier }
+}
+
+/**
+ * Why Hire keeps the job open: the other offers on it that are still in play, in plain words. Only a
+ * sent offer is 'still out'; drafts, approvals and accepted offers not yet hired say what they are.
+ */
+export function otherOffersText(others: Array<Pick<Offer, 'status' | 'personId'>>): string | null {
+  const words: string[] = []
+  if (others.some((o) => o.status === 'sent')) words.push('still out')
+  if (others.some((o) => o.status === 'awaiting_approval')) words.push('waiting for approval')
+  if (others.some((o) => o.status === 'draft' || o.status === 'approved')) words.push('in draft')
+  if (others.some((o) => o.status === 'accepted' && !o.personId)) words.push('accepted and not hired yet')
+  if (words.length === 0) return null
+  const list = words.length === 1 ? words[0] : `${words.slice(0, -1).join(', ')} or ${words[words.length - 1]}`
+  return `Keeps the job open, because ${others.length === 1 ? 'another offer on it is' : 'other offers on it are'} ${list}.`
 }
 
 /** 'Big-tech counteroffer.' -> 'Big-tech counteroffer' (so sentences do not end in two periods). */
 export function trimPeriod(s: string | undefined): string {
   return (s ?? '').trim().replace(/[.\s]+$/, '')
+}
+
+/**
+ * A rescind reason for 'Rescinded <day>: <reason>.', without its last period. The dialog stores the
+ * chip and the details as 'Offer made in error. Hours were wrong: ...'; a reason saved before that,
+ * as 'Offer made in error: Hours were wrong: ...', reads the same way instead of with two colons.
+ */
+export function rescindReasonText(reason: string | undefined): string {
+  const r = trimPeriod(reason)
+  for (const chip of rescindReasonChoices()) if (r.startsWith(`${chip}: `)) return `${chip}. ${r.slice(chip.length + 2)}`
+  return r
 }
 
 /** Compliance rules that switch on when headcount reaches n (active milestones only), for the Hire preview. */

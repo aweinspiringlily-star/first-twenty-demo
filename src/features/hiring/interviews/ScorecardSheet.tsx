@@ -13,7 +13,7 @@ import { useDB } from '@/store/db'
 import { Badge, Button, Callout, cx, Field, focusFirstInvalid, rovingKeyDown, rovingTabIndex, Sheet, TextArea } from '@/ui'
 import { act, DICTATION_HINT, InvalidChips } from './common'
 import { ratingWord } from './logic'
-import { candidateOfferOn, textIssueError, textIssues } from '../logic'
+import { candidateOfferOn, NOTE_MAX_CHARS, textIssueError, textIssues } from '../logic'
 import { TextIssueNotes } from '../parts'
 
 const RATINGS: Rating[] = [1, 2, 3, 4]
@@ -206,6 +206,7 @@ function ScorecardForm({ scorecardId, onClose }: { scorecardId: ID; onClose: () 
                 id={id}
                 aria-describedby={describedBy}
                 rows={4}
+                maxLength={NOTE_MAX_CHARS}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="What you saw: evidence for each rating."

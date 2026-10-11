@@ -1,17 +1,20 @@
-// Add person: a manual hire without the ATS (or a contractor converted to an employee). Creates
-// employee #N as Pre-start with an effective-dated job and pay record and the onboarding checklist
-// (plus the new-state checklist for a first employee in another state), all with computed dates.
+// Add person: a manual hire without the ATS (or a contractor converted to an employee, or a former
+// employee rehired). Creates employee #N as Pre-start with an effective-dated job and pay record and the
+// onboarding checklist (plus the new-state checklist for a first employee in another state), all with
+// computed dates. A name or personal email that matches a former employee offers to link the rehire.
 import { useEffect, useMemo, useState } from 'react'
 import { useViewer } from '@/app/useViewer'
 import { ThresholdPreview } from '@/features/compliance'
+import { hireStartPresets } from '@/features/timeoff'
 import { generateChecklist, type TaskOverride } from '@/domain/checklists/generate'
 import { TASK_IDS } from '@/domain/checklists/templates'
+import { defaultExemptionBasis } from '@/domain/hiring/offers'
 import { companyDomain, slugify } from '@/domain/lifecycle'
 import { bandFor, exemptCheck } from '@/domain/pay'
-import { employedOn, fullName, incomingOn } from '@/domain/people'
+import { daysAway, employedOn, founder, fullName, getPerson, incomingOn, priorStint } from '@/domain/people'
 import type { CompRecord, DB, EmploymentType, ExemptionBasis, FLSA, ID, Person, WorkMode } from '@/domain/types'
 import { links, navigate } from '@/app/router'
-import { addDays, fmtDate, type ISODate, today } from '@/lib/dates'
+import { addDays, fmtDate, fmtMonth, type ISODate, today } from '@/lib/dates'
 import { moneyShort } from '@/lib/format'
 import { newId } from '@/lib/id'
 import { logActivity, useDB } from '@/store/db'
@@ -34,7 +37,7 @@ import {
   TextInput,
   toast,
 } from '@/ui'
-import { nextMonday, splitName, titleFromScope } from './helpers'
+import { LINE_MAX_CHARS, nextMonday, scopeSummary, splitName, titleFromScope } from './helpers'
 import { undoToast } from './parts'
 
 export const US_STATES = [
@@ -51,7 +54,7 @@ const EXEMPTION_LABEL: Record<ExemptionBasis, string> = {
   outside_sales: 'Outside sales',
 }
 
-export type PersonPrefill = Partial<PersonForm> & { fromContractorId?: ID }
+export type PersonPrefill = Partial<PersonForm> & { fromContractorId?: ID; rehireOfPersonId?: ID }
 
 type PersonForm = {
   firstName: string
@@ -79,12 +82,15 @@ type PersonForm = {
   backgroundCheck: 'clear' | 'pending' | 'not_required'
 }
 
-function defaults(db: DB): PersonForm {
+function defaults(db: DB, prefill?: PersonPrefill): PersonForm {
   const dept = db.departments[0]
   const hq = db.locations.find((l) => l.kind === 'hq') ?? db.locations[0]
   const family = db.families.find((f) => f.track === 'engineering') ?? db.families[0]
   const level = db.levels.find((l) => l.code === 'L3') ?? db.levels[0]
-  const band = family && level ? bandFor(db, family.id, level.id) : undefined
+  // A prefill's family and level (a rehire, a contractor) decide the band and the exemption.
+  const familyId = prefill?.familyId ?? family?.id ?? ''
+  const levelId = prefill?.levelId ?? level?.id ?? ''
+  const band = familyId && levelId ? bandFor(db, familyId, levelId) : undefined
   return {
     firstName: '',
     lastName: '',
@@ -103,7 +109,9 @@ function defaults(db: DB): PersonForm {
     employmentType: 'full_time',
     hoursPerWeek: 40,
     flsa: band?.flsaDefault ?? 'exempt',
-    exemptionBasis: 'professional',
+    // The exemption that fits the family and level (computer professional for engineering and ML),
+    // as in Change job or pay and the offer builder, so the exempt check uses the right minimum.
+    exemptionBasis: defaultExemptionBasis(familyId, levelId),
     payType: 'salary',
     salary: band?.mid ?? null,
     hourlyRate: null,
@@ -134,9 +142,14 @@ export function AddPersonSheet({
 }) {
   const db = useDB((s) => s.db)
   const viewer = useViewer()
-  const [form, setForm] = useState<PersonForm>(() => ({ ...defaults(db), ...prefill }))
+  const [form, setForm] = useState<PersonForm>(() => ({ ...defaults(db, prefill), ...prefill }))
   const [endContract, setEndContract] = useState(true)
   const [tried, setTried] = useState(false)
+  // The exemption follows the family and level until someone picks one.
+  const [basisPicked, setBasisPicked] = useState(!!prefill?.exemptionBasis)
+  // The former employee this hire is linked to as a rehire, and a match someone said is a different person.
+  const [rehireOf, setRehireOf] = useState<ID | null>(prefill?.rehireOfPersonId ?? null)
+  const [notRehire, setNotRehire] = useState<ID | null>(null)
   // The employee this sheet just created (so the closing sheet does not flash the duplicate warning).
   const [createdId, setCreatedId] = useState<ID | null>(null)
   const contractor = prefill?.fromContractorId ? db.contractors.find((c) => c.id === prefill.fromContractorId) : undefined
@@ -148,9 +161,12 @@ export function AddPersonSheet({
 
   useEffect(() => {
     if (open) {
-      setForm({ ...defaults(db), ...prefill })
+      setForm({ ...defaults(db, prefill), ...prefill })
       setTried(false)
       setCreatedId(null)
+      setBasisPicked(!!prefill?.exemptionBasis)
+      setRehireOf(prefill?.rehireOfPersonId ?? null)
+      setNotRehire(null)
     }
     // Reset only when the sheet opens or the prefill changes.
   }, [open, prefill])
@@ -159,10 +175,30 @@ export function AddPersonSheet({
   const band = bandFor(db, form.familyId, form.levelId)
   const managers = useMemo(() => [...employedOn(db), ...incomingOn(db)].sort((a, b) => a.hireNumber - b.hireNumber), [db])
   const hireNumber = db.people.reduce((m, p) => Math.max(m, p.hireNumber), 0) + 1
-  const domain = companyDomain(db.company)
-  const emailDefault = form.firstName ? `${slugify(form.firstName).replace(/-/g, '')}@${domain}` : ''
+  // Work emails prefill only on a known domain (the website or the founder's work email), never a guess.
+  const domain = companyDomain(db.company, founder(db)?.workEmail)
+  const emailDefault = form.firstName && domain ? `${slugify(form.firstName).replace(/-/g, '')}@${domain}` : ''
   const emailTaken = (e: string) => db.people.some((p) => p.workEmail.toLowerCase() === e.toLowerCase())
-  const workEmail = form.workEmail.trim() || (emailTaken(emailDefault) ? `${slugify(form.firstName).replace(/-/g, '')}.${slugify(form.lastName).replace(/-/g, '')}@${domain}` : emailDefault)
+  const workEmail =
+    form.workEmail.trim() ||
+    (emailDefault && emailTaken(emailDefault) ? `${slugify(form.firstName).replace(/-/g, '')}.${slugify(form.lastName).replace(/-/g, '')}@${domain}` : emailDefault)
+  // A former employee with this name or personal email: offer to link the rehire.
+  const linked = rehireOf ? getPerson(db, rehireOf) : undefined
+  const match = useMemo(() => {
+    if (rehireOf || contractor || !form.firstName.trim() || !form.lastName.trim()) return undefined
+    const found = priorStint(db, { id: '', firstName: form.firstName.trim(), lastName: form.lastName.trim(), personalEmail: form.personalEmail, startDate: form.startDate })
+    return found && found.id !== notRehire ? found : undefined
+  }, [db, rehireOf, contractor, form.firstName, form.lastName, form.personalEmail, form.startDate, notRehire])
+  const linkRehire = (prior: Person) => {
+    setRehireOf(prior.id)
+    // The same person keeps the same work address.
+    setForm((f) => ({ ...f, workEmail: f.workEmail.trim() || prior.workEmail, personalEmail: f.personalEmail.trim() || (prior.personalEmail ?? '') }))
+  }
+  const unlinkRehire = () => {
+    if (linked) setNotRehire(linked.id)
+    setRehireOf(null)
+  }
+  const away = linked?.endDate ? daysAway(linked.endDate, form.startDate) : undefined
   const outsideCA = form.homeState.toUpperCase() !== 'CA'
   const exemptIssue =
     form.flsa === 'exempt'
@@ -195,6 +231,7 @@ export function AddPersonSheet({
       familyId,
       levelId,
       flsa: b?.flsaDefault ?? f.flsa,
+      exemptionBasis: basisPicked ? f.exemptionBasis : defaultExemptionBasis(familyId, levelId),
       salary: f.payType === 'salary' && b ? b.mid : f.salary,
     }))
   }
@@ -239,6 +276,8 @@ export function AddPersonSheet({
     if (form.homeCity.trim()) person.homeCity = form.homeCity.trim()
     if (form.flsa === 'exempt') person.exemptionBasis = form.exemptionBasis
     if (contractor) person.fromContractorId = contractor.id
+    // Links the records: sick leave left at the exit comes back within 12 months, and no DE 34 is due under 60 days away.
+    if (linked) person.rehireOfPersonId = linked.id
     const comp: CompRecord = {
       id: newId('cr'),
       personId: id,
@@ -259,7 +298,7 @@ export function AddPersonSheet({
       comp.approvedOn = t
     }
     const name = fullName(person)
-    const label = `Added ${name} as employee #${hireNumber}`
+    const label = linked ? `Rehired ${name} as employee #${hireNumber}` : `Added ${name} as employee #${hireNumber}`
     useDB.getState().mutate(label, (d) => {
       d.people.push(person)
       d.comp.push(comp)
@@ -300,7 +339,9 @@ export function AddPersonSheet({
         kind: 'hired',
         text: contractor
           ? `Converted ${contractor.name} from contractor to employee #${hireNumber}, starting ${fmtDate(person.startDate)}`
-          : `Added ${name} as ${person.title}, employee #${hireNumber}, starting ${fmtDate(person.startDate)}`,
+          : linked
+            ? `Rehired ${name} (formerly #${linked.hireNumber}) as ${person.title}, employee #${hireNumber}, starting ${fmtDate(person.startDate)}`
+            : `Added ${name} as ${person.title}, employee #${hireNumber}, starting ${fmtDate(person.startDate)}`,
       })
     })
     undoToast(label)
@@ -315,7 +356,7 @@ export function AddPersonSheet({
     <Sheet
       open={open}
       onClose={onClose}
-      title={contractor ? `Convert ${contractor.name} to an employee` : 'Add a person'}
+      title={contractor ? `Convert ${contractor.name} to an employee` : linked && prefill?.rehireOfPersonId ? `Rehire ${fullName(linked)}` : 'Add a person'}
       subtitle={`Adds employee #${hireNumber} as Pre-start and builds the onboarding checklist with every date worked out.`}
       width={640}
       footer={
@@ -344,7 +385,7 @@ export function AddPersonSheet({
         {convertedTo && contractor && (
           <Callout tone="warn" title={`${contractor.name} is already employee #${convertedTo.hireNumber}`}>
             Converted {contractor.convertedOn ? fmtDate(contractor.convertedOn) : 'earlier'}.{' '}
-            <a href={links.person(convertedTo.id)} className="font-semibold text-accent underline">
+            <a href={links.person(convertedTo.id)} className="-my-2.5 inline-flex min-h-10 items-center font-semibold text-accent underline">
               Open {fullName(convertedTo)}
             </a>{' '}
             instead of adding a second employee record.
@@ -365,23 +406,85 @@ export function AddPersonSheet({
         <SectionLabel>Who</SectionLabel>
         <FormGrid>
           <Field label="First name" required error={err('firstName')}>
-            {(id, d) => <TextInput id={id} aria-describedby={d} value={form.firstName} onChange={(e) => set('firstName', e.target.value)} data-autofocus />}
+            {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={form.firstName} onChange={(e) => set('firstName', e.target.value)} data-autofocus />}
           </Field>
           <Field label="Last name" required error={err('lastName')}>
-            {(id, d) => <TextInput id={id} aria-describedby={d} value={form.lastName} onChange={(e) => set('lastName', e.target.value)} />}
+            {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={form.lastName} onChange={(e) => set('lastName', e.target.value)} />}
           </Field>
           <Field label="Preferred first name" hint="Optional">
-            {(id, d) => <TextInput id={id} aria-describedby={d} value={form.preferredName} onChange={(e) => set('preferredName', e.target.value)} />}
+            {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={form.preferredName} onChange={(e) => set('preferredName', e.target.value)} />}
           </Field>
-          <Field label="Work email" hint={form.workEmail ? undefined : workEmail ? `Will be ${workEmail}` : 'Made from the first name'}>
+          <Field
+            label="Work email"
+            hint={
+              form.workEmail
+                ? undefined
+                : workEmail
+                  ? `Will be ${workEmail}`
+                  : domain
+                    ? 'Made from the first name'
+                    : 'Add your website in Settings > Company to prefill work emails'
+            }
+          >
             {(id, d) => (
-              <TextInput id={id} aria-describedby={d} type="email" value={form.workEmail} placeholder={workEmail} onChange={(e) => set('workEmail', e.target.value)} />
+              <TextInput
+                id={id}
+                aria-describedby={d}
+                type="email"
+                maxLength={LINE_MAX_CHARS}
+                value={form.workEmail}
+                placeholder={workEmail}
+                onChange={(e) => set('workEmail', e.target.value)}
+              />
             )}
           </Field>
           <Field label="Personal email" hint="Optional, for the welcome email before day 1">
-            {(id, d) => <TextInput id={id} aria-describedby={d} type="email" value={form.personalEmail} onChange={(e) => set('personalEmail', e.target.value)} />}
+            {(id, d) => <TextInput id={id} aria-describedby={d} type="email" maxLength={LINE_MAX_CHARS} value={form.personalEmail} onChange={(e) => set('personalEmail', e.target.value)} />}
           </Field>
         </FormGrid>
+        {linked && (
+          <Callout
+            tone={linked.separation?.rehireEligible === false ? 'warn' : 'good'}
+            icon="user"
+            title={`Rehire of #${linked.hireNumber} ${fullName(linked)} (${fmtMonth(linked.startDate)} to ${fmtMonth(linked.endDate)})`}
+            action={
+              <Button variant="ghost" size="sm" onClick={unlinkRehire}>
+                Not a rehire
+              </Button>
+            }
+          >
+            {linked.separation?.rehireEligible === false && <p className="font-semibold">Marked not eligible for rehire when they left. Check why before going ahead.</p>}
+            <p>
+              The new record links to the earlier one{linked.workEmail ? ' and keeps the same work email' : ''}. Sick leave left at the exit comes back
+              within 12 months.
+            </p>
+            {away != null && (
+              <p className="mt-1">
+                {away < 60
+                  ? `Back after ${away} ${away === 1 ? 'day' : 'days'}, so no DE 34 new hire report is needed (EDD counts a rehire after 60 days away).`
+                  : `Back after ${away} days, so EDD needs a DE 34 new hire report within 20 days of the start date.`}
+              </p>
+            )}
+          </Callout>
+        )}
+        {match && (
+          <Callout
+            tone={match.separation?.rehireEligible === false ? 'warn' : 'accent'}
+            icon="user"
+            title={`${fullName(match)} worked here until ${fmtDate(match.endDate)}. Link this as a rehire?`}
+          >
+            {match.separation?.rehireEligible === false && <p className="font-semibold">Marked not eligible for rehire when they left.</p>}
+            <p>Employee #{match.hireNumber}. Linking connects the two records and reuses the work email.</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button variant="primary" size="sm" icon="link" onClick={() => linkRehire(match)}>
+                Link as a rehire
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setNotRehire(match.id)}>
+                Different person
+              </Button>
+            </div>
+          </Callout>
+        )}
 
         <SectionLabel>Job</SectionLabel>
         <FormGrid>
@@ -390,12 +493,13 @@ export function AddPersonSheet({
             required
             error={err('title')}
             className="sm:col-span-2"
-            hint={contractor ? `From their contract scope: ${contractor.scope}` : undefined}
+            hint={contractor ? `From their contract scope: ${scopeSummary(contractor.scope)}` : undefined}
           >
             {(id, d) => (
               <TextInput
                 id={id}
                 aria-describedby={d}
+                maxLength={LINE_MAX_CHARS}
                 value={form.title}
                 onChange={(e) => set('title', e.target.value)}
                 placeholder={contractor ? 'For example: Close review accountant' : 'For example: Senior data engineer'}
@@ -471,7 +575,7 @@ export function AddPersonSheet({
             )}
           </Field>
           <Field label="Works from (city)" hint="City only. Never a street address.">
-            {(id, d) => <TextInput id={id} aria-describedby={d} value={form.homeCity} onChange={(e) => set('homeCity', e.target.value)} />}
+            {(id, d) => <TextInput id={id} aria-describedby={d} maxLength={LINE_MAX_CHARS} value={form.homeCity} onChange={(e) => set('homeCity', e.target.value)} />}
           </Field>
           <Field label="Works from (state)" hint={outsideCA ? 'Outside California: adds the new-state checklist.' : undefined}>
             {(id, d) => <Select id={id} aria-describedby={d} value={form.homeState} onChange={(v) => set('homeState', v)} options={US_STATES.map((s) => ({ value: s, label: s }))} />}
@@ -527,17 +631,25 @@ export function AddPersonSheet({
                     { value: 'non_exempt', label: 'Non-exempt' },
                   ]}
                 />
-                {form.flsa === 'exempt' && (
-                  <Select
-                    aria-label="Exemption"
-                    value={form.exemptionBasis}
-                    onChange={(v) => set('exemptionBasis', v)}
-                    options={(Object.keys(EXEMPTION_LABEL) as ExemptionBasis[]).map((k) => ({ value: k, label: EXEMPTION_LABEL[k] }))}
-                  />
-                )}
               </div>
             )}
           </Field>
+          {form.flsa === 'exempt' && (
+            <Field label="Exemption" id="add-person-exemption" hint="Decides which California pay minimum the exempt check uses.">
+              {(id, d) => (
+                <Select
+                  id={id}
+                  aria-describedby={d}
+                  value={form.exemptionBasis}
+                  onChange={(v) => {
+                    setBasisPicked(true)
+                    set('exemptionBasis', v)
+                  }}
+                  options={(Object.keys(EXEMPTION_LABEL) as ExemptionBasis[]).map((k) => ({ value: k, label: EXEMPTION_LABEL[k] }))}
+                />
+              )}
+            </Field>
+          )}
           <Field label="Pay type">
             {() => (
               <ChipGroup
@@ -576,11 +688,7 @@ export function AddPersonSheet({
               label="Start date"
               value={form.startDate}
               onChange={(v) => set('startDate', v)}
-              presets={[
-                { label: 'Next Mon', date: nextMonday(t) },
-                { label: 'In 2 weeks (Mon)', date: nextMonday(addDays(t, 7)) },
-                { label: 'In 3 weeks (Mon)', date: nextMonday(addDays(t, 14)) },
-              ]}
+              presets={hireStartPresets(t, db.holidays)}
             />
           )}
         </Field>
@@ -611,6 +719,40 @@ export function AddPersonSheet({
       </div>
     </Sheet>
   )
+}
+
+/**
+ * Prefill for rehiring a former employee from their alumni profile: the same name, emails, job family,
+ * level, title, team, location and hours, the manager when they are still here, and the link to the
+ * earlier record. Pay starts from the band again (an offer is a new negotiation).
+ */
+export function prefillForRehire(db: DB, personId: ID): PersonPrefill | undefined {
+  const p = db.people.find((x) => x.id === personId)
+  if (!p) return undefined
+  const t = today()
+  const manager = p.managerId ? db.people.find((x) => x.id === p.managerId) : undefined
+  const managerHere = !!manager && (!manager.endDate || manager.endDate >= t)
+  return {
+    rehireOfPersonId: p.id,
+    firstName: p.firstName,
+    lastName: p.lastName,
+    preferredName: p.preferredName ?? '',
+    workEmail: p.workEmail,
+    personalEmail: p.personalEmail ?? '',
+    title: p.title,
+    departmentId: p.departmentId,
+    familyId: p.familyId,
+    levelId: p.levelId,
+    ...(managerHere && manager ? { managerId: manager.id } : {}),
+    locationId: p.locationId,
+    workMode: p.workMode,
+    homeCity: p.homeCity ?? '',
+    homeState: p.homeState,
+    employmentType: p.employmentType,
+    hoursPerWeek: p.hoursPerWeek,
+    flsa: p.flsa,
+    ...(p.flsa === 'exempt' && p.exemptionBasis ? { exemptionBasis: p.exemptionBasis } : {}),
+  }
 }
 
 /** Prefill for converting a contractor to a part-time hourly employee. */

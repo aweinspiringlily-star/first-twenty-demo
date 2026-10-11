@@ -4,13 +4,15 @@
 // The equity planning view (docs/SPEC.md, EQUITY PLANNING VIEW) is a planning mirror: the cap table
 // tool stays the source of truth for issued options, exercises and 409A valuations.
 import type { Draft } from 'immer'
+import { setTaskStatus } from '@/domain/checklists/actions'
+import { TASK_IDS } from '@/domain/checklists/templates'
 import { offerLapsed, outstandingOffers } from '@/domain/pay'
 import { fullName } from '@/domain/people'
-import type { DB, EquityGrant, ID, Valuation409A } from '@/domain/types'
+import type { DB, EquityGrant, EquitySetup, ID, Valuation409A } from '@/domain/types'
 import { addDays, addMonths, daysBetween, fmtDate, fmtShort, fullMonthsBetween, type ISODate, nowISO } from '@/lib/dates'
 import { money2, num, plural } from '@/lib/format'
 import { newId } from '@/lib/id'
-import { logActivity } from '@/store/draft'
+import { currentActorId, logActivity } from '@/store/draft'
 
 /**
  * Whole months of service from the vesting start to the date, or -1 before the start. A month counts on its
@@ -93,6 +95,14 @@ export function pctOfFullyDiluted(db: DB, shares: number): number {
   return db.equity.fullyDilutedShares > 0 ? shares / db.equity.fullyDilutedShares : 0
 }
 
+/**
+ * True while the cap table holds the placeholder numbers Start fresh filled in (nobody has entered or
+ * confirmed them): percentages of fully diluted shares are then estimates, and offer letters leave them out.
+ */
+export function capTableIsPlaceholder(db: Pick<DB, 'equity'>): boolean {
+  return !db.equity.capTableConfirmedOn
+}
+
 export function grantsFor(db: DB, personId: ID): EquityGrant[] {
   return db.grants.filter((g) => g.personId === personId).sort((a, b) => a.vestingStart.localeCompare(b.vestingStart))
 }
@@ -119,12 +129,21 @@ export function holderName(db: DB, grant: Pick<EquityGrant, 'personId'>): string
   return 'Unknown holder'
 }
 
-/** Last day the holder works for the company (employee end date or contract end), if any. */
+/**
+ * Last day the holder works for the company (employee end date or contract end), if any. A separation
+ * in progress counts too: offboarding sets the end date, and its last day stands in when only that is known.
+ */
 export function holderEndDate(db: DB, grant: Pick<EquityGrant, 'personId'>): ISODate | undefined {
   const p = db.people.find((x) => x.id === grant.personId)
-  if (p) return p.endDate ?? undefined
+  if (p) return p.endDate ?? p.separation?.lastDay ?? undefined
   const k = db.contractors.find((x) => x.id === grant.personId)
   return k?.endOn ?? undefined
+}
+
+/** The day vesting stops for a grant: its cancellation date or the holder's last day, whichever comes first. */
+export function vestingStop(db: DB, grant: EquityGrant): ISODate | undefined {
+  const end = holderEndDate(db, grant)
+  return [grant.cancelledOn, end].filter((d): d is ISODate => !!d).sort()[0]
 }
 
 /** Shares vested after `m` whole months of service (cliff and whole-share rules applied). */
@@ -141,29 +160,28 @@ function vestAtMonth(g: Pick<EquityGrant, 'shares' | 'cliffMonths' | 'vestingMon
  */
 export function vestedHeld(db: DB, grant: EquityGrant, date: ISODate): number {
   if (grant.status === 'reserved') return 0
-  let stop = date
-  if (grant.cancelledOn && grant.cancelledOn < stop) stop = grant.cancelledOn
-  const end = holderEndDate(db, grant)
-  if (end && end < stop) stop = end
-  return Math.min(vestedShares(grant, stop), sharesHeld(grant))
+  const stop = vestingStop(db, grant)
+  return Math.min(vestedShares(grant, stop && stop < date ? stop : date), sharesHeld(grant))
 }
 
 export type VestingPoint = { date: ISODate; vested: number }
 
 /**
  * Monthly cumulative vested shares for a chart, from the vesting start to the fully vested date
- * (vestingMonths + 1 points). After a cancellation date the line stays flat at what was kept.
+ * (vestingMonths + 1 points). After the cancellation date, or `stop` when earlier (the holder's last day,
+ * from vestingStop), the line stays flat at what was kept.
  */
-export function vestingPoints(grant: EquityGrant): VestingPoint[] {
+export function vestingPoints(grant: EquityGrant, stop?: ISODate): VestingPoint[] {
   const months = Math.max(0, grant.vestingMonths)
   const kept = sharesHeld(grant)
+  const end = [grant.cancelledOn, stop].filter((d): d is ISODate => !!d).sort()[0]
   const points: VestingPoint[] = []
   let frozen: number | null = null
   for (let m = 0; m <= months; m++) {
     const date = addMonths(grant.vestingStart, m)
     let vested = vestAtMonth(grant, m)
-    if (grant.cancelledOn && date > grant.cancelledOn) {
-      if (frozen == null) frozen = Math.min(vestedShares(grant, grant.cancelledOn), kept)
+    if (end && date > end) {
+      if (frozen == null) frozen = Math.min(vestedShares(grant, end), kept)
       vested = frozen
     }
     points.push({ date, vested })
@@ -444,21 +462,74 @@ export function consentTableText(db: DB, grantIds: ID[], date: ISODate, opts: { 
   return [['Name', 'Shares', 'Type', 'Strike', 'Vest start', 'Schedule'].join('\t'), ...rows].join('\n')
 }
 
+/**
+ * True when approving the grant on the board date would record a $0 strike: an option grant with no strike
+ * entered and no 409A in effect on that date. Options are priced at fair market value on the grant date,
+ * so such a grant waits for a valuation (approveGrants skips it).
+ */
+export function grantNeeds409A(db: DB, grant: Pick<EquityGrant, 'type' | 'strikePrice'>, boardDate: ISODate): boolean {
+  return grant.type !== 'RSA' && !(grant.strikePrice > 0) && current409A(db, boardDate) == null
+}
+
+/** The onboarding task that waits on the hire grant's board consent (templates.ts ONBOARDING). */
+const EQUITY_BOARD_TASK = 'on-equity-board'
+
+/** A refresh grant queued by a job or pay change (changeJobOrPay), found the way cancelScheduledChange finds it. */
+function isRefreshGrant(g: Pick<EquityGrant, 'fromOfferId' | 'note'>): boolean {
+  return !g.fromOfferId && /^Refresh grant/.test(g.note ?? '')
+}
+
+/**
+ * Closes the checklist tasks that wait on board consent for the approved grants, through setTaskStatus so each
+ * checklist's completion stays in step: a refresh grant's 'ch-refresh-grant' task (on the change checklist dated
+ * on the grant's vesting start, else the person's oldest open one), and the onboarding 'on-equity-board' task
+ * once none of the person's other grants (refresh grants aside) still waits for the board. Returns how many closed.
+ */
+function closeBoardConsentTasks(draft: Draft<DB>, approved: EquityGrant[], on: ISODate): number {
+  const byId = currentActorId(draft as DB)
+  let n = 0
+  const openTasks = (personId: ID, templateTaskId: string) =>
+    draft.checklists
+      .filter((c) => c.personId === personId)
+      .sort((a, b) => a.createdOn.localeCompare(b.createdOn))
+      .flatMap((c) => c.tasks.filter((t) => t.status === 'open' && t.templateTaskId === templateTaskId).map((t) => ({ checklistId: c.id, kind: c.kind, anchorDate: c.anchorDate, taskId: t.id })))
+  for (const g of approved.filter(isRefreshGrant)) {
+    const open = openTasks(g.personId, TASK_IDS.refreshGrant)
+    const pick = open.find((o) => o.kind === 'change' && o.anchorDate === g.vestingStart) ?? open[0]
+    if (pick && setTaskStatus(draft, pick.checklistId, pick.taskId, 'done', { date: on, byId })) n++
+  }
+  for (const personId of new Set(approved.filter((g) => !isRefreshGrant(g)).map((g) => g.personId))) {
+    if (draft.grants.some((g) => g.personId === personId && g.status === 'promised' && !isRefreshGrant(g))) continue
+    for (const o of openTasks(personId, EQUITY_BOARD_TASK)) {
+      if (setTaskStatus(draft, o.checklistId, o.taskId, 'done', { date: on, byId })) n++
+    }
+  }
+  return n
+}
+
 export type ApproveGrantsResult = {
   approved: ID[]
-  /** Ids that were not promised grants and were left alone. */
+  /** Ids that were left alone: not promised grants, or option grants with no 409A to price them (noStrike). */
   skipped: ID[]
+  /** The skipped option grants that need a 409A in effect on the board date first (grantNeeds409A). */
+  noStrike: ID[]
+  /** Checklist tasks waiting on this consent that were marked done ('on-equity-board', 'ch-refresh-grant'). */
+  tasksClosed: number
   /** True when these are the company's first option grants (the 25102(o) notice clock starts). */
   firstIssuance: boolean
   /** California 25102(o) notice due date, 30 days after the first issuance (docs/SPEC.md). */
   notice25102oDueOn?: ISODate
-  /** 409A warnings on the board date, plus a note when the board date is after `date`. */
+  /**
+   * The note about grants not approved for lack of a 409A first (when any), then 409A warnings on the board
+   * date, a note when the board date is after `date`, and a late 25102(o) notice.
+   */
   warnings: string[]
 }
 
 /**
  * Marks promised grants as board approved on `boardDate`. By default the strike is set to the 409A in
- * effect on the board date (options are priced at grant).
+ * effect on the board date (options are priced at grant). The checklist tasks that wait on the consent
+ * close with it (closeBoardConsentTasks), dated the board date, or today for a board date still ahead.
  * The 25102(o) notice is due 30 days after the first issuance, so equity.firstIssuanceOn is the earliest board
  * approval on record: when it is unset and earlier grants were already approved (approved, or cancelled after
  * board approval), it is set to the earliest of those and this is not the first issuance (with a warning when
@@ -471,10 +542,6 @@ export function approveGrants(
   opts: { date: ISODate; keepStrike?: boolean },
 ): ApproveGrantsResult {
   const db = draft as DB
-  const warnings = valuationWarnings(db, boardDate)
-    .filter((w) => w.kind !== 'strike')
-    .map((w) => w.text)
-  if (boardDate > opts.date) warnings.push(`The board date ${fmtDate(boardDate)} is after today.`)
   // Earliest earlier board approval, read before this approval changes any status.
   const earlier = db.grants
     .filter((g) => (g.status === 'approved' || g.status === 'cancelled') && !!g.boardApprovedOn)
@@ -483,7 +550,7 @@ export function approveGrants(
   const fmv = current409A(db, boardDate)?.fmvPerShare
   const approved: ID[] = []
   const skipped: ID[] = []
-  let noStrike = 0
+  const noStrike: ID[] = []
   for (const id of grantIds) {
     const g = draft.grants.find((x) => x.id === id)
     if (!g || g.status !== 'promised') {
@@ -492,9 +559,9 @@ export function approveGrants(
     }
     // Options are priced at fair market value on the grant date: with no 409A in effect and no strike
     // entered, approving would record a $0 strike, so the grant waits for a valuation.
-    if (g.type !== 'RSA' && fmv == null && !(g.strikePrice > 0)) {
+    if (grantNeeds409A(db, g, boardDate)) {
       skipped.push(id)
-      noStrike++
+      noStrike.push(id)
       continue
     }
     g.status = 'approved'
@@ -510,11 +577,20 @@ export function approveGrants(
       text: `Board approved the ${g.type === 'RSA' ? 'restricted stock' : 'option'} grant for ${holderName(db, g)} (board date ${fmtDate(boardDate)})`,
     })
   }
-  if (noStrike) {
+  const approvedGrants = draft.grants.filter((g) => approved.includes(g.id))
+  const tasksClosed = approvedGrants.length ? closeBoardConsentTasks(draft, approvedGrants, boardDate < opts.date ? boardDate : opts.date) : 0
+  // What went wrong comes first; the generic "no 409A on file" warning would only repeat it.
+  const warnings: string[] = []
+  if (noStrike.length) {
     warnings.push(
-      `${noStrike === 1 ? '1 option grant was' : `${noStrike} option grants were`} not approved: no 409A valuation is in effect on ${fmtDate(boardDate)}, so there is no strike price. Add a 409A first.`,
+      `${noStrike.length === 1 ? '1 option grant was' : `${noStrike.length} option grants were`} not approved: no 409A valuation is in effect on ${fmtDate(boardDate)}, so there is no strike price. Record a 409A first.`,
     )
   }
+  for (const w of valuationWarnings(db, boardDate)) {
+    if (w.kind === 'strike' || (w.kind === 'missing' && noStrike.length)) continue
+    warnings.push(w.text)
+  }
+  if (boardDate > opts.date) warnings.push(`The board date ${fmtDate(boardDate)} is after today.`)
   let firstIssuance = false
   let notice25102oDueOn: ISODate | undefined
   const prior = [draft.equity.firstIssuanceOn, earlier].filter((d): d is ISODate => !!d).sort()[0]
@@ -547,12 +623,156 @@ export function approveGrants(
       text: `First option grants recorded on ${fmtDate(boardDate)}. The California 25102(o) notice is due by ${fmtDate(notice25102oDueOn)}.`,
     })
   }
-  return { approved, skipped, firstIssuance, ...(notice25102oDueOn ? { notice25102oDueOn } : {}), warnings }
+  return { approved, skipped, noStrike, tasksClosed, firstIssuance, ...(notice25102oDueOn ? { notice25102oDueOn } : {}), warnings }
 }
 
 /** Last day to exercise vested options after leaving: last day + the grant's post-termination window (90 days by default). */
 export function exerciseDeadline(grant: Pick<EquityGrant, 'postTerminationExerciseDays'>, lastDay: ISODate): ISODate {
   return addDays(lastDay, grant.postTerminationExerciseDays > 0 ? grant.postTerminationExerciseDays : 90)
+}
+
+// ---------------------------------------------------------------------------------------------
+// 409A valuations and cap table numbers (entered by the founder; the cap table tool stays the source of truth)
+// ---------------------------------------------------------------------------------------------
+
+export type ValuationInput = Omit<Valuation409A, 'id'>
+
+export type ValuationField = 'effectiveOn' | 'fmvPerShare' | 'provider' | 'expiresOn'
+
+/** Safe harbor end to suggest: 12 months after the effective date (a priced round or other material event ends it sooner). */
+export function defaultSafeHarborEnd(effectiveOn: ISODate): ISODate {
+  return addMonths(effectiveOn, 12)
+}
+
+/**
+ * Problems with a 409A entry, pinned to the field to fix (empty when it can be saved). `others` are the
+ * valuations already on file (leave out the one being edited): two on the same date would make the one
+ * in effect ambiguous.
+ */
+export function valuationErrors(
+  v: { effectiveOn?: ISODate | null; fmvPerShare?: number | null; provider?: string | null; expiresOn?: ISODate | null },
+  others: ReadonlyArray<Pick<Valuation409A, 'effectiveOn'>> = [],
+): Partial<Record<ValuationField, string>> {
+  const out: Partial<Record<ValuationField, string>> = {}
+  if (!v.effectiveOn) out.effectiveOn = 'Pick the effective date from the valuation report.'
+  else if (others.some((o) => o.effectiveOn === v.effectiveOn)) out.effectiveOn = 'A 409A with this effective date is already on file. Edit that one instead.'
+  if (v.fmvPerShare == null || !Number.isFinite(v.fmvPerShare) || v.fmvPerShare <= 0) out.fmvPerShare = 'Enter the fair market value a share, more than $0.'
+  if (!v.provider?.trim()) out.provider = 'Name the firm that did the valuation.'
+  if (!v.expiresOn) out.expiresOn = 'Pick the date safe harbor ends.'
+  else if (v.effectiveOn && v.expiresOn <= v.effectiveOn) out.expiresOn = 'Safe harbor has to end after the effective date.'
+  return out
+}
+
+function cleanValuation(input: ValuationInput): ValuationInput {
+  const out: ValuationInput = {
+    effectiveOn: input.effectiveOn,
+    fmvPerShare: Math.round(input.fmvPerShare * 10_000) / 10_000,
+    provider: input.provider.trim(),
+    expiresOn: input.expiresOn,
+  }
+  if (input.note?.trim()) out.note = input.note.trim()
+  return out
+}
+
+/** Records a 409A valuation and logs it (with no price: activity can be seen outside Admin). Returns its id. */
+export function addValuation(draft: Draft<DB>, input: ValuationInput): ID {
+  const v: Valuation409A = { id: newId('v'), ...cleanValuation(input) }
+  draft.equity.valuations.push(v)
+  log(draft, {
+    entityType: 'equity',
+    entityId: v.id,
+    kind: 'valuation_recorded',
+    text: `Recorded a 409A valuation effective ${fmtDate(v.effectiveOn)} from ${v.provider}, safe harbor until ${fmtDate(v.expiresOn)}`,
+  })
+  return v.id
+}
+
+/** Corrects a 409A valuation on file. Returns false when there is no such valuation or nothing changed. */
+export function updateValuation(draft: Draft<DB>, id: ID, input: ValuationInput): boolean {
+  const list = draft.equity.valuations
+  const i = list.findIndex((v) => v.id === id)
+  if (i < 0) return false
+  const next: Valuation409A = { id, ...cleanValuation(input) }
+  if (JSON.stringify(next) === JSON.stringify(list[i])) return false
+  list[i] = next
+  log(draft, { entityType: 'equity', entityId: id, kind: 'valuation_updated', text: `Updated the 409A valuation effective ${fmtDate(next.effectiveOn)}` })
+  return true
+}
+
+/** Removes a 409A valuation entered by mistake. Approved grants keep the strike they were given. */
+export function removeValuation(draft: Draft<DB>, id: ID): boolean {
+  const v = draft.equity.valuations.find((x) => x.id === id)
+  if (!v) return false
+  draft.equity.valuations = draft.equity.valuations.filter((x) => x.id !== id)
+  log(draft, { entityType: 'equity', entityId: id, kind: 'valuation_removed', text: `Removed the 409A valuation effective ${fmtDate(v.effectiveOn)}` })
+  return true
+}
+
+export type CapTable = Pick<EquitySetup, 'authorizedShares' | 'fullyDilutedShares' | 'founderShares' | 'poolShares'>
+
+export type CapTableField = keyof CapTable
+
+/**
+ * Problems with cap table numbers, pinned to the field to fix: whole shares, founder shares plus the option
+ * pool (with `poolIncreases`, shares the board added to the pool later) within fully diluted, and fully
+ * diluted within authorized.
+ */
+export function capTableErrors(c: { [K in CapTableField]: number | null }, poolIncreases = 0): Partial<Record<CapTableField, string>> {
+  const out: Partial<Record<CapTableField, string>> = {}
+  const labels: Record<CapTableField, string> = {
+    authorizedShares: 'authorized shares',
+    fullyDilutedShares: 'fully diluted shares',
+    founderShares: 'founder shares',
+    poolShares: 'option pool',
+  }
+  for (const k of Object.keys(labels) as CapTableField[]) {
+    const n = c[k]
+    if (n == null || !Number.isFinite(n)) out[k] = `Enter the ${labels[k]}.`
+    else if (!Number.isInteger(n) || n < 0) out[k] = 'Use a whole number of shares, 0 or more.'
+  }
+  if (!out.fullyDilutedShares && (c.fullyDilutedShares ?? 0) <= 0) out.fullyDilutedShares = 'Fully diluted shares must be more than 0.'
+  if (Object.keys(out).length) return out
+  const fd = c.fullyDilutedShares as number
+  const used = (c.founderShares as number) + (c.poolShares as number) + poolIncreases
+  if (used > fd) {
+    out.fullyDilutedShares = `Fully diluted has to cover the founder shares plus the whole option pool (${num(used)}${poolIncreases ? `, with ${num(poolIncreases)} added to the pool later` : ''}).`
+  } else if (fd > (c.authorizedShares as number)) {
+    out.authorizedShares = 'Authorized shares have to be at least the fully diluted count. The charter sets how many the company may issue.'
+  }
+  return out
+}
+
+/**
+ * The one write path for the cap table numbers (authorized, fully diluted, founder and pool shares). Pool
+ * increases stay as they are. Saving marks the numbers as entered (`capTableConfirmedOn`), and saving the
+ * placeholder numbers unchanged confirms them. Logs no counts (activity can be seen outside Admin). Returns
+ * false when nothing changed.
+ */
+export function updateCapTable(draft: Draft<DB>, c: CapTable, on: ISODate): boolean {
+  const e = draft.equity
+  if (
+    e.authorizedShares === c.authorizedShares &&
+    e.fullyDilutedShares === c.fullyDilutedShares &&
+    e.founderShares === c.founderShares &&
+    e.poolShares === c.poolShares
+  ) {
+    return confirmCapTable(draft, on)
+  }
+  e.authorizedShares = c.authorizedShares
+  e.fullyDilutedShares = c.fullyDilutedShares
+  e.founderShares = c.founderShares
+  e.poolShares = c.poolShares
+  e.capTableConfirmedOn = on
+  log(draft, { entityType: 'equity', entityId: 'equity', kind: 'cap_table_updated', text: 'Updated the cap table: authorized, fully diluted, founder and option pool shares' })
+  return true
+}
+
+/** 'These numbers are right': confirms the cap table numbers on file. Returns false when they already were. */
+export function confirmCapTable(draft: Draft<DB>, on: ISODate): boolean {
+  if (draft.equity.capTableConfirmedOn) return false
+  draft.equity.capTableConfirmedOn = on
+  log(draft, { entityType: 'equity', entityId: 'equity', kind: 'cap_table_confirmed', text: 'Confirmed the cap table numbers' })
+  return true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -573,9 +793,17 @@ export type GrantSummary = {
   nextVest: { date: ISODate; shares: number } | null
   /** The next cliff, or the most recent one once all cliffs have passed. */
   cliff: { date: ISODate; shares: number; passed: boolean } | null
+  /** When the last live grant finishes vesting; null when vesting stops at the holder's last day first. */
   fullyVestedOn: ISODate | null
+  /**
+   * The holder's last day (end date, separation or contract end), once one is known: vesting stops there,
+   * what had vested is kept, the unvested shares go back to the pool, and vested options can be exercised
+   * until exerciseBy (null when nothing vested, or only restricted stock).
+   */
+  exit: { lastDay: ISODate; vestedAtExit: number; returnsToPool: number; exerciseBy: ISODate | null } | null
   pctFullyDiluted: number
-  status: 'none' | 'reserved' | 'awaiting_board' | 'pre_cliff' | 'vesting' | 'fully_vested' | 'ended'
+  /** leaving = a last day is set and has not passed yet; ended = it has passed. */
+  status: 'none' | 'reserved' | 'awaiting_board' | 'pre_cliff' | 'vesting' | 'fully_vested' | 'leaving' | 'ended'
   text: string
 }
 
@@ -596,6 +824,9 @@ export function grantSummary(db: DB, personId: ID, date: ISODate): GrantSummary 
     if (credited >= g.vestingMonths) continue
     const nextM = credited < g.cliffMonths ? g.cliffMonths : credited + 1
     const nextDate = addMonths(g.vestingStart, Math.max(nextM, 1))
+    // Nothing vests after the last day (or the cancellation date).
+    const stop = vestingStop(db, g)
+    if (stop && nextDate > stop) continue
     const shares = vestAtMonth(g, Math.max(nextM, 1)) - vestAtMonth(g, credited)
     if (shares > 0) {
       if (!nextVest || nextDate < nextVest.date) nextVest = { date: nextDate, shares }
@@ -606,13 +837,31 @@ export function grantSummary(db: DB, personId: ID, date: ISODate): GrantSummary 
     if (g.cliffMonths <= 0) continue
     const d = cliffDate(g)
     const c = { date: d, shares: vestAtMonth(g, g.cliffMonths), passed: d <= date }
-    if (!c.passed && !liveOn(db, g, date)) continue
+    const stop = vestingStop(db, g)
+    if (!c.passed && (!liveOn(db, g, date) || (stop && d > stop))) continue
     if (!cliff) cliff = c
     else if (!c.passed && (cliff.passed || d < cliff.date)) cliff = c
     else if (c.passed && cliff.passed && d > cliff.date) cliff = c
   }
-  const fullyVestedOn = live.length ? live.map((g) => fullyVestedDate(g)).sort().reverse()[0] : null
+  // A grant whose vesting stops before its schedule ends is never fully vested.
+  const completes = live.filter((g) => {
+    const stop = vestingStop(db, g)
+    return !stop || fullyVestedDate(g) <= stop
+  })
+  const fullyVestedOn = live.length && completes.length === live.length ? live.map((g) => fullyVestedDate(g)).sort().reverse()[0] : null
   const ended = grants.length > 0 && live.length === 0 && grants.every((g) => g.status === 'cancelled' || !!holderEndDate(db, g))
+
+  const lastDay = holderEndDate(db, { personId })
+  let exit: GrantSummary['exit'] = null
+  if (lastDay && all.some((g) => g.status !== 'reserved')) {
+    const vestedAtExit = grants.reduce((t, g) => t + vestedHeld(db, g, lastDay), 0)
+    // Everything granted that had not vested by the last day goes back: recorded cancellations and the rest.
+    const returnsToPool = all.filter((g) => g.status !== 'reserved').reduce((t, g) => t + g.shares - vestedHeld(db, g, lastDay), 0)
+    const options = grants.filter((g) => g.type !== 'RSA' && vestedHeld(db, g, lastDay) > 0)
+    const recorded = db.people.find((p) => p.id === personId)?.separation?.exerciseDeadline
+    const exerciseBy = options.length ? (recorded ?? options.map((g) => exerciseDeadline(g, lastDay)).sort()[0]) : null
+    exit = { lastDay, vestedAtExit, returnsToPool, exerciseBy }
+  }
 
   let status: GrantSummary['status']
   let text: string
@@ -622,6 +871,12 @@ export function grantSummary(db: DB, personId: ID, date: ISODate): GrantSummary 
   } else if (ended) {
     status = 'ended'
     text = `${num(vested)} vested options kept after leaving`
+  } else if (exit && exit.lastDay >= date) {
+    status = 'leaving'
+    text =
+      exit.returnsToPool > 0
+        ? `Vesting stops ${fmtDate(exit.lastDay)}: ${num(exit.vestedAtExit)} vested, ${num(exit.returnsToPool)} return to the pool`
+        : `Last day ${fmtDate(exit.lastDay)}, fully vested: ${plural(exit.vestedAtExit, 'option')}`
   } else if (awaitingBoard === totalShares) {
     status = 'awaiting_board'
     text = 'Grant awaiting board consent'
@@ -646,6 +901,7 @@ export function grantSummary(db: DB, personId: ID, date: ISODate): GrantSummary 
     nextVest,
     cliff,
     fullyVestedOn,
+    exit,
     pctFullyDiluted: pctOfFullyDiluted(db, totalShares),
     status,
     text,

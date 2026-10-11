@@ -30,6 +30,8 @@ export type NewCandidateInput = {
   sourceDetail?: string
   referrerId?: ID | null
   desiredPay?: number
+  /** 'hour' when desiredPay is an hourly rate (hourly and part-time jobs); a year otherwise. */
+  desiredPayUnit?: Candidate['desiredPayUnit']
   sponsorship?: Candidate['sponsorship']
   tags?: string[]
   summary?: string
@@ -67,7 +69,7 @@ export function addCandidate(
     ...(input.currentCompany ? { currentCompany: input.currentCompany } : {}),
     ...(input.sourceDetail ? { sourceDetail: input.sourceDetail } : {}),
     ...(input.referrerId ? { referrerId: input.referrerId } : {}),
-    ...(input.desiredPay != null ? { desiredPay: input.desiredPay } : {}),
+    ...(input.desiredPay != null ? { desiredPay: input.desiredPay, ...(input.desiredPayUnit === 'hour' ? { desiredPayUnit: 'hour' as const } : {}) } : {}),
     ...(input.summary ? { summary: input.summary } : {}),
     retainUntil: addYears(opts.date, 4),
   }

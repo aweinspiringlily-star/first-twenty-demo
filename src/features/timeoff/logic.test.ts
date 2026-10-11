@@ -8,6 +8,7 @@ import { whoIsOut } from '@/domain/timeoff'
 import type { LeaveCase } from '@/domain/types'
 import {
   afterTheFactKind,
+  approvalGroups,
   approverLabel,
   defaultLeaveReturn,
   leaveDatesValid,
@@ -26,11 +27,16 @@ import {
   markReturned,
   monthWeeks,
   outByDay,
+  hireStartPresets,
+  leaveStartPresets,
+  noteCountText,
   rangePresets,
   rangeSummary,
   rangeText,
   shortRange,
+  startInWeeks,
   startPresets,
+  waitingOnManager,
 } from './logic'
 
 const HOL = defaultHolidays()
@@ -50,6 +56,47 @@ describe('monthWeeks', () => {
     const weeks = monthWeeks('2026-11-01')
     expect(weeks[0][6]).toBe('2026-11-01')
     expect(weeks).toHaveLength(6)
+  })
+})
+
+describe('leave start chips', () => {
+  it('lands "In N weeks" on the Monday on or after today plus N weeks', () => {
+    const sun = '2026-10-11'
+    expect(leaveStartPresets(sun, HOL)).toEqual([
+      { label: 'Today', date: sun },
+      { label: 'Next Mon', date: '2026-10-12' },
+      { label: 'In 2 weeks (Mon)', date: '2026-10-26' },
+      { label: 'In 4 weeks (Mon)', date: '2026-11-09' },
+      { label: 'In 6 weeks (Mon)', date: '2026-11-23' },
+    ])
+    // From a Monday, two weeks out is that Monday.
+    expect(startInWeeks('2026-10-12', 2, HOL)).toBe('2026-10-26')
+    // A Monday holiday moves to the next workday, and the label says so.
+    const ownHoliday = [...HOL, { date: '2026-10-26', name: 'Company day' }]
+    expect(leaveStartPresets(sun, ownHoliday)[2]).toEqual({ label: 'In 2 weeks (Tue)', date: '2026-10-27' })
+  })
+})
+
+describe('hire start chips', () => {
+  it('lands "In 2 weeks" and "In 3 weeks" on the Monday on or after today plus N weeks, late in the week too', () => {
+    // Sunday Oct 11: two weeks out is Sun Oct 25, so the chip is Mon Oct 26 (not Oct 19, 8 days away).
+    expect(hireStartPresets('2026-10-11', HOL)).toEqual([
+      { label: 'Next Mon', date: '2026-10-12' },
+      { label: 'In 2 weeks (Mon)', date: '2026-10-26' },
+      { label: 'In 3 weeks (Mon)', date: '2026-11-02' },
+    ])
+    // Thursday Oct 15: Next Mon Oct 19, then Nov 2 and Nov 9.
+    expect(hireStartPresets('2026-10-15', HOL).map((p) => p.date)).toEqual(['2026-10-19', '2026-11-02', '2026-11-09'])
+    // A Monday holiday moves to the next workday, and the label says so.
+    const ownHoliday = [...HOL, { date: '2026-10-26', name: 'Company day' }]
+    expect(hireStartPresets('2026-10-11', ownHoliday)[1]).toEqual({ label: 'In 2 weeks (Tue)', date: '2026-10-27' })
+  })
+})
+
+describe('note length', () => {
+  it('counts characters only near the limit', () => {
+    expect(noteCountText('x'.repeat(799))).toBeNull()
+    expect(noteCountText('x'.repeat(850))).toBe('850 of 1,000 characters')
   })
 })
 
@@ -342,5 +389,46 @@ describe('holidays', () => {
     expect(ics.match(/BEGIN:VEVENT/g)).toHaveLength(11)
     expect(ics).toContain('DTSTART;VALUE=DATE:20271125')
     expect(ics).toContain('DTEND;VALUE=DATE:20271126')
+  })
+})
+
+describe('approval routing', () => {
+  it('groups requests by who approves them, the same way the inbox routes them', () => {
+    const db = buildSampleDB()
+    const admin = { role: 'admin' as const, personId: 'p-founder' }
+    const pending = db.timeOffRequests.filter((r) => r.status === 'pending')
+    const kofi = pending.find((r) => r.personId === 'p-kofi')
+    if (!kofi) throw new Error('no pending request for Kofi')
+    // Caleb reports to the founder; Kofi reports to Tomas, who approves his Oct 30 request.
+    const groups = approvalGroups(db, admin, pending, FRI)
+    expect(groups.map((g) => [g.label, g.requests.map((r) => r.personId)])).toEqual([
+      ['Waiting for you', ['p-caleb']],
+      ['Waiting on Tomas', ['p-kofi']],
+    ])
+    expect(waitingOnManager(db, admin, kofi, FRI)?.id).toBe('p-tomas')
+    // The Admin inbox leaves Kofi's request to Tomas too (it shows only within a week of the start)
+    const founder = db.people.find((p) => p.id === 'p-founder')
+    const mine = inboxItems(db, { role: 'admin', personId: 'p-founder', person: founder }, FRI).filter((i) => i.kind === 'timeoff' && i.waitingOn === 'you')
+    expect(mine.every((i) => groups[0].requests.some((r) => r.id === i.refs?.requestId))).toBe(true)
+    // Tomas sees it as his own
+    expect(approvalGroups(db, { role: 'manager', personId: 'p-tomas' }, [kofi], FRI).map((g) => [g.label, g.requests.length])).toEqual([['Waiting for you', 1]])
+    // With Tomas gone, it comes back to Admin
+    const gone = produce(db, (d) => {
+      const tomas = d.people.find((p) => p.id === 'p-tomas')
+      if (tomas) tomas.endDate = '2026-10-01'
+    })
+    expect(approvalGroups(gone, admin, pending, FRI).map((g) => g.label)).toEqual(['Waiting for you'])
+    // Sick leave before the 90-day wait is always Admin's call
+    expect(waitingOnManager(db, admin, { ...kofi, policyId: 'pol-sick' }, FRI)).toBeNull()
+  })
+
+  it('keeps an empty "Waiting for you" group first', () => {
+    const db = buildSampleDB()
+    const kofi = db.timeOffRequests.filter((r) => r.status === 'pending' && r.personId === 'p-kofi')
+    const groups = approvalGroups(db, { role: 'admin', personId: 'p-founder' }, kofi, FRI)
+    expect(groups.map((g) => [g.label, g.requests.length])).toEqual([
+      ['Waiting for you', 0],
+      ['Waiting on Tomas', 1],
+    ])
   })
 })
