@@ -97,6 +97,17 @@ WHERE l.workspace_id = 'default'
 ORDER BY l.seq DESC
 LIMIT 50;
 
+-- The assistant's use per company and day (UTC), every company: messages, and the tokens Claude read and
+-- wrote for them (docs/SERVER.md, "Lark, the assistant"): input at full price, written to the prompt cache,
+-- read from it (cache_read high and input low means the cache works), and output. Nothing of what was asked
+-- is stored.
+SELECT u.day, w.slug, u.messages, u.input_tokens, u.cache_creation_input_tokens AS cache_write_tokens,
+       u.cache_read_input_tokens AS cache_read_tokens, u.output_tokens
+FROM assistant_usage u
+JOIN workspaces w ON w.id = u.workspace_id
+ORDER BY u.day DESC, u.messages DESC
+LIMIT 100;
+
 -- How many rows each table holds, every company together.
 SELECT relname AS table_name, n_live_tup AS rows
 FROM pg_stat_user_tables

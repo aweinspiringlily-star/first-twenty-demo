@@ -1,6 +1,6 @@
-// Global header: sync status, search, + New, backup age, privacy blur, display options and the shortcut
-// sheet. Shown at the top of every page (inside the main column on wide screens). Also the shell's
-// notices: preview, sample company and server sync banners.
+// Global header: sync status, search, + New, backup age, privacy blur, display options, the shortcut
+// sheet and Ask <assistant>. Shown at the top of every page (inside the main column on wide screens). Also
+// the shell's notices: preview, sample company and server sync banners.
 import { Fragment, type ReactNode, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { daysBetween, fmtDate, fmtDateTime, fmtTime, parseDate, toISODate, today } from '@/lib/dates'
 import { copyText, downloadFile } from '@/lib/files'
@@ -24,6 +24,7 @@ import {
   tooLargeText,
 } from '@/features/settings/serverLogic'
 import { focusServerStep } from '@/features/settings/serverFocus'
+import { AskButton } from '@/features/assistant'
 import {
   clearRefreshed,
   clearReplacedRemotely,
@@ -339,6 +340,7 @@ export function Header() {
         <BlurToggle />
         <DisplayMenu />
         <ShortcutSheet />
+        <AskButton />
         <NewMenu />
       </div>
     </div>

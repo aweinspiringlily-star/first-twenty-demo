@@ -81,14 +81,20 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 # TCP to Postgres and Caddy, plus a Unix socket if DATABASE_URL points at one.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-# Network: 127.0.0.1 and ::1 only, both ways. Caddy connects in from 127.0.0.1 and Postgres is at
-# 127.0.0.1, so a compromised process cannot open a connection to the internet; the rest of 127.0.0.0/8,
-# such as the DNS resolver on 127.0.0.53, is closed too. It can still reach whatever else listens on
-# 127.0.0.1: Postgres (pg_hba.conf limits these roles to their own database, docs/SERVER.md step 1) and
-# Caddy's admin endpoint on 127.0.0.1:2019. A remote database needs its address added (see the top of
-# this file). Unix sockets are not affected.
+# Network: 127.0.0.1 and ::1, both ways, plus the assistant's way out. Caddy connects in from 127.0.0.1 and
+# Postgres is at 127.0.0.1, so a compromised process cannot open a connection to the internet at large;
+# the rest of 127.0.0.0/8 is closed. It can still reach whatever else listens on 127.0.0.1: Postgres
+# (pg_hba.conf limits these roles to their own database, docs/SERVER.md step 1) and Caddy's admin endpoint
+# on 127.0.0.1:2019. A remote database needs its address added (see the top of this file). Unix sockets
+# are not affected.
 IPAddressDeny=any
 IPAddressAllow=127.0.0.1/32 ::1/128
+# The assistant (docs/SERVER.md, "Lark, the assistant") calls the Claude API at api.anthropic.com: the DNS
+# stub resolver on 127.0.0.53 (systemd-resolved, which looks names up outside this sandbox) and Anthropic's
+# published inbound API ranges, IPv4 160.79.104.0/23 and IPv6 2607:6bc0::/48, from
+# https://platform.claude.com/docs/en/api/ip-addresses (checked 2026-10-11; Anthropic says they do not change
+# without notice). Nothing else on the internet is reachable. Without ANTHROPIC_API_KEY nothing uses them.
+IPAddressAllow=127.0.0.53/32 160.79.104.0/23 2607:6bc0::/48
 # MemoryDenyWriteExecute is deliberately absent: Node's JIT compiler needs writable executable memory.
 
 [Install]

@@ -6,13 +6,13 @@
 -- then give the login a password (psql asks twice and does not show it):
 --   sudo -u postgres psql -c '\password first_twenty_viewer'
 --
--- first_twenty_viewer can read the workspaces (companies), their records, their documents and the change
--- log, and nothing else: not users (password hashes), sessions, trusted_devices or invites (token
--- hashes). Every transaction it opens is read-only, and it holds no write privilege anyway, so a slip in
--- a SQL editor cannot change the data. It cannot reach any other database through the grants below
--- (pg_hba.conf can also pin it to first_twenty: docs/SERVER.md). Safe to re-run; run it again after a
--- migration adds a table, so the new table is readable too. A table that holds credentials must be added
--- to both lists below before that.
+-- first_twenty_viewer can read the workspaces (companies), their records, their documents, the change log
+-- and the assistant's daily counts (assistant_usage, migration 006), and nothing else: not users (password
+-- hashes), sessions, trusted_devices or invites (token hashes). Every transaction it opens is read-only,
+-- and it holds no write privilege anyway, so a slip in a SQL editor cannot change the data. It cannot
+-- reach any other database through the grants below (pg_hba.conf can also pin it to first_twenty:
+-- docs/SERVER.md). Safe to re-run; run it again after a migration adds a table, so the new table is
+-- readable too. A table that holds credentials must be added to both lists below before that.
 
 SELECT 'CREATE ROLE first_twenty_viewer LOGIN'
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'first_twenty_viewer') \gexec

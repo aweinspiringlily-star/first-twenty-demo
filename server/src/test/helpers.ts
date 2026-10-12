@@ -59,6 +59,7 @@ export async function resetDb(db: Db): Promise<void> {
     'sessions',
     'trusted_devices',
     'invites',
+    'assistant_usage',
     'workspace_docs',
     ...RECORD_COLLECTIONS.map(tableName),
     'users',

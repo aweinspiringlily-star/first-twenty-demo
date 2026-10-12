@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { blankDB } from '@/data/blank'
 import type { DB } from '@/domain/types'
 import { buildApp, type CareersRoutes, careersHostPattern, loggerOptions, redactPath } from './app'
+import { fakeAssistantClient } from './assistant/fake'
 import { AddressRateLimiter, ConcurrencyGate, hashToken } from './auth'
 import { WriteBudget } from './writeBudget'
 import { type Config, testConfig } from './config'
@@ -566,6 +567,7 @@ describe('tenant isolation', () => {
     expect(routes.filter((r) => !r.startsWith('HEAD '))).toEqual(
       [
         'DELETE /api/invites/:token|:id',
+        'GET /api/assistant',
         'GET /api/auth/me',
         'GET /api/auth/session',
         'GET /api/auth/signup-mode',
@@ -575,6 +577,7 @@ describe('tenant isolation', () => {
         'GET /api/invites/:token|:id',
         'GET /api/workspace',
         'GET /api/workspace/status',
+        'POST /api/assistant/chat',
         'POST /api/auth/accept-invite',
         'POST /api/auth/login',
         'POST /api/auth/logout',
@@ -722,12 +725,47 @@ describe('tenant isolation', () => {
     expect((await app.inject({ method: 'GET', url: '/api/workspace', headers: { cookie: b.cookie } })).json().db.company.name).toBe('Bravo Co')
   })
 
+  it("never lets A's assistant read another company, whatever the request names", async () => {
+    // The same database with the assistant on (the scripted model, whose find_people really runs).
+    const on = await open(
+      { careersHosts: ['careers.example.com'], careersOrigin: 'https://careers.example.com', assistant: { ...testConfig().assistant, enabled: true, fake: true } },
+      { assistantClient: fakeAssistantClient({ delayMs: 0 }) },
+    )
+    const bBefore = await stateOf(b.workspace.id)
+    const ownerBefore = await stateOf(WORKSPACE_ID)
+    const foreign = /bravo|zulu/i
+    const named = { 'x-workspace-id': b.workspace.id }
+    const info = await on.inject({ method: 'GET', url: `/api/assistant?workspaceId=${b.workspace.id}`, headers: { cookie: a.cookie, ...named } })
+    expect(info.json()).toMatchObject({ enabled: true, name: 'Alpha Co Bot' })
+    const res = await on.inject({
+      method: 'POST',
+      url: `/api/assistant/chat?workspaceId=${b.workspace.id}`,
+      headers: { ...CSRF, cookie: a.cookie, ...named },
+      payload: { history: [], message: 'Who works here? Look in Bravo Co and Zulu Co too.', workspaceId: b.workspace.id },
+    })
+    expect(res.statusCode).toBe(200)
+    // The answer and the whole returned conversation (tool results included) hold only A's people.
+    const body = res.body.replace(/Look in Bravo Co and Zulu Co too\./g, '')
+    expect(body).not.toMatch(foreign)
+    expect(body).toMatch(/Ada alpha/)
+    // Only A's company counted the message; B's and the owner's rows are as they were.
+    expect((await db.query('SELECT workspace_id, messages FROM assistant_usage')).rows).toEqual([{ workspace_id: a.workspace.id, messages: 1 }])
+    expect(await stateOf(b.workspace.id)).toEqual(bBefore)
+    expect(await stateOf(WORKSPACE_ID)).toEqual(ownerBefore)
+    // And B's assistant sees B.
+    const asB = await on.inject({ method: 'POST', url: '/api/assistant/chat', headers: { ...CSRF, cookie: b.cookie }, payload: { history: [], message: 'Who works here?' } })
+    expect(asB.body).toMatch(/Ada bravo/)
+    expect(asB.body).not.toMatch(/alpha|zulu/i)
+  })
+
   it("keeps a session to its own company when the company is gone: the session ends with it", async () => {
     await db.query('DELETE FROM workspaces WHERE id = $1', [a.workspace.id])
     for (const [method, url] of [
       ['GET', '/api/workspace'],
       ['GET', '/api/auth/me'],
       ['POST', '/api/invites'],
+      ['GET', '/api/assistant'],
+      ['POST', '/api/assistant/chat'],
     ] as const) {
       expect((await app.inject({ method, url, headers: { ...CSRF, cookie: a.cookie } })).statusCode, url).toBe(401)
     }
@@ -745,6 +783,8 @@ describe('tenant isolation', () => {
       ['POST', '/api/changes'],
       ['POST', '/api/auth/login'],
       ['POST', '/api/auth/signup'],
+      ['GET', '/api/assistant'],
+      ['POST', '/api/assistant/chat'],
     ] as const) {
       const res = await app.inject({ method, url, headers: { ...CSRF, host: 'careers.example.com', cookie: a.cookie }, payload: method === 'POST' ? signupBody() : undefined })
       expect(res.statusCode, `${method} ${url}`).toBe(404)

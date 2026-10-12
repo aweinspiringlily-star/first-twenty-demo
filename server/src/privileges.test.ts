@@ -6,6 +6,7 @@
 import { PGlite } from '@electric-sql/pglite'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
+import { recordTokens, releaseMessage, remainingToday, reserveMessage } from './assistant/quota'
 import { upsertAdmin } from './auth'
 import { type Db, fromPGlite } from './db'
 import { migrate } from './migrate'
@@ -52,6 +53,17 @@ describe('the server role (rows only, no schema rights)', () => {
     await replaceWorkspace(db, parseWorkspace({ db: ws, confirmReplace: true }), admin.id)
     expect(await pruneChangeLog(db, 120)).toBe(0)
     expect((await snapshot(db))?.db.company).toMatchObject({ name: 'Rightsco' })
+  })
+
+  it("can count the assistant's daily messages and tokens (006)", async () => {
+    const limits = { perWorkspace: 5, global: 10 }
+    const now = new Date('2026-10-11T12:00:00Z')
+    const r = await reserveMessage(db, 'default', limits, now)
+    expect(r).toMatchObject({ ok: true, remaining: 4 })
+    if (!r.ok) return
+    await recordTokens(db, 'default', r.day, { input: 100, cacheWrite: 50, cacheRead: 4000, output: 20 })
+    await releaseMessage(db, 'default', r.day)
+    expect(await remainingToday(db, 'default', limits, now)).toBe(5)
   })
 
   it('keeps working on the new numbering after-restore gives every workspace (run as the owner, as documented)', async () => {

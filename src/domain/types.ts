@@ -98,6 +98,11 @@ export type Company = {
   soc2Enabled: boolean
   soc2?: { typeIReportOn?: ISODate; typeIIWindow?: { from: ISODate; to: ISODate } }
   website?: string
+  /**
+   * What the in-app assistant is called (Settings > Company), at most ASSISTANT_NAME_MAX characters. Unset or
+   * blank: '<company name> Bot' (assistantDisplayName in src/domain/assistant.ts). The sample calls it Lark.
+   */
+  assistantName?: string
 }
 
 /** Employer tax rates and wage bases that Settings may override (fractions, e.g. 0.034 = 3.4%; bases in USD). */

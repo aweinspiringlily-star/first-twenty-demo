@@ -18,6 +18,11 @@
 // (options.careers, server/src/careers) and nothing else; the app, its worker and the API answer 404
 // there, and the careers routes answer only there (each carries a host constraint). No cookie is read or
 // set on a careers host.
+//
+// The assistant (server/src/assistant, docs/SERVER.md "Lark, the assistant"): /api/assistant and
+// /api/assistant/chat sit in the same API plugin, so they get its guards. Its model client comes from
+// options.assistantClient (index.ts builds the real one when ANTHROPIC_API_KEY is set; tests pass a fake),
+// or the scripted fake when ASSISTANT_FAKE is on; with neither, the routes answer that it is off.
 import { readFileSync } from 'node:fs'
 import fastifyCookie from '@fastify/cookie'
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
@@ -48,6 +53,9 @@ import {
   purgeSessions,
   trustDevice,
 } from './auth'
+import type { AssistantClient } from './assistant/client'
+import { fakeAssistantClient } from './assistant/fake'
+import { registerAssistantRoutes } from './assistant/routes'
 import type { Config } from './config'
 import { API_CSP, appCsp, CAREERS_CSP, inlineScriptHashes } from './csp'
 import type { Db } from './db'
@@ -129,6 +137,13 @@ export type BuildAppOptions = {
   passwordGate?: ConcurrencyGate
   /** The careers routes, served on CAREERS_HOSTS (see CareersRoutes). None: careers hosts answer 404 only. */
   careers?: CareersRoutes
+  /**
+   * The assistant's model client (assistant/client.ts). Default: the scripted fake when ASSISTANT_FAKE is on,
+   * else none, and the assistant answers that it is off (index.ts passes the real one when the key is set).
+   */
+  assistantClient?: AssistantClient | null
+  /** The assistant's clock (tests): today for its context note and the day its messages count under. Default: now. */
+  assistantNow?: () => Date
 }
 
 /** A request path with any invite token cut out: a working token is a key to a company, and logs keep paths. */
@@ -153,7 +168,16 @@ export function loggerOptions(config: Config): boolean | Record<string, unknown>
       }),
     },
     redact: {
-      paths: ['req.headers.cookie', 'req.headers.authorization', 'res.headers["set-cookie"]', 'password', '*.password'],
+      paths: [
+        'req.headers.cookie',
+        'req.headers.authorization',
+        'req.headers["x-api-key"]',
+        'res.headers["set-cookie"]',
+        'password',
+        '*.password',
+        'apiKey',
+        '*.apiKey',
+      ],
       censor: '[redacted]',
     },
   }
@@ -177,6 +201,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const inviteLookupLimiter = options.inviteLookupLimiter ?? new AddressRateLimiter(INVITE_LOOKUP_LIMITS)
   const writeBudget = options.writeBudget ?? new WriteBudget()
   const passwordGate = options.passwordGate ?? new ConcurrencyGate()
+  const assistantClient = options.assistantClient ?? (config.assistant.fake ? fakeAssistantClient() : null)
   const version = serverVersion()
   const careersHost = careersHostPattern(config.careersHosts)
   /** Whether a request is for a careers host: the same Host header test the careers routes' constraint makes. */
@@ -519,7 +544,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     })
 
     api.addHook('onSend', async (_request, reply, payload) => {
-      reply.header('Cache-Control', 'no-store')
+      // A route may add to no-store (the assistant's event stream adds no-transform), never drop it.
+      if (!/(^|,)\s*no-store\s*(,|$)/.test(String(reply.getHeader('cache-control') ?? ''))) reply.header('Cache-Control', 'no-store')
       return payload
     })
 
@@ -782,6 +808,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       admitWrite(user, changes.reduce((n, c) => n + (c.json?.length ?? 0), 0))
       return applyChanges(db, changes, user.id, { historyId, workspaceId: user.workspaceId, demoTotalBytes: config.demoMaxTotalBytes })
     })
+
+    // The assistant: GET /api/assistant and POST /api/assistant/chat, on the session login's company.
+    await registerAssistantRoutes(api, { db, config, client: assistantClient, requireAuth, currentUser, now: options.assistantNow })
   }
 
   await app.register(apiRoutes, { prefix: '/api' })

@@ -238,6 +238,8 @@ export function applyCompany(db: Draft<DB>): void {
     address: '2200 Golden Poppy Way, Sacramento, CA 95833',
   }
   c.phone = '(408) 555-0110'
+  // The in-app assistant (src/domain/assistant.ts); a new company leaves it unset and gets '<name> Bot'.
+  c.assistantName = 'Lark'
   c.regularPayday = 'the 15th and the last day of each month'
   c.eddAccountNumber = '000-0000-0 (placeholder)'
   c.firstPayrollOn = '2025-05-15'

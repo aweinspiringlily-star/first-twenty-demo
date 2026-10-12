@@ -2,7 +2,9 @@
 // look, sync with the server). Results respect the Viewing-as mode. Rows are 48px tall for easy pointing.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { canSeeCandidate, canSeeSection, isAdmin, visibleJobs } from '@/domain/access'
+import { assistantDisplayName } from '@/domain/assistant'
 import { fullName } from '@/domain/people'
+import { openAssistant } from '@/features/assistant'
 import { useDB } from '@/store/db'
 import { usePrefs } from '@/store/prefs'
 import { useSyncStatus } from '@/sync'
@@ -200,6 +202,18 @@ export function CommandPalette() {
           },
           hay,
         )
+      }
+    }
+    // The assistant (Admin view): "ask", "assistant" or its name opens it; any other search can be asked as
+    // a question, typed into its box (sorted last).
+    if (query && isAdmin(viewer)) {
+      const name = assistantDisplayName(db.company)
+      const hay = `ask ${name} assistant chat bot ai help question`.toLowerCase()
+      const s = score(hay, query)
+      if (s > 0 && query.length >= 2 && query.split(/\s+/).length <= 2) {
+        out.push({ id: 'ask-assistant', label: `Ask ${name}`, sub: 'Questions about your people, hiring and the rules', run: () => openAssistant(), icon: 'message', group: 'Actions', s })
+      } else if (query.length >= 3) {
+        out.push({ id: 'ask-assistant', label: `Ask ${name}: "${q.trim()}"`, sub: 'Opens the question, ready to send', run: () => openAssistant(q.trim()), icon: 'message', group: 'Actions', s: 0.01 })
       }
     }
     // Looks (Display menu), only when searched for: "look", "comic", "look trading", "theme" ...

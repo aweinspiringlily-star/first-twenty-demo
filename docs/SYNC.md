@@ -27,7 +27,7 @@ Decisions (from the user, October 2026):
 | API server | `server/src/**` (Fastify 5 + `pg`), built into `dist-server/server.mjs` with Vite SSR | Node 22+. Serves `/api/*` and, when `SERVE_APP=true`, the one-file app at `/` and its offline worker at `/sw.js`. |
 | SQL migrations | `server/sql/NNN_name.sql`, applied by `npm run server:migrate` | Tracked in `schema_migrations`. |
 | Shared collection list | `src/sync/collections.ts` | The single source of truth for which DB keys are record collections (one table each) and which are single documents. Server and client both import it. A test asserts it matches `src/domain/types.ts`. |
-| Browser sync engine | `src/sync/**` | Diff, outbox, API client, pull/push loop, status store. No UI. |
+| Browser sync engine | `src/sync/**` | Diff, outbox, API client, pull/push loop, status store. No UI. Also the assistant's client (`src/sync/assistant.ts`, with the event-stream reader `src/sync/sse.ts`): `assistantInfo()` and `assistantChat()`, never synced. |
 | Sync UI | Settings > Server (`#settings.server`), a header status chip, sync banners under the header, the rail note, the sample banner | Opened from a file or the claude.ai artifact viewer, Settings > Server only explains the server and makes no request. A browser that is not connected asks once per page load (`checkServer`) whether a server answers here: for the sample on any page served over http(s), and for any other workspace only on a page the server served (`isServedPage()`, the served mark), so the Vite dev server or a file never probes `/api` for it. If one does, the sample banner offers "Sign in to your server" (or, signed in to an empty server, Start fresh, which then uploads, and Import a backup) before Start fresh, the rail note says where to sign in, and a dismissible notice points a workspace of the company's own at the server while it lives in this browser only. A sign-in asks again; connecting or disconnecting updates the answer. `checkServer` asks `GET /api/auth/session`, so a browser that is not signed in logs no 401 on a normal page load, and, signed in and not connected, `GET /api/workspace/status` (`empty`; never the old servers' fallback, which would download the workspace). |
 | Offline worker | `server/src/offline.ts` (served at `/sw.js`), registered by `src/main.tsx` | Keeps the latest app page, so a page the server served opens again from the browser's copy while the server cannot be reached (see Opening while offline). |
 | Deploy kit | `server/deploy/**` and `docs/SERVER.md` | EC2 setup script, systemd unit, Caddyfile, Postgres role and database SQL, backups, SSH tunnel for development. |
@@ -82,6 +82,13 @@ Decisions (from the user, October 2026):
   document JSON, kept by every write once known (NULL until a demo company's first write counts it).
   Deleting a workspace deletes its logins and invites (foreign keys), and the expiry deletes its records,
   documents and change log in the same transaction.
+- **Assistant use** (migration 006): `assistant_usage (workspace_id, day date, messages int, input_tokens
+  bigint, cache_creation_input_tokens bigint, cache_read_input_tokens bigint, output_tokens bigint)`, primary
+  key `(workspace_id, day)`, one row per company and UTC day: the messages its logins sent the assistant (the
+  daily limits count these) and the tokens Claude read and wrote for them, by kind as the API bills them
+  (input at full price, written to the prompt cache, read from it, and output with the thinking in it),
+  counted for every turn, a turn that failed part way included. Nothing of what was asked or answered.
+  Deleting a workspace deletes its rows (the foreign key cascades, and the expiry deletes them by name).
 
 ## Protocol (`/api`, JSON)
 
@@ -138,6 +145,8 @@ scripts) are not affected, and the development origin (`ALLOWED_ORIGIN`) is exem
 | `PUT /api/workspace` | `{db, confirmReplace?: boolean}` | Replaces everything in one transaction and starts a new history. Allowed without `confirmReplace` only when the server is empty. `200 {workspaceId, historyId, seq, versions}` (`workspaceId`: the company that now holds it, which the browser keeps). Used for the first upload, Import and Start fresh. Body limit 10 MB. In a demo company, the demo limits of `POST /api/changes`. |
 | `GET /api/changes?since=<seq>&history=<historyId>` | | `200 {historyId, seq, changes: Change[]}` (oldest first, at most 5,000 changes, and stopping at the one that takes the page past 8 MB of record JSON; `more: true` when cut short) or `200 {resync: true}`, also when `history` is given and is not the current history id. `history` is optional. |
 | `POST /api/changes` | `{changes: ClientChange[], historyId?}` (at most 2,000) | `200 {historyId, seq, applied: Applied[], conflicts: Conflict[]}`. Applied in one transaction; each change independently accepted or rejected. `409 {error: 'resync'}` (nothing applied) when `historyId` is given and is not the current one: load the snapshot, rebase, then push again. In a demo company (see Companies), nothing applies on `413 {error: 'workspace_full'}` (past its records, its bytes, or what the demo companies may hold together), `413 {error: 'too_large'}` (a record over 64 KB) or `429 {error: 'write_limit', retryAfter}` (writing faster than the demo allows). |
+| `GET /api/assistant` | | `200 {enabled, name, model, remainingToday}`: whether the assistant is on here (`ANTHROPIC_API_KEY` set, or `ASSISTANT_FAKE` in development), its name for the login's company (`assistantDisplayName` of the company document, `src/domain/assistant.ts`; before the first upload, from the sign-up's company name), the model (`null` when off) and the messages the company may still send today (`0` when off). `401` without a session. See The assistant below. |
+| `POST /api/assistant/chat` | `{history, message}` (body limit 200 KB) | `200 text/event-stream` (see The assistant below). Refused before the stream starts: `503 {error: 'assistant_off'}` when the assistant is off; `400 {error: 'bad_request', detail}` for a body that is not `{history, message}` or a message that is blank or over 2,000 characters; `400 {error: 'bad_history', reason: 'malformed' \| 'too_long', detail}` for a history the server will not send on; `409 {error: 'assistant_busy'}` while this login already has an answer on its way; `409 {error: 'assistant_company_busy'}` while the company's logins have 2 answers on their way; `503 {error: 'assistant_full', retryAfter}` while the server runs 8 chats; `429 {error: 'assistant_quota', scope: 'workspace' \| 'global' \| 'reserve', remainingToday: 0}` when the company's or the server's messages for today (UTC) are used up (`reserve`: the server is down to the last quarter it keeps for companies that have asked fewer than 5 today). |
 
 Types:
 
@@ -196,7 +205,8 @@ Rules:
 
 - **The company comes from the session, and only from there.** Every route that needs a session works on
   the workspace of the session's login (`users.workspace_id`): `GET/PUT /api/workspace`,
-  `/api/workspace/status`, `GET/POST /api/changes`, `/api/auth/me`, `POST /api/invites`. A workspace id,
+  `/api/workspace/status`, `GET/POST /api/changes`, `/api/auth/me`, `POST /api/invites`, `/api/assistant`
+  and `/api/assistant/chat` (whose lookups read that workspace alone). A workspace id,
   history id or record named in a request never reaches another company: an id names a record in the
   login's own company, and another company's history id is just a history this one does not have
   (`resync`). `server/src/tenants.test.ts` checks this for every registered route and fails when a route
@@ -236,6 +246,62 @@ Rules:
   `/sw.js` and every `/api` route answer `404` there, the careers routes answer only there, and no cookie
   is read or set there (the session cookies are `__Host-` cookies of the app's own host anyway). Only
   companies whose careers page is on have one.
+
+## The assistant (`server/src/assistant`, migration 006)
+
+The in-app HR assistant (docs/SERVER.md, "Lark, the assistant"). Its name is `assistantDisplayName(company)`
+from `src/domain/assistant.ts`, shared by the app and the server: the company's `assistantName` (trimmed, at
+most 40 characters, set in Settings > Company and synced like the rest of the company document), else the
+company's name and " Bot" (`Company Bot` for a company with no name). The sample calls it Lark.
+
+- **The server keeps no conversations.** `POST /api/assistant/chat` takes `history`: the array the previous
+  `done` event carried, unchanged, or `[]` to start. The browser keeps it per tab (in memory and
+  sessionStorage, never synced) and sends it back as it came: the model's thinking blocks are tied to the
+  exact conversation that produced them, so a history that was edited, reordered or rebuilt is refused or
+  loses that thinking. The server checks it (`history.ts`) and never changes it: at most 40 messages and
+  150 KB of JSON (else `bad_history` with `reason: 'too_long'`: start a new conversation), `user` and
+  `assistant` roles only, alternating from the user and ending with the assistant, user content of `text`
+  and `tool_result` blocks, assistant content of `text`, `thinking`, `redacted_thinking`, `tool_use` (the
+  assistant's own tools only) and `fallback` blocks, every tool call answered in the next message, no
+  citations, images, documents or `cache_control`. It appends the question and runs: `{role: 'user', content:
+  message}`, or, on a conversation's first question and whenever the assistant's name, the company's name or
+  today's date (California) changed since the conversation last said them, `{role: 'user', content: [{type:
+  'text', text: '<app_context>You are Lark, ... Today is ...</app_context>'}, {type: 'text', text: message}]}`
+  (`prompt.ts` `contextNote`; `isAssistantContext` and `questionTexts` in `src/domain/assistant.ts`, which the
+  app uses to leave the note out of the question it shows). The system prompt itself is the same bytes for
+  every company and day, so nothing before the conversation ever changes under it.
+- **The stream.** `200 text/event-stream; charset=utf-8` with `Cache-Control: no-store, no-transform` (so
+  proxies never hold events back to compress them), events of exactly one `event:` and one `data:` line of
+  JSON, lines starting with `:` as keep-alives (every 15 seconds):
+
+  | Event | Data | When |
+  |---|---|---|
+  | `delta` | `{text}` | Answer text as it arrives; append in order. |
+  | `status` | `{label}` | A lookup started, for example `Looking up people`. |
+  | `discard` | `{chars}` | Drop the last `chars` characters of answer text received (as JavaScript counts them): the server asks that model turn again (its tool input could not be parsed), and the new turn streams its own text. A client that skips this event shows the turn's opening twice. |
+  | `done` | `{history, remainingToday, truncated?}` | The answer is complete. `history` is the whole conversation the runner ended with (the history sent, the new message, every tool call and result, the answer): keep it in place of the old one. `truncated: true`: the answer stopped at `ASSISTANT_MAX_TOKENS` (thinking counts toward it) before it finished; it is kept, and the app says it was cut off. |
+  | `error` | `{error, message, remainingToday?, discardPartial?}` | The message failed; `message` says why in plain words. The history stays as it was before this message, and the text streamed for it is not an answer (drop it; `discardPartial: true`, sent for `refused` and `truncated`, says so explicitly). |
+
+  Every stream ends with exactly one `done` or `error`. Error codes: `refused` (the model declined; a
+  server-side fallback model was tried first), `truncated` (a tool call cut off at the length limit),
+  `too_many_steps` (more than 8 model requests), `upstream_busy`, `upstream_unavailable` (Claude overloaded or
+  down, an error status or an error event inside the stream), `upstream_unreachable`, `upstream_error`,
+  `bad_conversation` (the Claude API refused a later question of a conversation: start a new one),
+  `assistant_misconfigured` (the key, model, organization or billing is wrong, or the API refused a
+  conversation's first question, which nothing in a conversation can cause) and `server_error`. Closing the
+  connection stops the request to Claude.
+- **Daily limits** (`quota.ts`): `ASSISTANT_DAILY_PER_WORKSPACE` messages per company and
+  `ASSISTANT_DAILY_GLOBAL` for the server per UTC day, the last quarter of the server's kept for companies
+  that have asked fewer than 5 that day, counted under one advisory lock when a message starts. A message is
+  given back only when no request went to the Claude API for it, or the API turned every request away with an
+  HTTP error status (or could not be reached) before answering; once a request is out, closing the
+  connection does not give it back. Tokens are added when it ends. One chat per login and two per company at
+  a time (in memory), and at most 8 on the server.
+- **Lookups** (`tools.ts`, `reader.ts`): ten read-only tools (`company_overview`, `find_people`,
+  `get_person`, `list_jobs`, `job_pipeline`, `find_candidates`, `list_offers`, `time_off`,
+  `compliance_status`, `law_facts`) that load only the collections they need, of the session login's
+  workspace only, compute with the app's domain code, and answer with at most 8 KB of JSON whose `link`
+  fields are `links.*` routes from `src/app/router.ts`.
 
 ## Browser sync engine (`src/sync/**`)
 
@@ -521,7 +587,8 @@ Rules:
   offline worker's script (`/sw.js`, `application/javascript`, `no-cache`) carries its own policy,
   `default-src 'none'; connect-src 'self'`.
 - Every `/api` route sits in one Fastify plugin whose hooks (CSRF header, cross-site refusal,
-  `Cache-Control: no-store`) apply by route match, so percent-encoded paths get the same guards. Never
+  `Cache-Control: no-store`, which a route may add to but never drop) apply by route match, so
+  percent-encoded paths get the same guards. Never
   relax the CSRF header: on a shared parent domain such as `*.sslip.io`, `SameSite` treats every sibling
   host as the same site, so the header (with the `Sec-Fetch-Site` check) is what keeps their pages from
   writing.
@@ -529,3 +596,11 @@ Rules:
   carries HSTS once: the server sends it, and Caddy sets it again in place of the server's copy, so it is
   there even when `PUBLIC_ORIGIN` was left at http.
 - Logs never include request bodies, cookies or passwords.
+- The assistant's `ANTHROPIC_API_KEY` lives in the settings file and the Claude API client in the server's
+  memory only: it is not part of the loaded config, never logged, never in an answer and never sent to a
+  browser (the client is built with `authToken: null`, so an `ANTHROPIC_AUTH_TOKEN` in the environment is
+  never sent with it). The assistant's lookups only read, the session login's workspace only; the history a
+  browser sends back cannot carry a `system` turn, images, documents or other tools. The app's renderer
+  follows links in answers only to in-app pages and the official sources the lookups cite. Its logs say who
+  asked and how it went, never what was asked. The systemd unit lets the server reach the DNS stub and Anthropic's
+  published API addresses besides loopback (docs/SERVER.md).

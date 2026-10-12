@@ -1,6 +1,7 @@
 // Starts the First Twenty server: load settings, open the database, migrate when MIGRATE_ON_START=true
 // (the default for PGlite in development), listen on HOST:PORT and shut down cleanly on SIGTERM/SIGINT.
 import { buildApp } from './app'
+import { anthropicClient } from './assistant/client'
 import { registerCareers } from './careers/routes'
 import { type Config, loadConfig } from './config'
 import { openDb } from './db'
@@ -48,8 +49,12 @@ async function main(): Promise<void> {
     }
   }
 
-  // The careers pages answer on CAREERS_HOSTS only (none set: no careers routes at all).
-  const app = await buildApp({ db, config, careers: registerCareers })
+  // The careers pages answer on CAREERS_HOSTS only (none set: no careers routes at all). The assistant's
+  // client gets ANTHROPIC_API_KEY straight from the environment (loadConfig loaded .env into it), and
+  // nothing else ever holds the key; ASSISTANT_FAKE (development only) makes buildApp use the fake.
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
+  const assistantClient = config.assistant.enabled && !config.assistant.fake && apiKey ? anthropicClient(apiKey) : undefined
+  const app = await buildApp({ db, config, careers: registerCareers, assistantClient })
 
   // Housekeeping at startup and once a day (housekeeping.ts): ended sessions, demo companies unused for
   // DEMO_EXPIRE_DAYS, old change-log rows, long-expired invites.
@@ -86,7 +91,15 @@ async function main(): Promise<void> {
 
   await app.listen({ host: config.host, port: config.port })
   app.log.info(
-    { db: describeDb(config), serveApp: config.serveApp, env: config.nodeEnv, signupMode: config.signupMode, careersHosts: config.careersHosts },
+    {
+      db: describeDb(config),
+      serveApp: config.serveApp,
+      env: config.nodeEnv,
+      signupMode: config.signupMode,
+      careersHosts: config.careersHosts,
+      // Whether the assistant is on and with which model; never the key.
+      assistant: config.assistant.enabled ? (config.assistant.fake ? 'fake' : config.assistant.model) : 'off',
+    },
     `First Twenty server listening on http://${config.host}:${config.port}`,
   )
   void runHousekeeping()

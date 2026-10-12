@@ -28,7 +28,7 @@ const unit = read('server/deploy/first-twenty.service')
 const caddyfile = read('server/deploy/Caddyfile')
 const setupSql = read('server/deploy/postgres-setup.sql')
 const serverDoc = read('docs/SERVER.md')
-const scripts = ['setup-ec2.sh', 'deploy.sh', 'backup.sh', 'with-env.sh'].map((f) => ({
+const scripts = ['setup-ec2.sh', 'deploy.sh', 'backup.sh', 'with-env.sh', 'set-anthropic-key.sh'].map((f) => ({
   name: f,
   text: read(`server/deploy/${f}`),
 }))
@@ -117,11 +117,27 @@ describe('systemd unit and Caddy', () => {
     for (const key of ['IPAddressDeny=any', 'IPAddressAllow=127.0.0.1/32 ::1/128', 'ProtectProc=invisible', 'ProcSubset=pid']) {
       expect(unit).toContain(`\n${key}\n`)
     }
-    // "localhost" means all of 127.0.0.0/8, which includes the DNS resolver on 127.0.0.53.
+    // "localhost" means all of 127.0.0.0/8; only the DNS stub is opened from it, below.
     expect(unit).not.toMatch(/^IPAddressAllow=localhost/m)
     // A remote database must be added to the allow list; the unit says how.
     expect(unit).toMatch(/^#\s+IPAddressAllow=\d+\.\d+\.\d+\.\d+/m)
     expect(serverDoc).toContain('IPAddressAllow=')
+  })
+
+  it("opens exactly the assistant's way out: the DNS stub and Anthropic's published API ranges, with where they come from", () => {
+    // Anthropic's inbound API addresses, https://platform.claude.com/docs/en/api/ip-addresses (checked 2026-10-11).
+    const anthropic = ['160.79.104.0/23', '2607:6bc0::/48']
+    const allow = [...unit.matchAll(/^IPAddressAllow=(.*)$/gm)].map((m) => m[1])
+    expect(allow).toEqual(['127.0.0.1/32 ::1/128', `127.0.0.53/32 ${anthropic.join(' ')}`])
+    // Nothing wider: no "any", no default route, no other loopback addresses.
+    for (const line of allow) expect(line).not.toMatch(/\bany\b|0\.0\.0\.0\/0|::\/0|127\.0\.0\.0\/8|localhost/)
+    // The comment says where the ranges come from and when they were checked.
+    expect(unit).toContain('https://platform.claude.com/docs/en/api/ip-addresses (checked 2026-10-11')
+    // The guide says the same, and says to re-run setup to apply the unit.
+    const section = serverDoc.slice(serverDoc.indexOf('## Lark, the assistant'))
+    expect(section.length).toBeGreaterThan(1000)
+    for (const range of [...anthropic, '127.0.0.53']) expect(section).toContain(range)
+    expect(section).toContain('setup-ec2.sh')
   })
 
   it('keeps restarting however often it fails, so a crash someone can repeat never leaves it stopped', () => {

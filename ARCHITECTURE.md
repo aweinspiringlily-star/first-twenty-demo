@@ -31,9 +31,11 @@ src/
   store/      db.ts (the one store: useDB, mutate, undo, persistence), prefs.ts (per-device prefs)
   themes/     looks (visual skins): registry.ts, one <id>.css per look, optional <id>/decor.tsx, fonts.ts
   data/       law.ts (verified 2026 constants), defaults.ts, blank.ts (solo-founder start), seed/ (sample)
-  features/   one folder per section: home, hiring, people, timeoff (panels), comp, compliance, me, settings
+  features/   one folder per section: home, hiring, people, timeoff (panels), comp, compliance, me, settings;
+              assistant (the Ask sheet, header button and its own Markdown renderer; no route)
   sync/       optional server sync engine (no UI): collections.ts (shared with the server), diff, outbox,
-              API client, status store. Public API in index.ts. Contract: docs/SYNC.md
+              API client, status store, the assistant's client (assistant.ts, sse.ts). Public API in index.ts.
+              Contract: docs/SYNC.md
   careers/    careers pages (no React): render.ts (the HTML for the static demo site, scripts/careers, and
               the server's live pages), application.ts (the live apply form), careers.css
 server/       optional API server (Fastify + Postgres, PGlite in development and tests), SQL migrations,
@@ -199,6 +201,7 @@ Pure logic in `src/domain/**` gets unit tests next to it (`*.test.ts`). Use fixe
 | `#me[.summary\|.job\|.equity\|.timeoff\|.tasks\|.profile\|.roles]` | Me; `#me.timeoff.request` opens the request sheet | features/me |
 | `#settings[.company\|.org\|.hiring\|.templates\|.timeoff\|.rules\|.links\|.data\|.server]` | Settings (admin). `#settings.data.fresh` and `#settings.server.fresh` open Start fresh; `#settings.data.import` focuses Import; `#settings.server` connects to the optional server (docs/SYNC.md); on a demo server (anyone may sign up) it also offers Create a demo company, and `#settings.server.signup` puts focus there. Signed in, it shows the company on the server, invite links and its careers page. | features/settings |
 | `#invite.<token>` | Join a company with an invite link from Settings, Server: a new login in that company, then its workspace into this browser. Any role (no section); the token is the record id, never the tab title. | features/settings (`InvitePage`) |
+| (no route) Ask sheet | The in-app HR assistant (`assistantDisplayName`: the company's `assistantName`, else "<company> Bot"; the sample's is Lark). Header button and H (Admin view only), or Ctrl K ("Ask Lark", or any search sent as a question); the sheet's pencil renames it, as does Settings > Company. Answers stream from the server (docs/SERVER.md "Lark, the assistant") through `assistantChat` in `@/sync`; the conversation lives in this tab (memory and sessionStorage, tied to the login and to the server workspace history it was about, so Start fresh or an Import drops it; never synced) and goes back to the server exactly as it came. Links in answers go only to in-app page routes (an absolute address into the app included, through the same route rules) and to the official sources the assistant's lookups cite (`officialSourceHosts` in `src/domain/assistant.ts`); any other address shows as text that cannot be followed (`safeLink` in features/assistant/markdown.tsx). | features/assistant |
 
 Aliases: `#timeoff` -> `#people.timeoff`, `#plan` -> `#comp.plan`. Always build links with `links.*`
 from `src/app/router.ts`. The App shell checks section access (`canSeeSection`) before rendering a page.
@@ -217,7 +220,8 @@ Each is exported from the owning feature's `index.tsx` (stubs exist until that f
 
 ## Shell services
 
-- Global header (`src/app/Header.tsx`): search (Ctrl K or /), + New menu (N), backup chip, privacy blur (B),
+- Global header (`src/app/Header.tsx`): search (Ctrl K or /), + New menu (N), Ask <assistant> (H, `AskButton` from
+  `@/features/assistant`), backup chip, privacy blur (B),
   Display (look, text size 100-150%, theme for looks with light and dark, reduced motion, single-key shortcuts on/off), shortcut sheet (?).
 - Shortcuts: register with `useShortcut(keys, handler, {description, group})` from `src/app/shortcuts.ts`.
   Never add raw keydown listeners for shortcuts. Single keys respect the user's "shortcuts off" setting.

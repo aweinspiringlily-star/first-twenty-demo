@@ -4,6 +4,7 @@
 // saved while the form was open is never written back with the value the form opened with.
 import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
+import { assistantDisplayName, assistantNameError, defaultAssistantName, normalizeAssistantName } from '@/domain/assistant'
 import { CCPA_REVENUE_THRESHOLD } from '@/domain/compliance'
 import { runway, STALE_CASH_DAYS } from '@/domain/pay'
 import type { Company, FundingRound } from '@/domain/types'
@@ -98,6 +99,8 @@ export function CompanyTab() {
 
 type Identity = Pick<Company, 'name' | 'legalName' | 'entityType' | 'incorporatedIn' | 'foundedOn' | 'stage' | 'tagline'> & {
   website: string
+  /** The in-app assistant's name ('' = the default, '<display name> Bot'). */
+  assistantName: string
 }
 
 const IDENTITY_LABELS: FieldLabels<Identity> = {
@@ -109,6 +112,7 @@ const IDENTITY_LABELS: FieldLabels<Identity> = {
   stage: 'Stage',
   tagline: 'One-line description',
   website: 'Website',
+  assistantName: 'Assistant name',
 }
 
 function IdentityPanel({ company }: { company: Company }) {
@@ -121,6 +125,7 @@ function IdentityPanel({ company }: { company: Company }) {
     stage: company.stage,
     tagline: company.tagline,
     website: company.website ?? '',
+    assistantName: company.assistantName ?? '',
   }
   return (
     <EditablePanel<Identity>
@@ -134,7 +139,7 @@ function IdentityPanel({ company }: { company: Company }) {
           ? 'Add a display name.'
           : !d.legalName.trim()
             ? 'Add the legal name as it appears on your formation documents.'
-            : linkProblem(d.website)
+            : (linkProblem(d.website) ?? assistantNameError(d.assistantName))
       }
       fieldLabels={IDENTITY_LABELS}
       onSave={(d, { changed }) =>
@@ -155,6 +160,12 @@ function IdentityPanel({ company }: { company: Company }) {
               if (d.website.trim()) c.website = normalizeWebsite(d.website)
               else delete c.website
             }
+            if (has('assistantName')) {
+              // An empty field goes back to the default name ('<display name> Bot').
+              const name = normalizeAssistantName(d.assistantName)
+              if (name) c.assistantName = name
+              else delete c.assistantName
+            }
           },
           { entityType: 'company', entityId: 'company' },
         )
@@ -169,6 +180,7 @@ function IdentityPanel({ company }: { company: Company }) {
             { label: 'Stage', value: company.stage },
             { label: 'Website', value: company.website },
             { label: 'One-line description', value: company.tagline },
+            { label: 'Assistant name', value: company.assistantName?.trim() ? assistantDisplayName(company) : `${assistantDisplayName(company)} (the default)` },
           ]}
         />
       }
@@ -204,6 +216,22 @@ function IdentityPanel({ company }: { company: Company }) {
           </FormGrid>
           <Field label="One-line description" hint="Shows on job postings.">
             {(id, hint) => <TextInput id={id} aria-describedby={hint} value={d.tagline} onChange={(e) => set({ tagline: e.target.value })} />}
+          </Field>
+          <Field
+            label="Assistant name"
+            hint={`Leave it empty to call it ${defaultAssistantName({ name: d.name })}. The header's Ask button uses this name.`}
+            error={assistantNameError(d.assistantName)}
+          >
+            {(id, hint) => (
+              <TextInput
+                id={id}
+                aria-describedby={hint}
+                autoComplete="off"
+                placeholder={defaultAssistantName({ name: d.name })}
+                value={d.assistantName}
+                onChange={(e) => set({ assistantName: e.target.value })}
+              />
+            )}
           </Field>
         </>
       )}

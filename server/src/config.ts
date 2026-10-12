@@ -53,9 +53,48 @@ export type Config = {
   careersHosts: string[]
   /** CAREERS_ORIGIN (default https://<first careers host>): the origin careers links are built on. Undefined when careers are off. */
   careersOrigin: string | undefined
+  /** The in-app assistant (server/src/assistant; docs/SERVER.md "Lark, the assistant"). */
+  assistant: AssistantConfig
 }
 
 export type SignupMode = 'closed' | 'open'
+
+/** output_config.effort levels the assistant may run at (ASSISTANT_EFFORT). */
+export const ASSISTANT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type AssistantEffort = (typeof ASSISTANT_EFFORTS)[number]
+
+/**
+ * The assistant's settings. The API key itself (ANTHROPIC_API_KEY) is deliberately not here: it never
+ * leaves the environment except into the Anthropic client index.ts builds (assistant/client.ts), so no log
+ * line or answer that includes the config can carry it.
+ */
+export type AssistantConfig = {
+  /** ANTHROPIC_API_KEY is set, or ASSISTANT_FAKE is on: GET /api/assistant says so and chats run. */
+  enabled: boolean
+  /** ASSISTANT_MODEL (default claude-opus-5-5). */
+  model: string
+  /** ASSISTANT_EFFORT (default low). */
+  effort: AssistantEffort
+  /** ASSISTANT_MAX_TOKENS (default 8000): the most each model turn may write, thinking included. */
+  maxTokens: number
+  /** ASSISTANT_DAILY_PER_WORKSPACE (default 40): messages one company may send per day (UTC). */
+  perWorkspaceDaily: number
+  /** ASSISTANT_DAILY_GLOBAL (default 600): messages every company together may send per day (UTC). */
+  globalDaily: number
+  /** ASSISTANT_FAKE=1: a scripted model for development and tests (assistant/fake.ts); refused in production. */
+  fake: boolean
+}
+
+export const ASSISTANT_DEFAULTS = {
+  model: 'claude-opus-5-5',
+  effort: 'low',
+  maxTokens: 8000,
+  perWorkspaceDaily: 40,
+  globalDaily: 600,
+} as const satisfies Partial<AssistantConfig>
+
+/** A model id as the API spells them (claude-opus-5-5): letters, digits, '.', '-' and '_'. */
+const MODEL_ID = /^[a-z0-9][a-z0-9._-]{2,99}$/i
 
 type Env = Record<string, string | undefined>
 
@@ -266,6 +305,8 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     careersOrigin = app ? `${app.protocol}//${careersHosts[0]}${app.port ? `:${app.port}` : ''}` : `https://${careersHosts[0]}`
   }
 
+  const assistant = assistantConfig(env, production)
+
   return {
     nodeEnv,
     port: positiveInt(env, 'PORT', 8787, 65535),
@@ -290,6 +331,36 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     demoMaxTotalBytes: positiveInt(env, 'DEMO_MAX_TOTAL_MB', 2048, 1_000_000) * 1024 * 1024,
     careersHosts,
     careersOrigin,
+    assistant,
+  }
+}
+
+/**
+ * The assistant's settings. It is on when ANTHROPIC_API_KEY holds a key (its value is only checked for
+ * being there; the Anthropic client reads it, see assistant/client.ts) or ASSISTANT_FAKE is on, which a
+ * production server refuses: a fake model there would answer real people with canned text.
+ */
+function assistantConfig(env: Env, production: boolean): AssistantConfig {
+  const fake = bool(env.ASSISTANT_FAKE, false)
+  if (fake && production) {
+    throw new ConfigError('ASSISTANT_FAKE is for development and tests only. Remove it in production and set ANTHROPIC_API_KEY instead.')
+  }
+  const key = env.ANTHROPIC_API_KEY?.trim() ?? ''
+  if (/\s/.test(key)) throw new ConfigError('ANTHROPIC_API_KEY has a space or line break in it. Paste the key alone, on one line.')
+  const model = env.ASSISTANT_MODEL?.trim() || ASSISTANT_DEFAULTS.model
+  if (!MODEL_ID.test(model)) throw new ConfigError(`ASSISTANT_MODEL must be a model id like ${ASSISTANT_DEFAULTS.model} (got "${env.ASSISTANT_MODEL}").`)
+  const rawEffort = env.ASSISTANT_EFFORT?.trim().toLowerCase() || ASSISTANT_DEFAULTS.effort
+  if (!(ASSISTANT_EFFORTS as readonly string[]).includes(rawEffort)) {
+    throw new ConfigError(`ASSISTANT_EFFORT must be one of ${ASSISTANT_EFFORTS.join(', ')} (got "${env.ASSISTANT_EFFORT}").`)
+  }
+  return {
+    enabled: key !== '' || fake,
+    model,
+    effort: rawEffort as AssistantEffort,
+    maxTokens: positiveInt(env, 'ASSISTANT_MAX_TOKENS', ASSISTANT_DEFAULTS.maxTokens, 128_000),
+    perWorkspaceDaily: positiveInt(env, 'ASSISTANT_DAILY_PER_WORKSPACE', ASSISTANT_DEFAULTS.perWorkspaceDaily, 100_000),
+    globalDaily: positiveInt(env, 'ASSISTANT_DAILY_GLOBAL', ASSISTANT_DEFAULTS.globalDaily, 10_000_000),
+    fake,
   }
 }
 
@@ -319,6 +390,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     demoMaxTotalBytes: 2048 * 1024 * 1024,
     careersHosts: [],
     careersOrigin: undefined,
+    assistant: { enabled: false, ...ASSISTANT_DEFAULTS, fake: false },
     ...overrides,
   }
 }

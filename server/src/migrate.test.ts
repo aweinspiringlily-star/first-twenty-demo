@@ -85,6 +85,27 @@ describe('migrations', () => {
     expect((await db.query('SELECT 1 FROM trusted_devices')).rows).toEqual([])
   })
 
+  it("keep each company's assistant use per day (006), gone with the company", async () => {
+    const r = await db.query<{ column_name: string; data_type: string }>(
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'assistant_usage' ORDER BY column_name`,
+    )
+    expect(r.rows).toEqual([
+      { column_name: 'cache_creation_input_tokens', data_type: 'bigint' },
+      { column_name: 'cache_read_input_tokens', data_type: 'bigint' },
+      { column_name: 'day', data_type: 'date' },
+      { column_name: 'input_tokens', data_type: 'bigint' },
+      { column_name: 'messages', data_type: 'integer' },
+      { column_name: 'output_tokens', data_type: 'bigint' },
+      { column_name: 'workspace_id', data_type: 'text' },
+    ])
+    await db.query(`INSERT INTO workspaces (id, name, slug) VALUES ('w-usage-test', 'Usage', 'usage-test')`)
+    await db.query(`INSERT INTO assistant_usage (workspace_id, day, messages) VALUES ('w-usage-test', '2026-10-11', 3)`)
+    // One row per company and day.
+    await expect(db.query(`INSERT INTO assistant_usage (workspace_id, day) VALUES ('w-usage-test', '2026-10-11')`)).rejects.toThrow()
+    await db.query(`DELETE FROM workspaces WHERE id = 'w-usage-test'`)
+    expect((await db.query('SELECT 1 FROM assistant_usage')).rows).toEqual([])
+  })
+
   it('index the change log by (workspace_id, seq)', async () => {
     const r = await db.query<{ indexdef: string }>(`SELECT indexdef FROM pg_indexes WHERE tablename = 'change_log'`)
     expect(r.rows.some((row) => /\(workspace_id, seq\)/.test(row.indexdef))).toBe(true)
@@ -94,7 +115,7 @@ describe('migrations', () => {
     expect(await pendingMigrations(db)).toEqual([])
     const again = await migrate(db)
     expect(again.applied).toEqual([])
-    expect(again.alreadyApplied).toEqual(['001_init.sql', '002_history_and_seq_versions.sql', '003_trusted_devices.sql', '004_multitenant.sql', '005_demo_hardening.sql'])
+    expect(again.alreadyApplied).toEqual(['001_init.sql', '002_history_and_seq_versions.sql', '003_trusted_devices.sql', '004_multitenant.sql', '005_demo_hardening.sql', '006_assistant.sql'])
     const ws = await db.query<{ id: string }>('SELECT id FROM workspaces')
     expect(ws.rows).toEqual([{ id: 'default' }])
   })

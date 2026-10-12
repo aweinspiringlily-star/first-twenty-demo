@@ -40,6 +40,10 @@
 //   clearRestoredRemotely()          dismisses status.restoredRemotely (the server's copy was replaced by
 //                                    another copy of this workspace)
 //   takeReloadNotice()               a notice the page before a reload left (Sign out and remove data), once
+//   assistantInfo(), assistantChat(input, handlers)   the assistant on the server (GET /api/assistant, the
+//                                    streamed POST /api/assistant/chat); see ./assistant
+//   assistantWorkspaceKey()          the server workspace and history this tab is connected to, which an
+//                                    assistant conversation belongs to
 // Other tabs: removing this browser's data or disconnecting in one tab stops the engine in the others
 // (storage events plus a BroadcastChannel), so no tab writes the workspace or the connection back.
 import { useEffect } from 'react'
@@ -49,6 +53,7 @@ import { getClockOverride } from '@/lib/dates'
 import { applyLoadChanges, loadSample, migrate, stopPersisting, STORAGE_KEY, useDB } from '@/store/db'
 import { type AccountLoader, createAccountLoader, type ServerAccount } from './account'
 import { type AcceptInviteInput, type ApiFailure, createApi, describeFailure, type LoginOptions, type SignupInput, type SyncApi } from './api'
+import { type AssistantApi, createAssistantApi, type ChatHandlers, type ChatInput } from './assistant'
 import { type DemoSignup, demoSignupOf, inviteFailureText, isInviteToken } from './demo'
 import { createSyncEngine, type FlowFailure, type FlowResult, type SignOutOptions, type SyncEngine, type UploadOptions } from './engine'
 import { type CareersSwitchResponse, type InviteInfo, type InviteResponse, type OpenInvite, SERVED_MARKER } from './protocol'
@@ -57,6 +62,7 @@ import { type RecordRef, useSyncStatus } from './status'
 
 export type { ServerAccount } from './account'
 export type { AcceptInviteInput, ApiErrorKind, ApiFailure, ApiResult, LoginOptions, SignupInput, SyncApi } from './api'
+export type { AssistantApi, AssistantFailure, AssistantFailureKind, AssistantInfo, AssistantResult, ChatDone, ChatHandlers, ChatInput } from './assistant'
 export { describeFailure } from './api'
 export type { DemoSignup } from './demo'
 export { companyNameProblem, demoNotice, newPasswordProblem, signupEmailProblem } from './demo'
@@ -462,6 +468,42 @@ export async function setCareers(enabled: boolean): Promise<({ ok: true } & Care
   }
   await getAccountLoader().load({ force: true })
   return { ok: true, ...r.data }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The assistant (docs/SERVER.md, "Lark, the assistant"): nothing here runs until the sheet asks
+// ---------------------------------------------------------------------------------------------
+
+let assistantApi: AssistantApi | null = null
+
+function getAssistantApi(): AssistantApi {
+  assistantApi ??= createAssistantApi()
+  return assistantApi
+}
+
+/** GET /api/assistant: whether the server has the assistant on, its name, and the questions left today. */
+export function assistantInfo() {
+  return getAssistantApi().info()
+}
+
+/**
+ * POST /api/assistant/chat: one question, answered as a stream (handlers get the pieces). Resolves with
+ * the conversation the server ran ('done'), to be kept exactly as it came, or with why it did not finish.
+ */
+export function assistantChat(input: ChatInput, handlers?: ChatHandlers) {
+  return getAssistantApi().chat(input, handlers)
+}
+
+/**
+ * Which server workspace, and which history of it, this tab is connected to ('<workspaceId>/<historyId>'),
+ * or null when it is not connected (or the sync engine has not started). Start fresh, Import and another
+ * computer's replace give the workspace a new history, so an assistant conversation about the old records
+ * can tell it no longer belongs here.
+ */
+export function assistantWorkspaceKey(): string | null {
+  if (!engine) return null
+  const c = engine.getConnection()
+  return c.mode === 'server' && c.workspaceId ? `${c.workspaceId}/${c.historyId ?? ''}` : null
 }
 
 /**

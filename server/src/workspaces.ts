@@ -400,6 +400,7 @@ export async function deleteDemoWorkspace(db: Db, workspaceId: string, stale?: n
       await q.query(`DELETE FROM ${tableName(collection)} WHERE workspace_id = $1`, [workspaceId])
     }
     await q.query('DELETE FROM invites WHERE workspace_id = $1', [workspaceId])
+    await q.query('DELETE FROM assistant_usage WHERE workspace_id = $1', [workspaceId])
     await q.query('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)', [workspaceId])
     await q.query('DELETE FROM trusted_devices WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)', [workspaceId])
     await q.query('DELETE FROM users WHERE workspace_id = $1', [workspaceId])

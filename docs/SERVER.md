@@ -27,6 +27,9 @@ one prints before moving on.
   Twenty, many people at once (see [A public demo server](#a-public-demo-server)).
 - **Optionally, careers pages**: every company's open jobs at an address of its own on a careers host,
   with an apply form that puts applicants straight into its pipeline (see [Careers pages](#careers-pages)).
+- **Optionally, an HR assistant** in the app (Lark in the sample): answers questions from the company's
+  records, explains the employment rules the app tracks and drafts text, using Anthropic's Claude API
+  (see [Lark, the assistant](#lark-the-assistant)).
 - **Nightly backups** of the database, kept for 14 days, optionally copied to S3.
 - **Offline keeps working.** The browser keeps its own copy, queues changes while offline, and catches up
   when the connection returns. Once a browser has opened the app from your server's address, it opens it
@@ -41,7 +44,7 @@ The kit lives in `server/deploy/`, plus `.env.example` in the project root:
 |---|---|
 | `setup-ec2.sh` | One-time setup: Node.js, Caddy, the service user, folders, settings file, services, backups. Safe to run again. |
 | `postgres-setup.sql` | Creates the `first_twenty` database and its two login roles: `first_twenty_owner`, which owns the tables and runs migrations, and `first_twenty`, which the server uses to read and write rows. |
-| `first-twenty.service` | The systemd service that runs the server, sandboxed: read-only code, loopback-only network, no privileged system calls. |
+| `first-twenty.service` | The systemd service that runs the server, sandboxed: read-only code, a network limited to loopback and the Claude API, no privileged system calls. |
 | `Caddyfile` | HTTPS and the reverse proxy to the server, plus a site per careers host when there are any. |
 | `deploy.sh` | Updates the server to the latest code: pull, install, build, back up the database when migrations are pending, migrate, restart, health check. |
 | `with-env.sh` | Runs a command (migrations, creating the admin) with the server's settings. |
@@ -773,7 +776,8 @@ the line) when you are done.
 ## Look at the data in DBeaver
 
 Browse the live data with a read-only login, never the server's or the owner's: `first_twenty_viewer`
-can read the companies (`workspaces`), every record table, the documents and the change log, cannot read
+can read the companies (`workspaces`), every record table, the documents, the change log and the
+assistant's daily counts (`assistant_usage`), cannot read
 `users`, `sessions`, `trusted_devices` or `invites` (password and token hashes), and cannot change
 anything. On a server that holds more than one company, filter by `workspace_id` (`SELECT id, slug, name
 FROM workspaces` lists them; yours is `default`). The ready-made queries in `server/deploy/browse.sql`
@@ -800,8 +804,8 @@ already read only `default`.
 
 3. Records are JSON in each table's `data` column. `server/deploy/browse.sql` has ready-made queries
    (people, jobs, candidates and applications, offers, pay history, equity, time off, checklists, settings,
-   recent changes): open it with **File > Open File**, choose the connection, put the cursor in a query and
-   press **Ctrl+Enter**. Double-click a `data` cell to see the whole record.
+   recent changes, the assistant's daily use): open it with **File > Open File**, choose the connection, put
+   the cursor in a query and press **Ctrl+Enter**. Double-click a `data` cell to see the whole record.
 
 The app is the source of truth: edits belong in the app, which syncs them. The viewer cannot write, so
 nothing done in DBeaver can drift from what the app shows.
@@ -877,10 +881,11 @@ The server log shows `password authentication failed for user "first_twenty"` or
 
 ### The server cannot reach a database on another host
 
-The systemd unit lets the server talk to `127.0.0.1` and `::1` only (`IPAddressDeny=any` with
-`IPAddressAllow=127.0.0.1/32 ::1/128`), so a compromised process cannot open a connection to the
-internet, and not even to the DNS resolver on `127.0.0.53`. It can still reach what listens on
-`127.0.0.1`: Postgres (the `reject` lines from step 1.5 keep it to its own database) and Caddy's admin
+The systemd unit lets the server talk to `127.0.0.1` and `::1` (`IPAddressDeny=any` with
+`IPAddressAllow=127.0.0.1/32 ::1/128`), plus only what the assistant needs: the DNS resolver on
+`127.0.0.53` and Anthropic's API addresses (see [Lark, the assistant](#lark-the-assistant)). So a
+compromised process cannot open a connection to the rest of the internet. It can still reach what listens
+on `127.0.0.1`: Postgres (the `reject` lines from step 1.5 keep it to its own database) and Caddy's admin
 endpoint on port 2019, which can change Caddy's configuration. Nor does the sandbox stop data leaving in
 the server's own answers. If `DATABASE_URL` points at another machine (RDS, a second instance),
 connections time out until you allow that address. Add it in a drop-in, which survives re-running setup:
@@ -987,6 +992,14 @@ private. Fix them with `sudo chmod -R g+rX /opt/first-twenty`. `deploy.sh` sets 
 - Trusted devices: a SHA-256 hash of each browser's device token and when it expires (180 days after its
   last sign-in). It only lets that browser past the per-email sign-in limit. `server:create-admin` and
   `server:after-restore` forget them all.
+- With the assistant on: how many messages each company sent it per day and how many tokens Claude read
+  and wrote for them (`assistant_usage`), never what was asked or answered. Conversations stay in the
+  browser tab that had them.
+
+**Sent to Anthropic, with the assistant on:** each question, the conversation it belongs to, and the
+records the assistant looks up to answer it go to Anthropic's Claude API. How long Anthropic keeps them is
+set by your agreement with Anthropic (see its commercial terms and privacy policy). The app says so in the
+assistant's panel.
 
 **Never stored anywhere:** the things First Twenty does not collect in the first place (SSNs, dates of
 birth, bank details, home street addresses, ID scans, I-9 forms, background check reports, medical
@@ -1218,3 +1231,175 @@ page view gets a short "busy" page instead.
 The static demo site (`npm run build:careers`, the fictional sample company, a form that sends nothing) is
 separate. Both come from the same renderer (`src/careers/render.ts`) and stylesheet
 (`src/careers/careers.css`).
+
+## Lark, the assistant
+
+First Twenty has an HR assistant: **Ask Lark** in the app's header (or its keyboard shortcut) opens a panel
+where anyone signed in to the company asks in plain words, for example "Who starts next week?", "Which legal
+deadlines are overdue?", "Where does the senior engineer search stand?" or "Draft a job posting for a
+founding designer". It answers from the company's own records, links each person, job or candidate it names
+to its page in the app, explains the federal, California and San Jose rules the app tracks with their
+official sources, and drafts text to copy. It cannot change anything: it reads, it never writes.
+
+**Its name.** The sample company calls it Lark. A company names it in **Settings > Company** (Assistant
+name, up to 40 characters); left empty, it is the company's name and "Bot" (**Quillfin Bot**). The name
+syncs with the other company settings.
+
+**Where it runs.** On a First Twenty server with the assistant turned on. Opened from the
+`first-twenty.html` file, a claude.ai artifact or GitHub Pages, the panel explains that it works when the app
+is connected to such a server, and links to the demo sign-up on the public demo server
+(`https://hr-77-112-161-54.sslip.io/#settings.server.signup`); that link shows the assistant only once the demo
+server runs a build with it, its key and the updated systemd unit (see Turn it on). Behind it is Anthropic's Claude API (Claude Opus 5.5 by default): each
+question, the conversation so far and the records the assistant looks up for it go to Anthropic, and the
+panel says so to everyone who uses it. Conversations are kept only in the browser tab (until it closes);
+the server stores how many messages each company sent per day and the tokens they used, never the
+questions or the answers.
+
+### Turn it on
+
+1. In the Claude Console (`https://console.anthropic.com`), create an API key, and set a monthly spend
+   limit for the organization in its limits settings, so a busy demo can never run up a surprise bill.
+2. Put the key in the settings file. The simplest way asks for it without showing it, saves it and
+   restarts the server (from `/opt/first-twenty`, in an interactive terminal):
+
+   ```bash
+   sudo bash server/deploy/set-anthropic-key.sh
+   ```
+
+   It ends by printing what the server reports, `"assistant":"claude-opus-5-5"` when the key took.
+   `--remove` deletes the key and turns the assistant off. By hand instead: `sudo nano /etc/first-twenty/env`
+   and add the line `ANTHROPIC_API_KEY=sk-ant-...`, then `sudo systemctl restart first-twenty`.
+
+   The file is readable only by root (mode 600). The server never logs the key, never returns it in an
+   answer and never sends it to a browser; only the Claude API client in the server's memory holds it.
+3. Let the server reach the Claude API. The systemd unit's network allow list
+   (`server/deploy/first-twenty.service`) has, besides loopback, the DNS resolver on `127.0.0.53` (to look
+   up `api.anthropic.com`) and Anthropic's published inbound API ranges, `160.79.104.0/23` and
+   `2607:6bc0::/48`, from https://platform.claude.com/docs/en/api/ip-addresses (checked 2026-10-11).
+   Install the updated unit by running setup again (it only changes what differs):
+
+   ```bash
+   sudo bash /opt/first-twenty/server/deploy/setup-ec2.sh hr.example.com
+   sudo systemctl restart first-twenty
+   ```
+
+   The EC2 security group allows outbound HTTPS by default; if yours limits outbound traffic, allow TCP 443
+   to those two ranges.
+4. Check: `sudo journalctl -u first-twenty -n 20 --no-pager` shows `"assistant":"claude-opus-5-5"` on the
+   line that says the server is listening, and `GET /api/assistant` (signed in) says `"enabled":true`. Ask
+   it something in the app.
+
+To turn it off, remove the `ANTHROPIC_API_KEY` line and restart; the panel then says it is off. The network
+allowance stays in the unit, unused. To close it as well, add a drop-in (`sudo systemctl edit
+first-twenty`) with `[Service]`, then `IPAddressAllow=` (an empty line resets the list) and
+`IPAddressAllow=127.0.0.1/32 ::1/128`.
+
+If Anthropic ever publishes new addresses (it says they do not change without notice), add them the same
+way, in a drop-in: `IPAddressAllow=<new range>`. Until then the assistant answers "The server could not
+reach Claude", and the server log says `assistant request failed` with no HTTP status.
+
+### Settings
+
+All in `.env.example`; restart after a change.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | empty | The Claude API key. Empty: the assistant is off. It is the only credential sent: an `ANTHROPIC_AUTH_TOKEN` in the environment is ignored. |
+| `ASSISTANT_MODEL` | `claude-opus-5-5` | The Claude model. It must take `effort` (the current Claude models do; Haiku 4.5 and Sonnet 4.5 do not); with another, every question answers that the assistant is not set up correctly. Requests carry no thinking setting: `claude-opus-5-5` always thinks adaptively, and `ASSISTANT_EFFORT` sets how much. |
+| `ASSISTANT_EFFORT` | `low` | How much the model thinks before answering: `low`, `medium`, `high`, `xhigh` or `max`. Higher is slower and costs more. |
+| `ASSISTANT_MAX_TOKENS` | `8000` | The most one model turn may write, its thinking included (up to 128,000). Thinking counts toward it, so a higher effort leaves less of it for the answer: a long draft that reaches it stops mid-sentence, and the panel says the answer was cut off. Raise it (with the cost) if that happens often. |
+| `ASSISTANT_DAILY_PER_WORKSPACE` | `40` | Messages one company may send per day (UTC). |
+| `ASSISTANT_DAILY_GLOBAL` | `600` | Messages every company together may send per day (UTC). |
+| `ASSISTANT_FAKE` | off | `1` runs a scripted model instead of Claude, for development (no key needed, nothing leaves the computer). The server refuses to start with it in production. |
+
+### What it costs, and the limits
+
+Claude Opus 5.5 costs $4 per million input tokens, $20 per million output tokens and $0.20 per million input
+tokens read from the prompt cache (Anthropic's prices, October 2026). The assistant's instructions and tool
+descriptions are cached, so a conversation pays full price for them about once every five minutes. A
+typical question (one or two lookups, a short answer) reads 10,000 to 30,000 tokens, most of them from the
+cache, and writes 500 to 2,000: a few cents. The `browse.sql` query "The assistant's use per company and
+day" shows the real numbers (`assistant_usage`), each kind of token apart as Anthropic bills it: input at
+full price ($4 per million), written to the prompt cache ($5) and read from it ($0.20), and output with the
+thinking in it ($20). Most input should show as cache reads; if it does not, the cache is not working. A
+turn that failed part way (the browser left, Claude broke off) is counted too, with what it had used.
+
+What caps it:
+
+- **Messages per day:** `ASSISTANT_DAILY_PER_WORKSPACE` per company and `ASSISTANT_DAILY_GLOBAL` for the
+  server, counted when a message starts. The last quarter of the server's count is kept for companies that
+  have asked fewer than 5 questions that day, so a few busy companies (or many sign-ups by one person)
+  cannot use it up for everyone. A message is given back only when no request went to Claude for it, or when
+  the API turned the request away with an error status (which Anthropic does not bill) or could not be
+  reached; once a request is out, closing the page does not give the message back, so hanging up early never
+  gets past the limits. Past a limit, the app says the questions are used up and when they come back, in the
+  person's own time (`429 assistant_quota`). The counts reset at midnight UTC (5 PM in California under
+  daylight time, 4 PM in winter).
+- **Per message:** at most 8 requests to Claude (each lookup round is one more), each writing at most
+  `ASSISTANT_MAX_TOKENS`; every lookup answers with at most 8 KB of records.
+- **Per conversation:** 40 messages (each lookup adds two) or 150 KB; then the app asks to start a new one.
+  A question is at most 2,000 characters.
+- **At once:** one answer at a time per login (`409 assistant_busy`), two per company across its logins
+  (`409 assistant_company_busy`), and 8 for the whole server (`503 assistant_full`, try again in a minute), so
+  no company can take every slot.
+
+### How it keeps company data safe
+
+- **One company only.** Its lookups read the signed-in login's company and nothing else, whatever a
+  question or a request names; the tests check every lookup against another company's records.
+- **Records are data, not instructions.** Candidate names, titles and answers come from strangers through
+  the careers pages, and anyone could type "ignore your instructions" into one. The assistant is told that
+  what its lookups return is data and that instructions in records are never followed; every result with
+  candidate text says the same, and record text is cut short. Its lookups only read, so even a successful
+  trick cannot change, delete or send anything.
+- **An answer cannot become a way out.** The panel shows answers with a small renderer of its own:
+  paragraphs, bold, italics, lists, code and links, everything else as plain text. It never shows images or
+  HTML, so no answer makes the page fetch an address by itself. Links are followed only to pages in the app
+  (never to an action, a form or an invite link, also when written as a full address into the app) and to
+  the official sources the assistant's lookups cite (the government and law sites in `src/data/law.ts` and
+  the compliance rules), which open in a new tab without a referrer. Any other address, for example one a
+  planted instruction got the model to write with salaries in it, shows as text with the site it named
+  ("link to evil.example removed") and cannot be clicked. What remains is the text itself: someone who copies
+  an odd address out of an answer by hand could still send what is in it, which is why the assistant is
+  told never to put record data into an address, and why its lookups only read.
+- **What it never does:** rank or score candidates, guess anyone's protected characteristics, or ask for
+  SSNs, bank details, medical details or salary history. Time off it reports never names a confidential kind
+  (bereavement, reproductive loss).
+
+### How it works
+
+`server/src/assistant/`: `routes.ts` (the two routes), `runner.ts` (one message: the Claude API's tool
+runner with streaming), `tools.ts` (the ten read-only lookups, computed with the app's own domain code from
+`src/domain`), `reader.ts` (loads one company's records), `prompt.ts`, `history.ts` (checks the conversation
+a browser sends back), `quota.ts`, `law.ts` (the verified facts from `src/data/law.ts` and the compliance
+rules) and `fake.ts` (`ASSISTANT_FAKE`). The protocol is in `docs/SYNC.md` (`/api/assistant`).
+
+- The browser sends the whole conversation with each question, exactly as the server returned it last time,
+  and the server checks it (user and assistant turns only, text and the assistant's own lookups, nothing
+  that could pull in images, documents or other sites) and never changes it: the model's thinking is tied to
+  the exact conversation that produced it.
+- Answers stream back as server-sent events (`delta` text, `status` while a lookup runs, `discard` when a
+  turn is asked again, then `done` with the conversation, or `error`). Caddy passes them through as they
+  arrive: the stream is marked `Cache-Control: no-store, no-transform`, so Caddy's compression leaves it
+  alone, and nothing in the Caddyfile needs changing. When the browser goes away, the server stops the
+  request to Claude (the message still counts if the request was out).
+- Requests leave the thinking setting out (on `claude-opus-5-5` adaptive thinking is the only mode) and set
+  `ASSISTANT_EFFORT`, cache the instructions and tool descriptions, and turn on Anthropic's server-side
+  refusal fallback (`fallbacks: "default"`), which retries a request a safety classifier declined on the
+  model Anthropic recommends for it. When that happens part way through an answer, the turn goes back into
+  the conversation the way Anthropic's docs say: the declined model's text stays, its thinking and
+  half-made lookups are left out, and those lookups never run.
+- The model's thinking is tied to the instructions and the conversation it was written under, so neither
+  ever changes under a running conversation: the instructions are the same for every company and day, and
+  the assistant's name, the company and today's date go into the conversation as a short note before the
+  first question, and again before a question when one of them changed (a new day in California, a rename).
+  An update that edits the instructions or a lookup does change them: a conversation started before it
+  can then be refused by the API at its next question, and the panel asks to start a new conversation
+  (`bad_conversation`).
+
+### Develop with it
+
+`ASSISTANT_FAKE=1 npm run server:dev` (or the line in `.env`) runs a scripted model: a question that
+mentions who, people or start looks people up for real and answers with a link to the first one; anything
+else is echoed. No key, nothing leaves the computer. With a real key in `.env` instead, development talks to
+Claude like the server does (the sandbox is a production matter: development has no network allow list).

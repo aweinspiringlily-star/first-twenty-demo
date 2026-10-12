@@ -191,3 +191,53 @@ describe('loadConfig: public demo and careers settings', () => {
     )
   })
 })
+
+describe('loadConfig: the assistant', () => {
+  const PROD = { NODE_ENV: 'production', DATABASE_URL: 'postgres://first_twenty:placeholder@127.0.0.1:5432/first_twenty', PUBLIC_ORIGIN: 'https://hr.example.com' }
+
+  it('is off without ANTHROPIC_API_KEY, with the documented defaults', () => {
+    expect(load({}).assistant).toEqual({ enabled: false, model: 'claude-opus-5-5', effort: 'low', maxTokens: 8000, perWorkspaceDaily: 40, globalDaily: 600, fake: false })
+    expect(load({ ANTHROPIC_API_KEY: '   ' }).assistant.enabled).toBe(false)
+  })
+
+  it('is on with a key, and reads the model, effort, token limit and daily limits', () => {
+    const c = load({
+      ...PROD,
+      ANTHROPIC_API_KEY: 'sk-ant-test-not-a-real-key',
+      ASSISTANT_MODEL: 'claude-sonnet-5-5',
+      ASSISTANT_EFFORT: 'High',
+      ASSISTANT_MAX_TOKENS: '16000',
+      ASSISTANT_DAILY_PER_WORKSPACE: '10',
+      ASSISTANT_DAILY_GLOBAL: '100',
+    })
+    expect(c.assistant).toEqual({ enabled: true, model: 'claude-sonnet-5-5', effort: 'high', maxTokens: 16000, perWorkspaceDaily: 10, globalDaily: 100, fake: false })
+  })
+
+  it('never keeps the key in the config, so nothing that logs or sends the config can carry it', () => {
+    const c = load({ ...PROD, ANTHROPIC_API_KEY: 'sk-ant-test-not-a-real-key' })
+    expect(JSON.stringify(c)).not.toContain('sk-ant-test-not-a-real-key')
+  })
+
+  it('runs the fake model in development, and refuses it in production', () => {
+    expect(load({ ASSISTANT_FAKE: '1' }).assistant).toMatchObject({ enabled: true, fake: true })
+    expect(() => load({ ...PROD, ASSISTANT_FAKE: '1' })).toThrow(/ASSISTANT_FAKE is for development and tests only/)
+    expect(load({ ...PROD, ASSISTANT_FAKE: '0' }).assistant.fake).toBe(false)
+  })
+
+  it('rejects malformed values with a clear message, never echoing the key', () => {
+    expect(() => load({ ASSISTANT_EFFORT: 'extreme' })).toThrow(/ASSISTANT_EFFORT must be one of low, medium, high, xhigh, max/)
+    expect(() => load({ ASSISTANT_MODEL: 'claude opus' })).toThrow(/ASSISTANT_MODEL must be a model id/)
+    expect(() => load({ ASSISTANT_MAX_TOKENS: '0' })).toThrow(/ASSISTANT_MAX_TOKENS/)
+    expect(() => load({ ASSISTANT_MAX_TOKENS: '200000' })).toThrow(/ASSISTANT_MAX_TOKENS/)
+    expect(() => load({ ASSISTANT_DAILY_PER_WORKSPACE: 'lots' })).toThrow(/ASSISTANT_DAILY_PER_WORKSPACE/)
+    expect(() => load({ ASSISTANT_DAILY_GLOBAL: '-5' })).toThrow(/ASSISTANT_DAILY_GLOBAL/)
+    let message = ''
+    try {
+      load({ ANTHROPIC_API_KEY: 'sk-ant-secret part' })
+    } catch (err) {
+      message = (err as Error).message
+    }
+    expect(message).toMatch(/ANTHROPIC_API_KEY has a space/)
+    expect(message).not.toContain('sk-ant-secret')
+  })
+})
