@@ -21,6 +21,7 @@ import {
   candidateTimeline,
   compareJobs,
   emptySweepCounts,
+  CAREERS_SITE_FILTER,
   filterCandidateRows,
   guessTimezone,
   hourlyDesiredFits,
@@ -264,6 +265,11 @@ describe('candidates list', () => {
     expect(filterCandidateRows(db, rows, { ...f, flags: ['archived'] }).map((r) => r.candidate.id)).toEqual(['c-arch'])
     expect(filterCandidateRows(db, rows, { ...f, flags: ['referral'] }).map((r) => r.candidate.id)).toEqual(['c-ben'])
     expect(filterCandidateRows(db, rows, { ...f, source: 'outbound' }).map((r) => r.candidate.id)).toEqual(['c-chen'])
+    // Careers page applicants on their own: inbound with the source detail the careers page writes.
+    const alexRow = rows.find((r) => r.candidate.id === 'c-alex')!
+    const careersRows = rows.map((r) => (r === alexRow ? { ...r, candidate: { ...r.candidate, source: 'inbound' as const, sourceDetail: 'Careers site' } } : r))
+    expect(filterCandidateRows(db, careersRows, { ...f, source: CAREERS_SITE_FILTER }).map((r) => r.candidate.id)).toEqual(['c-alex'])
+    expect(filterCandidateRows(db, careersRows, { ...f, source: 'inbound' }).map((r) => r.candidate.id)).toContain('c-alex')
     expect(filterCandidateRows(db, rows, { ...f, stage: 'onsite' }).map((r) => r.candidate.id)).toEqual(['c-alex'])
     expect(filterCandidateRows(db, rows, { ...f, q: 'full-stack ortiz' }).map((r) => r.candidate.id)).toEqual(['c-ben'])
     const alex = rows.find((r) => r.candidate.id === 'c-alex')

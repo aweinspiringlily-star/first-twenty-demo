@@ -27,6 +27,7 @@ import {
   findDuplicates,
   nextStage,
 } from '@/domain/hiring'
+import { isCareersSiteCandidate } from '@/domain/hiring/sources'
 import { planSlotStatus } from '@/domain/pay'
 import { founder, fullName, personNameById } from '@/domain/people'
 import type {
@@ -349,11 +350,15 @@ export function talentPool(db: DB, job: Job, viewer?: Viewer): PoolMatch[] {
 
 export type CandidateFlag = 'keep_warm' | 'silver' | 'referral' | 'archived'
 
+/** The Source filter's choice for careers page applicants (inbound, source detail "Careers site"). */
+export const CAREERS_SITE_FILTER = 'careers_site'
+
 export type CandidateFilter = {
   q: string
   stage: StageKind | ''
   jobId: ID | ''
-  source: SourceKind | ''
+  /** A source kind, or CAREERS_SITE_FILTER for the inbound candidates who applied on the careers page. */
+  source: SourceKind | typeof CAREERS_SITE_FILTER | ''
   flags: CandidateFlag[]
 }
 
@@ -408,7 +413,7 @@ export function filterCandidateRows(db: DB, rows: CandidateRow[], f: CandidateFi
     if (f.flags.includes('keep_warm') && !c.tags.some((t) => t.toLowerCase() === 'keep warm')) return false
     if (f.flags.includes('silver') && !c.tags.some((t) => t.toLowerCase() === 'silver medalist')) return false
     if (f.flags.includes('referral') && c.source !== 'referral') return false
-    if (f.source && c.source !== f.source) return false
+    if (f.source === CAREERS_SITE_FILTER ? !isCareersSiteCandidate(c) : f.source && c.source !== f.source) return false
     if (f.jobId && !r.apps.some((a) => a.jobId === f.jobId)) return false
     if (f.stage && !r.apps.some((a) => (a.status === 'active' || a.status === 'hired') && appStageKind(db, a) === f.stage)) return false
     if (q) {

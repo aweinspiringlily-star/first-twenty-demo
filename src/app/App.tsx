@@ -103,8 +103,11 @@ function useUndoShortcut() {
   )
 }
 
-/** Views whose second segment is a record id; other views keep one page across their tabs. */
-const RECORD_VIEWS = new Set(['job', 'candidate', 'person', 'checklist', 'contractor'])
+/**
+ * Views whose second segment is a record id; other views keep one page across their tabs. An invite's
+ * token is one too: it never becomes the tab's title.
+ */
+const RECORD_VIEWS = new Set(['job', 'candidate', 'person', 'checklist', 'contractor', 'invite'])
 /** Route segments that open a sheet over the current page. */
 const SHEET_SEGMENTS = new Set(['add', 'new', 'new-job', 'request', 'offboard', 'change', 'edit', 'posting', 'fresh'])
 
@@ -124,6 +127,7 @@ const SECTION_TITLES: Record<string, string> = {
   compliance: 'Compliance',
   me: 'Me',
   settings: 'Settings',
+  invite: 'Join a company',
 }
 
 const TAB_TITLES: Record<string, string> = {

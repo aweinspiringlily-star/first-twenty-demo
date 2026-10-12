@@ -229,7 +229,11 @@ describe('login', () => {
   it('signs in with the right password and sets a hardened session cookie', async () => {
     const res = await app.inject({ method: 'POST', url: '/api/auth/login', headers: CSRF, payload: { email: 'Admin@Example.com ', password: ADMIN.password } })
     expect(res.statusCode).toBe(200)
-    expect(res.json()).toEqual({ user: { id: expect.any(String), email: ADMIN.email, role: 'admin' } })
+    // The login's company too, so a browser can tell a login of another company from its own.
+    expect(res.json()).toEqual({
+      user: { id: expect.any(String), email: ADMIN.email, role: 'admin' },
+      workspace: { id: 'default', name: 'Default workspace', slug: 'default-workspace' },
+    })
     const raw = rawCookie(res, 'ft_session')
     expect(raw).toMatch(/^ft_session=[A-Za-z0-9_-]{43};/)
     expect(raw).toContain('HttpOnly')

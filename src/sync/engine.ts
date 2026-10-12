@@ -39,20 +39,34 @@
 import type { Activity, DB } from '@/domain/types'
 import { newId } from '@/lib/id'
 import type { HistoryEntry } from '@/store/db'
-import { type ApiErrorKind, type ApiFailure, type ApiResult, describeFailure, type LoginOptions, type SyncApi } from './api'
+import {
+  type AcceptInviteInput,
+  type ApiErrorKind,
+  type ApiFailure,
+  type ApiResult,
+  describeFailure,
+  type LoginOptions,
+  type SignupInput,
+  type SyncApi,
+} from './api'
 import { applyChanges, isApplicable, localValue, type RemoteChange } from './apply'
 import { DOC_COLLECTION, RECORD_COLLECTIONS } from './collections'
+import { inviteFailureText, signupFailureText } from './demo'
 import { deepEqual, diffDB, type LocalChange } from './diff'
 import { fingerprint } from './fingerprint'
 import { isWorkspaceSwap, LOAD_TIME_ACTIVITY_PREFIX, stabilizeLoadTimeIds, withWorkspaceId, workspaceIdOf } from './loadTime'
 import {
+  type AccountResponse,
   type Change,
   type ClientChange,
   type Conflict,
+  type LoginResponse,
   MAX_PUSH_CHANGES,
   MAX_RECORD_BYTES,
   type PostChangesResponse,
+  type PutWorkspaceResponse,
   recordKey,
+  type ServerWorkspace,
   type SyncUser,
   type WorkspaceSnapshot,
 } from './protocol'
@@ -168,9 +182,10 @@ export type FlowFailure = {
   /**
    * 'session_open': removing this browser's data was refused because the server could not be reached to
    * end the session (see SignOutOptions.keepServerSession). 'demo_clock': refused while the demo clock is
-   * on (CLOCK_MESSAGE).
+   * on (CLOCK_MESSAGE). 'other_company': a sign-in with a login of another company than the one this
+   * browser syncs with (otherCompanyMessage); this browser stays signed out.
    */
-  kind: ApiErrorKind | 'sample' | 'pending' | 'session_open' | 'demo_clock'
+  kind: ApiErrorKind | 'sample' | 'pending' | 'session_open' | 'demo_clock' | 'other_company'
   status: number | null
   /** Plain-language text for the UI. */
   message: string
@@ -187,6 +202,11 @@ export type FlowResult = { ok: true; message?: string } | FlowFailure
  */
 export type CheckServerResult = { ok: true; version: string; signedIn: boolean; user: SyncUser | null; empty?: boolean } | FlowFailure
 export type SignInResult = { ok: true; user: SyncUser } | FlowFailure
+/**
+ * A new login, from signUp or acceptInvite: signed in like signIn, not syncing yet. workspace: the company
+ * the login belongs to (null when the server did not say).
+ */
+export type AccountResult = { ok: true; user: SyncUser; workspace: ServerWorkspace | null } | FlowFailure
 /**
  * confirmed: the server ended the session. When it did not (offline, a server error), this browser
  * still treats itself as signed out and ends the session as soon as the server answers (logoutPending in
@@ -249,6 +269,25 @@ export type SyncEngine = {
   checkServer(): Promise<CheckServerResult>
   /** opts.remember: "Keep me signed in" (see LoginOptions). Default false. */
   signIn(email: string, password: string, opts?: LoginOptions): Promise<SignInResult>
+  /**
+   * Creates a login and a new, empty company on a demo server (POST /api/auth/signup) and signs in, as
+   * signIn does. Nothing syncs yet: uploadNew then puts the new company's workspace there. Refused (kind
+   * 'pending', CONNECTED_ACCOUNT_MESSAGE) while this browser syncs with a server: Disconnect first.
+   */
+  signUp(input: SignupInput): Promise<AccountResult>
+  /**
+   * Creates a login in the company an invite link joins (POST /api/auth/accept-invite) and signs in, as
+   * signIn does. Nothing syncs yet: useServerCopy then takes that company's workspace. Refused like signUp
+   * while this browser syncs with a server.
+   */
+  acceptInvite(input: AcceptInviteInput): Promise<AccountResult>
+  /**
+   * Puts a new workspace (the company a sign-up just created) on the signed-in login's empty server
+   * workspace (PUT without confirmReplace) and starts syncing it. The store takes it only once the server
+   * has it: on failure nothing changes in this browser. Never the sample (kind 'sample'); refused while
+   * this browser already syncs with a server (kind 'pending').
+   */
+  uploadNew(db: DB): Promise<FlowResult>
   /** Ends the session. With forgetThisBrowser, also removes this browser's copy and reloads the page. */
   signOut(opts?: SignOutOptions): Promise<SignOutResult>
   /** Looks at the server's workspace (downloads it once; useServerCopy reuses it for two minutes). */
@@ -349,6 +388,24 @@ export const JOINED_MESSAGE =
 /** Upload from the server_empty hold found that another computer put a different workspace on the server. */
 export const SWITCHED_MESSAGE =
   'Another computer put a different workspace on your server first. This browser switched to it. Download a backup of what was here from the notice at the top of the page.'
+
+/** Sign-up, joining with an invite, or uploading a new company while this browser already syncs with a server. */
+export const CONNECTED_ACCOUNT_MESSAGE =
+  'This browser syncs with a company on this server. Disconnect it first (Settings, Server), then create or join another company.'
+
+/**
+ * A sign-in, on a browser that syncs one company's copy, with a login of another company: what happened
+ * (nothing: this browser stays signed out, its copy and its waiting changes as they were) and the two
+ * ways on. waiting: changes not sent yet, counted as a person counts edits.
+ */
+export function otherCompanyMessage(otherName: string, thisName: string, waiting: number): string {
+  const other = otherName.trim() || 'another company'
+  const here = thisName.trim() || 'another company'
+  const changes = waiting === 1 ? '1 change' : `${waiting} changes`
+  const held = waiting > 0 ? `${here}'s copy, with ${changes} not sent yet` : `${here}'s copy`
+  const keep = waiting > 0 ? ` to send ${waiting === 1 ? 'it' : 'them'}` : ''
+  return `That login belongs to ${other}. This browser holds ${held}, so nothing changed and it stays signed out. Sign in with a login of ${here}${keep}, or disconnect this browser first (Disconnect, below) to use ${other} here.`
+}
 
 export const STORAGE_FULL_MESSAGE =
   'This browser refused to save changes that have not reached the server yet (its storage is full or blocked). Keep this tab open until they sync; closing it now would lose them.'
@@ -1500,10 +1557,14 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   function rebaseOnSnapshot(snap: WorkspaceSnapshot): void {
     const serverDb = prepare(snap.db)
     const local = store.getState().db
+    // Another company's workspace on the server (the session belongs to another company's login) is a
+    // swap whatever its data says: meta.workspaceId is written by whoever uploaded it, so another company
+    // can carry this one's, and merging would send this company's queued edits into it.
+    const otherServerWorkspace = conn.workspaceId !== null && snap.workspaceId !== conn.workspaceId
     // The same history as before (a pruned log, a rebuilt store): never a swap. Another history, or one
     // this device cannot compare, is a swap when the server holds a different workspace.
     const sameHistory = conn.historyId !== null && snap.historyId !== undefined && snap.historyId === conn.historyId
-    if (!sameHistory && isWorkspaceSwap(local, serverDb)) {
+    if (otherServerWorkspace || (!sameHistory && isWorkspaceSwap(local, serverDb))) {
       takeRemoteSwap(local, serverDb, snap)
       return
     }
@@ -1984,7 +2045,10 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     try {
       // GET /api/auth/session: nobody signed in is an answer, not a 401 in the console.
       const me = await api.session()
-      if (me.ok && me.data.user && signedOut && conn.mode === 'server' && active && !logoutPending()) resume(me.data.user)
+      // A session of another company's login (another tab signed in to it) never picks up this copy.
+      if (me.ok && me.data.user && signedOut && conn.mode === 'server' && active && !logoutPending() && !otherCompany(me.data.workspace)) {
+        resume(me.data.user)
+      }
     } finally {
       probing = false
     }
@@ -2033,6 +2097,14 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       }
     })()
     return endingSession
+  }
+
+  /**
+   * The company a login belongs to, when it is not the one this browser syncs with (null: the same, or
+   * a server or saved connection from before companies, which hold one company only).
+   */
+  function otherCompany(workspace: ServerWorkspace | undefined): ServerWorkspace | null {
+    return workspace && conn.mode === 'server' && conn.workspaceId !== null && workspace.id !== conn.workspaceId ? workspace : null
   }
 
   /** A valid session again: start syncing whatever queued up meanwhile. */
@@ -2243,6 +2315,16 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     if (!me.ok) return fail(me)
     const user = me.data.user
     if (!user) return { ok: true, version: health.data.version, signedIn: false, user: null }
+    if (otherCompany(me.data.workspace)) {
+      // The session belongs to another company's login: this browser's copy goes nowhere under it.
+      if (!signedOut) {
+        signedOut = true
+        failure = null
+        clearAllTimers()
+        publish()
+      }
+      return { ok: true, version: health.data.version, signedIn: false, user: null }
+    }
     if (signedOut && conn.mode === 'server') resume(user)
     else {
       setConn({ user })
@@ -2257,11 +2339,49 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       : { ok: true, version: health.data.version, signedIn: true, user }
   }
 
+  /**
+   * Sign-up and accepting an invite: a new login, signed in the way signIn is. Only for a browser that
+   * does not sync with a server: queued changes of one company must never go out under another's login.
+   */
+  async function newAccount(call: () => Promise<ApiResult<AccountResponse>>, text: (f: ApiFailure) => string): Promise<AccountResult> {
+    if (conn.mode === 'server') return { ok: false, kind: 'pending', status: null, message: CONNECTED_ACCOUNT_MESSAGE }
+    // A logout on its way carries the old cookie; let it finish so it cannot end the new session.
+    if (endingSession) await endingSession
+    signingIn = true
+    let res: ApiResult<AccountResponse>
+    try {
+      res = await call()
+    } finally {
+      signingIn = false
+    }
+    if (!res.ok) {
+      const out: FlowFailure = { ok: false, kind: res.kind, status: res.status, message: text(res) }
+      if (res.retryAfter !== undefined) out.retryAfter = res.retryAfter
+      return out
+    }
+    // The server dropped any session this browser had (a new one with every sign-in).
+    if (logoutPending()) setLogoutPending(false)
+    setConn({ user: res.data.user, signedOutByUser: false })
+    authEpoch++
+    publish()
+    return { ok: true, user: res.data.user, workspace: res.data.workspace }
+  }
+
+  function signUp(input: SignupInput): Promise<AccountResult> {
+    const body: SignupInput = { email: input.email.trim(), password: input.password, companyName: input.companyName.trim(), remember: input.remember === true }
+    return newAccount(() => api.signup(body), signupFailureText)
+  }
+
+  function acceptInvite(input: AcceptInviteInput): Promise<AccountResult> {
+    const body: AcceptInviteInput = { token: input.token, email: input.email.trim(), password: input.password, remember: input.remember === true }
+    return newAccount(() => api.acceptInvite(body), (f) => inviteFailureText(f, 'join'))
+  }
+
   async function signIn(email: string, password: string, o: LoginOptions = {}): Promise<SignInResult> {
     // A logout on its way carries the old cookie; let it finish so it cannot end the new session.
     if (endingSession) await endingSession
     signingIn = true
-    let res: ApiResult<{ user: SyncUser }>
+    let res: ApiResult<LoginResponse>
     try {
       res = await api.login(email.trim(), password, { remember: o.remember === true })
     } finally {
@@ -2270,6 +2390,19 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     if (!res.ok) return fail(res)
     // The server dropped the session this browser had (a new one every sign-in), so nothing is left to end.
     if (logoutPending()) setLogoutPending(false)
+    const other = otherCompany(res.data.workspace)
+    if (other) {
+      // A login of another company: this browser's copy and its queued changes must never go out under
+      // it, nor be swapped for that company's. The new session ends again (retried on focus and when
+      // back online if the server cannot be reached now), and this browser stays as it was, signed out.
+      const out = await api.logout()
+      if (!out.ok && out.kind !== 'signed_out') {
+        setLogoutPending(true)
+        watchLogout()
+      }
+      const here = store.getState().db.company?.name
+      return { ok: false, kind: 'other_company', status: null, message: otherCompanyMessage(other.name, typeof here === 'string' ? here : '', waitingEdits()) }
+    }
     if (conn.mode === 'server') resume(res.data.user)
     else {
       setConn({ user: res.data.user, signedOutByUser: false })
@@ -2445,6 +2578,12 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
   /** A new workspace identity (see workspaceIdOf in loadTime.ts). */
   const makeWorkspaceId = (): string => newId('ws')
 
+  /**
+   * The server workspace an upload went to, as its answer says, so the connection knows which company
+   * it syncs with. Servers from before companies do not say: they hold one workspace, 'default'.
+   */
+  const uploadedTo = (r: PutWorkspaceResponse): string => r.workspaceId ?? conn.workspaceId ?? 'default'
+
   function uploadLocal(o: UploadOptions = {}): Promise<FlowResult> {
     return exclusiveOp(async (): Promise<FlowResult> => {
       const ended = sessionEndedHere() ?? clockRefusal()
@@ -2476,7 +2615,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       // changes on the server (Undo would swap the old workspace back in for every device).
       const after = store.getState().db
       setStoreQuietly(after === current ? db : withWorkspaceId(after, () => workspaceIdOf(db) ?? makeWorkspaceId()), [])
-      commit(freshConnection(res.data.seq, res.data.versions, db, conn.workspaceId ?? 'default', res.data.historyId))
+      commit(freshConnection(res.data.seq, res.data.versions, db, uploadedTo(res.data), res.data.historyId))
       // A demo clock copy left from another connection must never be restored over this one.
       if (fresh) dropClockCopy()
       resetFlags()
@@ -2484,6 +2623,29 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       // Edits made while the upload was on its way go out as ordinary changes.
       const now = store.getState().db
       if (now !== db) enqueueLocal(diffDB(db, now), db)
+      return OK
+    })
+  }
+
+  function uploadNew(input: DB): Promise<FlowResult> {
+    return exclusiveOp(async (): Promise<FlowResult> => {
+      const ended = sessionEndedHere() ?? clockRefusal()
+      if (ended) return ended
+      if (conn.mode === 'server') return { ok: false, kind: 'pending', status: null, message: CONNECTED_ACCOUNT_MESSAGE }
+      if (isSampleDB(input)) return { ok: false, kind: 'sample', status: null, message: SAMPLE_MESSAGE }
+      // A new workspace gets its identity, and the changes due on load, before it leaves: every device
+      // that takes the server's copy starts from exactly this.
+      const db = withLoadChanges(prepare({ ...withWorkspaceId(input, makeWorkspaceId), schemaVersion: 1 }))
+      const res = await api.putWorkspace(db, false)
+      if (!res.ok) return fail(res)
+      // No Undo step: undoing would swap the old workspace back in as record-by-record changes.
+      setStoreQuietly(db, [])
+      commit(freshConnection(res.data.seq, res.data.versions, db, uploadedTo(res.data), res.data.historyId))
+      // A demo clock copy left from another connection must never be restored over this one.
+      dropClockCopy()
+      resetFlags()
+      resetRefreshed()
+      activate()
       return OK
     })
   }
@@ -2611,7 +2773,7 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
       }
       // No Undo step: undoing would turn the old workspace into record-by-record changes again.
       setStoreQuietly(db, [])
-      commit(freshConnection(res.data.seq, res.data.versions, db, conn.workspaceId ?? 'default', res.data.historyId))
+      commit(freshConnection(res.data.seq, res.data.versions, db, uploadedTo(res.data), res.data.historyId))
       resetFlags()
       resetRefreshed()
       restored = null
@@ -2733,9 +2895,12 @@ export function createSyncEngine(opts: EngineOptions): SyncEngine {
     flush,
     checkServer,
     signIn,
+    signUp,
+    acceptInvite,
     signOut,
     inspectServer,
     uploadLocal,
+    uploadNew,
     useServerCopy,
     replaceWorkspace,
     disconnect,

@@ -29,8 +29,11 @@ import {
   clearReplacedRemotely,
   clearRestoredRemotely,
   connect,
+  type DemoSignup,
+  demoSignup,
   discardRejected,
   getReplacedBackup,
+  INVITE_ROUTE,
   isServedPage,
   retryRejected,
   STORAGE_FULL_MESSAGE,
@@ -42,7 +45,7 @@ import {
 import { LOOKS } from '@/themes/registry'
 import { cx, Icon, Kbd, Menu, type MenuItem, Modal, restoreFocus, Segmented, Switch, toast, useTwoStepConfirm } from '@/ui'
 import { LookPicker } from './LookPicker'
-import { href, links, navigate } from './router'
+import { href, links, navigate, useRoute } from './router'
 import { keyLabel, useShortcut, useShortcutList } from './shortcuts'
 import { useViewer } from './useViewer'
 
@@ -373,9 +376,13 @@ export function PreviewBanner() {
 // artifact viewer never probes /api for it (docs/SYNC.md). Signing in or out after that (Settings,
 // Server) shows at once: the sync status's user changes, and a sign-in asks again, since only a signed-in
 // answer says whether the server is empty. Connecting means the server holds a workspace; disconnecting
-// asks again.
-/** empty: the server holds no workspace yet (known only when signed in; absent when it could not tell). */
-type ServerHere = { signedIn: boolean; empty?: boolean }
+// asks again. A demo server (anyone may sign up) says so too, so a visitor who is not signed in is offered
+// a company of their own.
+/**
+ * empty: the server holds no workspace yet (known only when signed in; absent when it could not tell).
+ * demoSignup: anyone may create a demo company here (given only while not signed in).
+ */
+type ServerHere = { signedIn: boolean; empty?: boolean; demoSignup?: DemoSignup }
 /** The answer, with the sync status's user when it came (a later change of user is a sign-in or sign-out). */
 type ServerAnswer = ServerHere & { user: SyncUser | null }
 let serverHere: ServerAnswer | null = null
@@ -396,10 +403,10 @@ function askServerHere(again = false): void {
   if (detectHostContext() !== 'web') return
   watchStatus()
   serverHereAsking = true
-  void connect
-    .checkServer()
-    .then((res) => {
-      setServerHere(res.ok ? { signedIn: res.signedIn, empty: res.empty, user: useSyncStatus.getState().user } : null)
+  // Side by side: whether anyone may sign up is asked once per page load (demoSignup keeps the answer).
+  void Promise.all([connect.checkServer(), demoSignup()])
+    .then(([res, demo]) => {
+      setServerHere(res.ok ? { signedIn: res.signedIn, empty: res.empty, user: useSyncStatus.getState().user, ...(demo ? { demoSignup: demo } : {}) } : null)
     })
     .catch(() => {
       /* nothing answered: the banner stays as it is */
@@ -447,7 +454,8 @@ export function useServerHere(ask = false): ServerHere | null {
   }, [ask])
   if (!here) return null
   const signedIn = signedInHere(here, user)
-  return signedIn ? (here.signedIn && here.empty !== undefined ? { signedIn, empty: here.empty } : SIGNED_IN_HERE) : SIGNED_OUT_HERE
+  if (signedIn) return here.signedIn && here.empty !== undefined ? { signedIn, empty: here.empty } : SIGNED_IN_HERE
+  return here.demoSignup ? { signedIn: false, demoSignup: here.demoSignup } : SIGNED_OUT_HERE
 }
 
 /**
@@ -464,21 +472,28 @@ const SIGNED_OUT_HERE: ServerHere = { signedIn: false }
 /** Start fresh: on a page with a server, from Settings, Server, so the next step there (sign in, upload) follows. */
 const startFreshHref = (server: boolean) => (server ? href('settings', 'server', 'fresh') : links.startFresh())
 
+/** Settings, Server with focus on Create a demo company. */
+export const DEMO_SIGNUP_HREF = href('settings', 'server', 'signup')
+
 /**
  * Banner while the sample company is loaded. A browser served by the company's server (a new computer)
  * is pointed at signing in there first: the sample is what every new browser shows until then. A server
  * that is still empty asks for a company instead: Start fresh (which then uploads) or Import a backup.
+ * A demo server (anyone may sign up) offers a first-time visitor a demo company of their own first. Not
+ * on the invite page, which has its own next step.
  */
 export function SampleBanner() {
   const meta = useDB((s) => s.db.meta)
   const company = useDB((s) => s.db.company.name)
   const viewer = useViewer()
   const local = useSyncStatus((s) => s.mode !== 'server')
-  const shown = meta.sample && viewer.role === 'admin'
+  const inviting = useRoute().view === INVITE_ROUTE
+  const shown = meta.sample && viewer.role === 'admin' && !inviting
   const server = useServerHere(shown && local)
   if (!shown) return null
   const here = local ? server : null
   const empty = !!here?.signedIn && here.empty === true
+  const demo = !!here && !here.signedIn && !!here.demoSignup
   // Only loadSample moves the dates; a saved or uploaded sample keeps the ones it had then.
   const current = sampleIsCurrent({ meta })
   // 40px hit areas; the negative margins keep the banner as compact as its text.
@@ -487,16 +502,25 @@ export function SampleBanner() {
     <div className="ft-banner ft-banner--sample mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-accent-soft px-4 py-1.5 text-[13.5px] text-accent-soft-ink sm:py-2.5">
       <span className="min-w-0 flex-[1_1_8rem] sm:hidden">
         Sample company: <strong>{company}</strong>
-        {here && (empty ? '. Your server is empty.' : here.signedIn ? '. Your server is here.' : '. Sign in to your server to get started.')}
+        {here &&
+          (demo
+            ? '. Make a demo company of your own to try it.'
+            : empty
+              ? '. Your server is empty.'
+              : here.signedIn
+                ? '. Your server is here.'
+                : '. Sign in to your server to get started.')}
       </span>
       <span className="hidden min-w-0 flex-[1_1_12rem] sm:inline">
         You are exploring <strong>{company}</strong>, a fictional sample company.{' '}
         {here
-          ? empty
-            ? 'Your server is empty. Start fresh or import a backup, then upload it.'
-            : here.signedIn
-              ? "This page is served by your company's server, and you are signed in. Open your workspace from it."
-              : "This page is served by your company's server. Sign in to your server to get started."
+          ? demo
+            ? 'This page is served by a First Twenty demo server: create a demo company of your own to try it with your team, or sign in to yours.'
+            : empty
+              ? 'Your server is empty. Start fresh or import a backup, then upload it.'
+              : here.signedIn
+                ? "This page is served by your company's server, and you are signed in. Open your workspace from it."
+                : "This page is served by your company's server. Sign in to your server to get started."
           : current
             ? 'Its dates move with the calendar so the story stays current.'
             : local
@@ -504,6 +528,12 @@ export function SampleBanner() {
               : 'This saved copy keeps its dates.'}
       </span>
       <span className="-my-1.5 -mr-2 ml-auto flex flex-wrap items-center gap-x-1 sm:-my-2.5">
+        {demo && (
+          <a href={DEMO_SIGNUP_HREF} className={action}>
+            <span className="sm:hidden">Create a company</span>
+            <span className="hidden sm:inline">Create your own demo company</span>
+          </a>
+        )}
         {here &&
           (empty ? (
             // Lands on the Import panel; a finished import goes back to Settings, Server to upload it.
@@ -557,11 +587,14 @@ export function ServerHereBanner() {
   const sample = useDB((s) => s.db.meta.sample)
   const viewer = useViewer()
   const local = useSyncStatus((s) => s.mode !== 'server')
-  const shown = !sample && viewer.role === 'admin' && local
+  const inviting = useRoute().view === INVITE_ROUTE
+  const shown = !sample && viewer.role === 'admin' && local && !inviting
   const here = useServerHere(shown && isServedPage())
   const [dismissed, setDismissed] = useState(serverHintDismissed)
   if (!shown || !here || dismissed) return null
   const empty = here.signedIn && here.empty === true
+  // A demo server takes sign-ups: the company can go there under a new login of its own.
+  const demo = !here.signedIn && !!here.demoSignup
   if (here.signedIn && !empty) return null
   const dismiss = () => {
     try {
@@ -577,14 +610,23 @@ export function ServerHereBanner() {
       icon="globe"
       onDismiss={dismiss}
       actions={
-        <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
-          {empty ? 'Upload it' : 'Sign in to your server'}
-        </a>
+        <>
+          {demo && (
+            <a href={DEMO_SIGNUP_HREF} className={BANNER_ACTION}>
+              Create a demo company
+            </a>
+          )}
+          <a href={SERVER_SETTINGS_HREF} onClick={stayOnServerPage} className={BANNER_ACTION}>
+            {empty ? 'Upload it' : demo ? 'Sign in' : 'Sign in to your server'}
+          </a>
+        </>
       }
     >
       {empty
         ? 'This company is saved in this browser only, and your server is empty. Upload it to keep it on your server.'
-        : 'This company is saved in this browser only. Your server answers at this address: sign in to keep the company there.'}
+        : demo
+          ? 'This company is saved in this browser only. This demo server can keep it: create a demo company and upload it, or sign in to yours.'
+          : 'This company is saved in this browser only. Your server answers at this address: sign in to keep the company there.'}
     </SyncBanner>
   )
 }

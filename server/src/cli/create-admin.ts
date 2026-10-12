@@ -1,7 +1,8 @@
 // npm run server:create-admin -- --email you@company.com
-// Creates the single admin login, or changes its email and password when it exists (signing out its
-// sessions). Asks for the password twice without echoing it. For automation, set ADMIN_PASSWORD in the
-// environment instead (read once, never logged).
+// Creates the admin login of the server's own company (workspace 'default'), or changes its email and
+// password when it exists (signing out its sessions). Demo companies' logins on the same server are never
+// touched, and an email that signs in to one of them is refused. Asks for the password twice without
+// echoing it. For automation, set ADMIN_PASSWORD in the environment instead (read once, never logged).
 import { isValidEmail, MIN_PASSWORD_LENGTH, normalizeEmail, passwordProblem, upsertAdmin } from '../auth'
 import { loadConfig } from '../config'
 import { openDb } from '../db'

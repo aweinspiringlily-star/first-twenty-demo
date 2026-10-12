@@ -34,7 +34,28 @@ export type Config = {
   trustProxy: string | boolean
   logLevel: string
   rootDir: string
+  /**
+   * SIGNUP_MODE. 'closed' (default): logins come from server:create-admin and invites only. 'open': a
+   * public demo server, where anyone may create a login and a company of their own (POST /api/auth/signup).
+   */
+  signupMode: SignupMode
+  /** DEMO_MAX_WORKSPACES: most demo companies (workspaces not kept) at once; sign-up answers 503 demo_full beyond. */
+  demoMaxWorkspaces: number
+  /** DEMO_EXPIRE_DAYS: a demo company with no write or sign-in for this many days is deleted (0: never). */
+  demoExpireDays: number
+  /**
+   * DEMO_MAX_TOTAL_MB, in bytes: how much record and document data the demo companies may hold together
+   * (each also holds at most validate.ts LIMITS.bytesPerDemoWorkspace). A write that would pass it gets
+   * 413 workspace_full, so strangers can never fill the disk the owner's own workspace lives on.
+   */
+  demoMaxTotalBytes: number
+  /** CAREERS_HOSTS, lowercase: host names that serve careers pages and nothing else (empty: careers off). */
+  careersHosts: string[]
+  /** CAREERS_ORIGIN (default https://<first careers host>): the origin careers links are built on. Undefined when careers are off. */
+  careersOrigin: string | undefined
 }
+
+export type SignupMode = 'closed' | 'open'
 
 type Env = Record<string, string | undefined>
 
@@ -113,6 +134,31 @@ function positiveInt(env: Env, key: string, fallback: number, max = Number.MAX_S
   const n = Number(raw)
   if (!Number.isInteger(n) || n <= 0 || n > max) throw new ConfigError(`${key} must be a whole number between 1 and ${max} (got "${raw}").`)
   return n
+}
+
+function wholeNumber(env: Env, key: string, fallback: number, max: number): number {
+  const raw = env[key]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0 || n > max) throw new ConfigError(`${key} must be a whole number between 0 and ${max} (got "${raw}").`)
+  return n
+}
+
+/** A DNS host name: letters, digits and hyphens in dot-separated labels (no port, no scheme). */
+const HOST_NAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/
+
+/** CAREERS_HOSTS: comma-separated host names, lowercased, without repeats. */
+function hostList(env: Env, key: string): string[] {
+  const out: string[] = []
+  for (const part of (env[key] ?? '').split(',')) {
+    const host = part.trim().toLowerCase()
+    if (!host) continue
+    if (!HOST_NAME.test(host)) {
+      throw new ConfigError(`${key} must list host names separated by commas, like careers.example.com,jobs.example.com (got "${part.trim()}").`)
+    }
+    if (!out.includes(host)) out.push(host)
+  }
+  return out
 }
 
 function origin(env: Env, key: string): string | undefined {
@@ -194,6 +240,32 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     throw new ConfigError(`PGSSLMODE "${pgSslMode}" is not recognized (use disable, require, verify-full or no-verify).`)
   }
 
+  const rawSignup = env.SIGNUP_MODE?.trim().toLowerCase() || 'closed'
+  if (rawSignup !== 'closed' && rawSignup !== 'open') throw new ConfigError(`SIGNUP_MODE must be closed or open (got "${env.SIGNUP_MODE}").`)
+  const signupMode: SignupMode = rawSignup
+  if (production && signupMode === 'open' && !secureCookies) {
+    warn('SIGNUP_MODE=open on a server whose PUBLIC_ORIGIN is not https: strangers would sign up over a plain connection. Set PUBLIC_ORIGIN to https://your-domain.')
+  }
+
+  // Careers hosts answer careers pages only (app.ts), so the app's own host can never be one of them.
+  const careersHosts = hostList(env, 'CAREERS_HOSTS')
+  const appHost = publicOrigin ? new URL(publicOrigin).hostname : undefined
+  if (appHost && careersHosts.includes(appHost)) {
+    throw new ConfigError(`CAREERS_HOSTS lists ${appHost}, the app's own host (PUBLIC_ORIGIN). Careers pages need a host name of their own.`)
+  }
+  let careersOrigin = origin(env, 'CAREERS_ORIGIN')
+  if (careersHosts.length === 0) {
+    if (careersOrigin) warn('CAREERS_ORIGIN is set but CAREERS_HOSTS is empty, so careers pages are off. Set CAREERS_HOSTS too.')
+    careersOrigin = undefined
+  } else if (careersOrigin) {
+    const host = new URL(careersOrigin).hostname
+    if (!careersHosts.includes(host)) throw new ConfigError(`CAREERS_ORIGIN must be on one of CAREERS_HOSTS (${careersHosts.join(', ')}); got ${host}.`)
+  } else {
+    // The first careers host, over the app's own scheme and port (https in production).
+    const app = publicOrigin ? new URL(publicOrigin) : null
+    careersOrigin = app ? `${app.protocol}//${careersHosts[0]}${app.port ? `:${app.port}` : ''}` : `https://${careersHosts[0]}`
+  }
+
   return {
     nodeEnv,
     port: positiveInt(env, 'PORT', 8787, 65535),
@@ -212,6 +284,12 @@ export function loadConfig(env: Env = process.env, options: LoadConfigOptions = 
     trustProxy,
     logLevel: env.LOG_LEVEL?.trim() || 'info',
     rootDir,
+    signupMode,
+    demoMaxWorkspaces: positiveInt(env, 'DEMO_MAX_WORKSPACES', 500, 100_000),
+    demoExpireDays: wholeNumber(env, 'DEMO_EXPIRE_DAYS', 30, 3650),
+    demoMaxTotalBytes: positiveInt(env, 'DEMO_MAX_TOTAL_MB', 2048, 1_000_000) * 1024 * 1024,
+    careersHosts,
+    careersOrigin,
   }
 }
 
@@ -235,6 +313,12 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     trustProxy: 'loopback',
     logLevel: 'silent',
     rootDir: findRootDir(),
+    signupMode: 'closed',
+    demoMaxWorkspaces: 500,
+    demoExpireDays: 30,
+    demoMaxTotalBytes: 2048 * 1024 * 1024,
+    careersHosts: [],
+    careersOrigin: undefined,
     ...overrides,
   }
 }

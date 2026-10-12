@@ -21,7 +21,12 @@ one prints before moving on.
   only on `127.0.0.1:8787`, so the internet reaches it only through Caddy.
 - **Your data in Postgres**: one table per kind of record (people, candidates, jobs, and so on), each row
   holding the record as JSON. Postgres listens only on localhost; port 5432 is never opened.
-- **One admin login** that protects the data (see [One admin login](#one-admin-login-and-the-path-to-team-logins)).
+- **Logins** that protect the data: your admin login, and teammates you invite with a link (see
+  [Logins and the path to team roles](#logins-and-the-path-to-team-roles)).
+- **Optionally, a public demo server**: anyone can create a demo company of their own and try First
+  Twenty, many people at once (see [A public demo server](#a-public-demo-server)).
+- **Optionally, careers pages**: every company's open jobs at an address of its own on a careers host,
+  with an apply form that puts applicants straight into its pipeline (see [Careers pages](#careers-pages)).
 - **Nightly backups** of the database, kept for 14 days, optionally copied to S3.
 - **Offline keeps working.** The browser keeps its own copy, queues changes while offline, and catches up
   when the connection returns. Once a browser has opened the app from your server's address, it opens it
@@ -37,7 +42,7 @@ The kit lives in `server/deploy/`, plus `.env.example` in the project root:
 | `setup-ec2.sh` | One-time setup: Node.js, Caddy, the service user, folders, settings file, services, backups. Safe to run again. |
 | `postgres-setup.sql` | Creates the `first_twenty` database and its two login roles: `first_twenty_owner`, which owns the tables and runs migrations, and `first_twenty`, which the server uses to read and write rows. |
 | `first-twenty.service` | The systemd service that runs the server, sandboxed: read-only code, loopback-only network, no privileged system calls. |
-| `Caddyfile` | HTTPS and the reverse proxy to the server. |
+| `Caddyfile` | HTTPS and the reverse proxy to the server, plus a site per careers host when there are any. |
 | `deploy.sh` | Updates the server to the latest code: pull, install, build, back up the database when migrations are pending, migrate, restart, health check. |
 | `with-env.sh` | Runs a command (migrations, creating the admin) with the server's settings. |
 | `backup.sh`, `first-twenty-backup.service`, `first-twenty-backup.timer` | The nightly backup. |
@@ -252,6 +257,9 @@ mkdir -p ~/first-twenty && tar -xzf ~/first-twenty.tgz -C ~/first-twenty
 sudo bash ~/first-twenty/server/deploy/setup-ec2.sh --domain hr.example.com --email you@example.com
 ```
 
+For careers pages, add `--careers-domain careers.example.com` (repeat it for more host names); you can
+also add them later. See [Careers pages](#careers-pages).
+
 On an instance with under 2 GB of memory (a t3.micro has about 900 MB), setup adds a 2 GB swap file at
 `/swapfile`, so `npm ci` and the build fit. The swap file sits on the same disk as Postgres and every
 database on it, so setup first checks that the disk keeps 1 GB free on top of the swap file, and skips it
@@ -270,7 +278,7 @@ It prints each step as it goes and finishes with the remaining steps. Here is wh
 | `/opt/first-twenty` | The code (with `.git` when you cloned, so `git pull` works there). Owned by your login; the service can read it but not change it. |
 | `/etc/first-twenty/env` | The server's settings, readable only by root. Created from `.env.example` once and never overwritten. |
 | `/etc/systemd/system/first-twenty.service` | The service, enabled to start on boot. It runs as the `firsttwenty` system user, which cannot log in. |
-| `/etc/caddy/Caddyfile` | Your site: https, `http://` redirected to it, and read timeouts so a client that sends a request a byte at a time cannot hold connections open (3 minutes for a whole upload, 15 seconds for the headers). A Caddyfile you wrote yourself is left alone; the site goes in `/etc/caddy/first-twenty.caddy` and the script tells you the one `import` line to add, and to copy the timeouts (the global options block) to the top of yours. |
+| `/etc/caddy/Caddyfile` | Your site (and one per careers host): https, `http://` redirected to it, and read timeouts so a client that sends a request a byte at a time cannot hold connections open (3 minutes for a whole upload, 15 seconds for the headers). A Caddyfile you wrote yourself is left alone; the site goes in `/etc/caddy/first-twenty.caddy` and the script tells you the one `import` line to add, and to copy the timeouts (the global options block) to the top of yours. |
 | `/etc/apt/apt.conf.d/51first-twenty` | Ubuntu only: automatic Node.js updates and reboots (see [Keep it patched](#keep-it-patched)). Written once and never overwritten. |
 | `/usr/local/sbin/first-twenty-backup` and the `first-twenty-backup.timer` | The nightly backup. |
 
@@ -299,7 +307,9 @@ MIGRATION_DATABASE_URL=postgres://first_twenty_owner:owner-role-password@127.0.0
 Check that `PUBLIC_ORIGIN` is `https://` plus your domain. Setup sets it when it creates the file; when
 you re-run setup with another domain it keeps the file, warns, and prints the one command that sets it.
 Leave everything else as it is; each line has a comment saying what it does. (The comment near the top
-of the file mentions `CHANGE_ME` as an example; that one stays.) Save with Ctrl+O, Enter, Ctrl+X.
+of the file mentions `CHANGE_ME` as an example; that one stays.) Only for a server that is meant to be a
+public demo, also set `SIGNUP_MODE=open` (see [A public demo server](#a-public-demo-server)). Save with
+Ctrl+O, Enter, Ctrl+X.
 
 If your password has characters other than letters and digits, percent-encode them in the URL: `@` is
 `%40`, `:` is `%3A`, `/` is `%2F`, `#` is `%23`, `%` is `%25`.
@@ -543,7 +553,7 @@ schema stays intact. The tables belong to `first_twenty_owner`, whose password l
 |---|---|
 | The server (`systemctl start first-twenty`) | `first_twenty` (`DATABASE_URL`). The systemd unit removes `MIGRATION_DATABASE_URL` from its environment. |
 | `with-env.sh npm run server:migrate`, also run by `deploy.sh` (with `-- --status` first) | `first_twenty_owner` |
-| `with-env.sh npm run server:after-restore` | `first_twenty_owner` (it moves the change-log counter) |
+| `with-env.sh npm run server:after-restore` | `first_twenty_owner` (it renumbers every company's changes and ends every session) |
 | `with-env.sh npm run server:create-admin` | `first_twenty` |
 | The nightly backup, and the one `deploy.sh` takes before migrating | `first_twenty_owner` when `MIGRATION_DATABASE_URL` is filled in, else `first_twenty` |
 
@@ -669,8 +679,8 @@ copy, and it signs everyone out and forgets every trusted device (the backup may
 devices that had already ended). The admin password
 is the one in use when the backup was taken; run `server:create-admin` again if you had changed it since.
 
-Both step 6 commands run as `first_twenty_owner` through `with-env.sh`; `server:after-restore` needs it
-because it moves the change-log counter, which the server's own role may not do.
+Both step 6 commands run as `first_twenty_owner` through `with-env.sh`, like every maintenance command
+that rewrites the whole database.
 
 **Postgres in Docker:** in steps 3 and 4 use `docker exec -i <container> psql -U postgres ...` in place of
 `sudo -u postgres psql ...` (no password prompts come up in step 4, so `-i` with `<` is fine there). For
@@ -759,6 +769,42 @@ This is your live company data: anything you change locally is real. Use the ser
 `permission denied for schema public` instead of changing the production schema, and schema changes
 reach production only through `deploy.sh`. Use PGlite for experiments, and delete `.env` (or comment out
 the line) when you are done.
+
+## Look at the data in DBeaver
+
+Browse the live data with a read-only login, never the server's or the owner's: `first_twenty_viewer`
+can read the companies (`workspaces`), every record table, the documents and the change log, cannot read
+`users`, `sessions`, `trusted_devices` or `invites` (password and token hashes), and cannot change
+anything. On a server that holds more than one company, filter by `workspace_id` (`SELECT id, slug, name
+FROM workspaces` lists them; yours is `default`). The ready-made queries in `server/deploy/browse.sql`
+already read only `default`.
+
+1. Once, on the instance, from `/opt/first-twenty`:
+
+   ```bash
+   sudo -u postgres psql -v ON_ERROR_STOP=1 -f server/deploy/viewer-role.sql
+   sudo -u postgres psql -c '\password first_twenty_viewer'
+   ```
+
+   The second command asks for the new password twice without showing it. Optionally pin the login to its
+   database: add `first_twenty_viewer` to the user column of the `first_twenty` and `reject` lines from
+   step 1 in `pg_hba.conf`, then `sudo systemctl reload postgresql`. Run `viewer-role.sql` again after a
+   migration adds a table.
+
+2. In DBeaver: **Database > New Database Connection > PostgreSQL**.
+   - **Main:** Host `localhost`, Port `5432`, Database `first_twenty`, Username `first_twenty_viewer`,
+     the password from step 1. (Host is `localhost` because the connection starts on the instance.)
+   - **SSH** tab: **Use SSH Tunnel**, Host the instance's address (the Elastic IP), Port `22`, User
+     `ubuntu` (`ec2-user` on Amazon Linux), Authentication **Public Key**, Private key your `.pem` file.
+   - **Test Connection**, then **Finish**.
+
+3. Records are JSON in each table's `data` column. `server/deploy/browse.sql` has ready-made queries
+   (people, jobs, candidates and applications, offers, pay history, equity, time off, checklists, settings,
+   recent changes): open it with **File > Open File**, choose the connection, put the cursor in a query and
+   press **Ctrl+Enter**. Double-click a `data` cell to see the whole record.
+
+The app is the source of truth: edits belong in the app, which syncs them. The viewer cannot write, so
+nothing done in DBeaver can drift from what the app shows.
 
 ## Troubleshooting
 
@@ -929,7 +975,13 @@ private. Fix them with `sudo chmod -R g+rX /opt/first-twenty`. `deploy.sh` sets 
   it was deleted (without its contents); a full replace (Import, Start fresh) removes every earlier
   entry. Older copies stay in the nightly dumps until those age out (14 days by default) and in S3 for as
   long as your bucket's lifecycle rule keeps them.
-- The admin login: the email and a scrypt hash of the password, never the password itself.
+- The logins: each one's email, a scrypt hash of its password (never the password itself) and the
+  company it belongs to.
+- Companies: on your own server, just yours; on a public demo server, every demo company too, each with
+  its name, its careers page slug, who signed it up and when it was last used (demo companies are deleted
+  after `DEMO_EXPIRE_DAYS` without use).
+- Invite links: a SHA-256 hash of each token (never the token), its company, who made it, when it expires
+  and when it was used. Expired links are removed a week after they expire.
 - Sign-in sessions: a SHA-256 hash of each session token (never the token), with the time, IP address and
   browser name.
 - Trusted devices: a SHA-256 hash of each browser's device token and when it expires (180 days after its
@@ -950,25 +1002,219 @@ offline worker's cache), which holds no workspace data.
 **Other copies:** nightly dumps in `/var/backups/first-twenty` (and S3 if you set it up), and Caddy's
 access log in `/var/log/caddy` (addresses, paths and browser names; no bodies, and Caddy hides cookies).
 
-## One admin login and the path to team logins
+## Logins and the path to team roles
 
-For now the server has exactly one login, and whoever has it can read and change everything. **Viewing
-as** in the app is still a preview, not security: it changes what the screen shows, not what the server
-allows. So:
+Your company starts with one login, the admin that `server:create-admin` makes. To add a teammate, open
+**Settings > Server**, choose **Invite a teammate** and send them the link: whoever opens it can create a
+login in your company (once; the link stops working after it is used, or after 7 days). A company has at
+most 20 open links and 50 logins.
 
-- Keep the admin login to yourself (or one trusted operator). Do not give it to managers or employees.
-- To change the password, or hand the login to someone else, run `server:create-admin` again (step 4).
-  It also signs out every session, which is the quickest way to cut off a lost laptop.
+Every login can read and change everything in its company. **Viewing as** in the app is still a preview,
+not security: it changes what the screen shows, not what the server allows. So:
+
+- Invite only people who may see everything, pay and equity included. Do not invite managers or
+  employees who should see less.
+- Treat an invite link like a password until it is used: anyone holding it can join.
+- To change your admin password, or hand the admin login to someone else, run `server:create-admin` again
+  (step 4). It also signs out every session of that login, which is the quickest way to cut off a lost
+  laptop. It only ever changes your own company's admin, never a login of a demo company on the same
+  server, and it refuses an email that already signs in to another company.
+- To remove a teammate, delete their login on the instance (it signs them out everywhere; the changes
+  they made stay, without their name):
+  `sudo -u postgres psql first_twenty -c "DELETE FROM users WHERE email = 'them@company.com'"`.
 - Anyone with SSH access to the instance can read the database, so keep SSH limited to your IP and your
   key to yourself.
 
-The groundwork for team logins is already in place: the `users` table has a `role` column (`admin`,
-`manager`, `employee`), and every change records who made it. Moving to team logins means:
+The groundwork for team roles is in place: the `users` table has a `role` column (`admin`, `manager`,
+`employee`), and every change records who made it. Moving to team roles means:
 
-1. One login per person, linked to their person record, with invitations and password resets.
+1. Each login linked to their person record, with password resets.
 2. The server enforcing the same access rules the app uses today for its preview, on every read and
    write: employees see their own pay and equity only, hiring managers see their own jobs and candidates,
    and pay fields are removed from what non-admins receive.
 3. Optionally, single sign-on with your Google Workspace or Microsoft account instead of passwords.
 
-Until then, the single admin login keeps the data in your hands only.
+Until then, keep logins to the people who may see everything.
+
+## A public demo server
+
+Set `SIGNUP_MODE=open` in `/etc/first-twenty/env` (then `sudo systemctl restart first-twenty`) and the
+server becomes a public demo: **Settings > Server** offers **Create a demo company** next to Sign in, and
+anyone who opens your address can create a login and a company of their own. Many people can use it at
+once; each sees only their own company. The app says plainly that it is a demo server, that nobody should
+enter real employee or candidate data, and that demo companies are deleted after 30 days without
+activity.
+
+**Never open sign-up on a server that holds real data.** Your own workspace stays separate: no demo login
+can read or change it, its careers page stays off until you turn it on (Settings > Server), and the demo
+limits below keep strangers from filling the disk or the memory it shares with them. But a public sign-up
+page invites strangers to your server, and every company on it shares the one database and its backups.
+
+What sign-up does: it creates the login (an admin), a company with the name given, and a slug for its
+careers page: the name and six random letters and digits (`acme-robotics-k7m2qx`), so nobody can find a
+company, or learn that a name is taken, by guessing. A slug is never handed out twice: when a demo company
+is deleted, its slug is set aside for good (the `released_slugs` table), so links to its old careers page
+(on job boards, in emails) never start working for whoever signs up next under the same name. The app then
+uploads a fresh, empty company. Invite links work in demo companies too, and an admin can see the open
+ones and revoke any of them (Settings > Server).
+
+The settings (all in `.env.example`):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `SIGNUP_MODE` | `closed` | `open` lets anyone create a login and a demo company. `closed` leaves logins to `server:create-admin` and invite links. |
+| `DEMO_MAX_WORKSPACES` | `500` | The most demo companies at once. Sign-up says the demo is full beyond it (your own workspace does not count). Only uploaded companies count, plus sign-ups from the last hour, so sign-ups that never upload cannot fill it. |
+| `DEMO_EXPIRE_DAYS` | `30` | A demo company with no change and no sign-in for this many days is deleted with everything in it, and one that was never uploaded a day after its sign-up. `0` never deletes. |
+| `DEMO_MAX_TOTAL_MB` | `2048` | How much record data the demo companies may hold together. A write past it is refused (`413 workspace_full`). Keep it well under the disk's free space: the change log and the nightly backups take about as much again. |
+
+Limits that keep a t3.micro (1 GB of memory) responsive for everyone:
+
+- **Sign-ups:** 5 tries per address (IPv6: per /64) and 60 companies created from all addresses together,
+  per hour. Only sign-ups that create a company count toward the 60, so tries that fail cannot use them up
+  for everyone. A hidden form field that people never fill turns away simple bots. Sign-in keeps its own
+  limits.
+- **Joining with an invite:** the link's token is checked first, against the invite lookup limit (30 per
+  address per 15 minutes), so a junk token costs no password work and touches no account limit; a working
+  one then allows 5 joins per address per hour. There is no server-wide count for joins (sign-ups cannot use
+  it up, and strangers cannot keep teammates out); a company's 50 logins cap them.
+- **Per demo company:** 20,000 records (people, candidates, activity rows and the rest together) and 16 MB of
+  them, records of 64 KB at most (documents such as Settings keep the usual 256 KB), a change log of one
+  row per record (an edit replaces the record's earlier row, and the newest 50,000 rows are kept, pruned in
+  the write that passes them), 20 open invite links and 50 logins. An upload is at most 10 MB, as
+  everywhere.
+- **How fast a demo company writes:** 120 writes a minute and 64 MB an hour. A browser that syncs normally
+  sends far less; past it the server answers `429 write_limit` and the browser keeps the changes and tries
+  again. A pull sends at most 8 MB at a time.
+- **Per company numbering:** every company counts its own change numbers, so nobody can tell from their own
+  numbers how busy another company (yours included) is.
+- **Housekeeping** runs when the server starts and then once a day: it signs out ended sessions, deletes
+  demo companies past `DEMO_EXPIRE_DAYS` and sign-ups never uploaded after a day (each in one transaction:
+  records, documents, change log, invites, logins, sessions, trusted devices, then the company, whose slug
+  is set aside), prunes change-log rows older than 120 days, and removes invite links a week after they
+  expired. The log says how much it removed.
+
+**What a sign-up tells a stranger:** a sign-up, or joining with an invite, with an email that already has a
+login anywhere on the server answers that it does (`409 email_taken`), as it must for a person who mistyped.
+It takes as long as a success, each address may try 5 times an hour, and one invite link stops working
+after 3 such answers, so nobody can test many emails, but a determined person can learn whether one email
+(yours included) has a login here. Use a login email for your own workspace that you do not mind being
+known to exist, or keep sign-up closed.
+
+Keep one demo company forever (a showcase you return to) by marking it kept, on the instance:
+
+```bash
+sudo -u postgres psql first_twenty -c "UPDATE workspaces SET keep = true WHERE slug = 'acme-robotics-k7m2qx'"
+```
+
+Delete one at once, setting its slug aside like the expiry does:
+
+```bash
+sudo -u postgres psql first_twenty -c "INSERT INTO released_slugs (slug) SELECT slug FROM workspaces WHERE slug = 'acme-robotics-k7m2qx' AND NOT keep ON CONFLICT DO NOTHING; DELETE FROM workspaces WHERE slug = 'acme-robotics-k7m2qx' AND NOT keep"
+```
+
+Its records, documents, change log, logins and invites all go with it (the foreign keys cascade), and
+browsers signed in to it are signed out.
+
+To close the demo again, set `SIGNUP_MODE=closed` and restart: existing demo logins keep working until
+their companies expire, and nobody new can sign up.
+
+## Careers pages
+
+With careers hosts set, every company on the server whose careers page is on gets a public careers page
+built from its own records: its open jobs (open, posted and not waiting for approval, the same rule as the
+static demo site), each posting exactly as First Twenty writes it (pay range, benefits, Fair Chance and
+equal opportunity lines), and an apply form. An application lands in that company's pipeline as a new
+candidate in the job's first stage, marked **Inbound: Careers site** on its card and in the candidate list
+(and the Source filter has **Careers site**), with the next step "Review application" and the answer as a
+note, and every browser signed in to the company receives it like any other change.
+
+**On or off:** demo companies start with their careers page on; your own workspace starts with it off, so
+nothing of it is public until an admin turns it on in **Settings > Server** (Public careers page). Turning a
+page off takes it down at once: its addresses answer 404 and take no applications.
+
+| Address (on a careers host) | What it shows |
+|---|---|
+| `https://careers.example.com/` | A short page about the careers pages. It lists no companies. |
+| `https://careers.example.com/<slug>/` | A company's careers page. **Settings > Server** shows the link (so does the Hiring page). |
+| `https://careers.example.com/<slug>/jobs/<job>` | One open job and its apply form. The job's address is its title and its record id (`senior-engineer-j-3fa9c0b1d2`): after a rename, the old address sends visitors on to the new one, so links already shared keep working. |
+
+Addresses that are nearly right go where they meant to: capital letters in the slug, a trailing slash, the
+title alone or the record id alone all send visitors on (`301`) to the job's address, and an address under
+a company that has no page there shows that company's own "not found" page.
+
+**Set them up:**
+
+1. Point a DNS `A` record for each careers host at the Elastic IP, as for the app's domain. With
+   [sslip.io](#a-free-sslipio-name-instead), `careers-3-14-15-92.sslip.io` (and `jobs-3-14-15-92.sslip.io`
+   for a second one) work with no DNS setup; the same caveats apply to those names.
+2. Run setup with them. It is safe to run again, from `/opt/first-twenty` once the code lives there:
+
+   ```bash
+   sudo bash /opt/first-twenty/server/deploy/setup-ec2.sh --domain hr.example.com \
+     --careers-domain careers.example.com --careers-domain jobs.example.com
+   ```
+
+   It writes a Caddy site per careers host (https, the `http://` redirect, the app's timeouts and headers,
+   a 64 KB body limit, no cookies) and, in a settings file it creates, `CAREERS_HOSTS`. A settings file it
+   kept is never changed: setup prints the one command that sets `CAREERS_HOSTS` there. Later runs
+   without `--careers-domain` keep the careers sites that `CAREERS_HOSTS` names.
+3. Restart the server and check the careers host answers:
+
+   ```bash
+   sudo systemctl restart first-twenty
+   curl -I https://careers.example.com/
+   ```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `CAREERS_HOSTS` | empty | Host names that serve careers pages, separated by commas. Empty: no careers pages. Never the app's own host (the server refuses to start). |
+| `CAREERS_ORIGIN` | `https://` and the first careers host | The address the app builds careers links on. |
+
+**What a careers host answers:** careers pages, the stylesheet and typeface they load, and `robots.txt`,
+nothing else, under its name with or without the trailing dot of a fully qualified name. The app, its
+offline worker and every `/api` route answer 404 there, and careers pages answer 404 on the app's host. No
+cookie is set or read on a careers host: the app's sign-in cookies are `__Host-` cookies of the app's host,
+the server ignores any cookie a careers request carries, and Caddy drops any `Set-Cookie` on the way out.
+Each careers host's HSTS covers that host alone (nothing uses `includeSubDomains`). Every page sends a
+strict Content-Security-Policy (its own stylesheet and typeface only, forms that post back to the same
+host, no framing), `nosniff`, a same-origin `Referrer-Policy` and `X-Robots-Tag: noindex`, and every value
+from a company's records is escaped. The pages carry no script: the form works without one, and the
+server checks what it receives. A live page leaves out the company's headcount, and any fact a demo sign-up
+filled in that the company never changed (its headquarters, stage, workweek and founding date).
+
+**The apply form** asks for a name, an email, a phone number (optional), a link (LinkedIn, a portfolio or
+a resume; optional; plain `http` or `https` addresses only) and an answer to one question about the role.
+It never asks for pay history or criminal history, and there is no file upload. Every page says that this
+is a demo server where anyone can create a company, so a company or job there may not be real, and the
+form says where the application goes. After a send, the confirmation takes focus and is announced; a form
+with problems comes back with them listed first, focused and announced, and what was typed kept. The
+confirmation's address carries proof of the send that works for 15 minutes, so nobody can send a link that
+claims someone applied. Limits that keep it from being used to flood a company:
+
+- 30 form posts and 5 applications per address (IPv6: per /64) an hour, and 100 applications per company
+  a day. An application takes its place in both the moment it passes its checks, before the database is
+  asked anything, so posts sent all at once cannot get past them. They live in the server's memory, so a
+  restart resets them. A post refused by them gets the form back with what was typed and when to try
+  again.
+- The form takes 32 KB at most, every field has a length limit, a hidden field that people never fill
+  turns away simple bots, and a form posted from another site (or a sibling host under the same domain)
+  is refused.
+- The same email applying to the same job again adds nothing, and the answer is the same; it counts toward
+  the limits like a new application, so neither the answers nor the limits tell anyone whether an address
+  applied before.
+- Applications count toward a demo company's records and bytes, and never as the company being in use: a
+  demo company nobody signs in to still expires.
+
+What a page view costs is capped too: a page reads at most 200 open roles and 2 MB of job records, and of
+everything else only what those jobs name (their teams, locations and pay bands), whatever the company
+holds. Pages are built per request from the company's records and kept in memory until its next change,
+up to 32 MB of pages in all (the companies viewed least recently go first), so a page view costs one small
+database query. Only two companies' records are read at once; more wait their turn, and past 32 waiting a
+page view gets a short "busy" page instead.
+
+**Turn them off** by emptying `CAREERS_HOSTS` and restarting, then run setup again without
+`--careers-domain` to remove the careers sites from Caddy.
+
+The static demo site (`npm run build:careers`, the fictional sample company, a form that sends nothing) is
+separate. Both come from the same renderer (`src/careers/render.ts`) and stylesheet
+(`src/careers/careers.css`).

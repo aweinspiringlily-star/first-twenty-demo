@@ -275,6 +275,9 @@ describe('signed out on purpose (r1-10)', () => {
   it('keeps saying the user signed out, and says the session ended only when it did', () => {
     expect(signInSubtitle({ signedOutByUser: true })).toMatch(/^You signed out\./)
     expect(signInSubtitle({ signedOutByUser: false })).toMatch(/^Your session on the server ended\./)
+    // On a demo server, which company's login carries on with this browser's copy.
+    expect(signInSubtitle({ signedOutByUser: true, company: ' Acme Robots ' })).toMatch(/^You signed out\..* Sign in with a login of Acme Robots\.$/)
+    expect(signInSubtitle({ signedOutByUser: true, company: ' ' })).not.toMatch(/login of/)
     const base = { status: 'signed_out', hold: null, pending: 4, pendingEdits: 2, storageFull: false } as const
     expect(statusView({ ...base, signedOutByUser: true }).sentence).toBe(
       'You signed out. Sign in to sync again; this browser keeps an offline copy until then. 2 changes are waiting in this browser.',

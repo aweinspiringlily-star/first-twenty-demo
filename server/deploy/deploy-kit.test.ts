@@ -11,7 +11,10 @@ import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { REQUEST_TIMEOUT_MS, WORKSPACE_BODY_LIMIT } from '../src/app'
+import { redactPath, REQUEST_TIMEOUT_MS, WORKSPACE_BODY_LIMIT } from '../src/app'
+import { DEFAULT_APPLY_LIMITS } from '../src/careers/limits'
+import { APPLY_BODY_LIMIT, CAREERS_CACHE_BYTES } from '../src/careers/routes'
+import { LOAD_BUDGET, MAX_LISTED_JOBS } from '../src/careers/data'
 import { loadConfig, parseDotEnv } from '../src/config'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -187,6 +190,46 @@ describe('systemd unit and Caddy', () => {
     expect(code).toMatch(/^\theader \{\n\t\tStrict-Transport-Security "max-age=31536000"\n\t\tdefer\n\t\}$/m)
     expect(code).toMatch(/^\theader -Server$/m)
     expect(code).not.toMatch(/^\s*\?/m)
+  })
+
+  it('keeps invite tokens out of the access log, which records every request path', () => {
+    const code = caddyCode()
+    const start = code.indexOf('\nhr.example.com {\n')
+    const app = code.slice(start, code.indexOf('\n}\n', start) + 3)
+    expect(app).toContain('\t\tformat filter {\n\t\t\twrap json\n\t\t\tfields {\n\t\t\t\trequest>uri regexp "(?i)/invites/[^/?#]+" "/invites/[redacted]"\n\t\t\t}\n\t\t}\n')
+    expect(app).not.toMatch(/^\t\tformat json$/m)
+    // The pattern (Go's regexp syntax; (?i) is the i flag here) cuts the token out of every spelling the
+    // server routes, as redactPath does for the server's own log.
+    const re = /\/invites\/[^/?#]+/i
+    for (const uri of [`/api/invites/${'T'.repeat(43)}`, `/%61pi/invites/${'T'.repeat(43)}?x=1`, `/api/INVITES/${'T'.repeat(43)}`]) {
+      const cut = uri.replace(re, '/invites/[redacted]')
+      expect(cut, uri).not.toContain('T'.repeat(43))
+      expect(cut.toLowerCase(), uri).toBe(redactPath(uri).toLowerCase())
+    }
+  })
+
+  it('has a careers site template that proxies like the app, takes small bodies only and drops cookies', () => {
+    const m = /^# BEGIN careers site\n([\s\S]*?)^# END careers site$/m.exec(caddyfile)
+    expect(m).not.toBeNull()
+    const block = m![1]
+    // The template is the last thing in the file, so setup can append one copy per careers domain there.
+    expect(caddyfile.trimEnd().endsWith('# END careers site')).toBe(true)
+    expect(block).toMatch(/^http:\/\/careers\.example\.com \{\n\tredir https:\/\/\{host\}\{uri\} permanent\n\}$/m)
+    expect(block).toMatch(/^careers\.example\.com \{$/m)
+    expect(block).toMatch(/^\t# tls you@example\.com$/m)
+    const env = parseDotEnv(envExample)
+    expect(block).toMatch(new RegExp(`^\\treverse_proxy ${env.HOST.replace(/\./g, '\\.')}:${env.PORT} \\{\\n\\t\\theader_up -X-Real-IP\\n\\t\\}$`, 'm'))
+    expect(block).toMatch(/^\theader \{\n\t\tStrict-Transport-Security "max-age=31536000"\n\t\tdefer\n\t\}$/m)
+    expect(block).toMatch(/^\theader -Set-Cookie$/m)
+    // Room for the largest application the server takes, and nothing like a workspace upload.
+    const size = /^\t\tmax_size (\d+)KB$/m.exec(block)
+    expect(size).not.toBeNull()
+    expect(Number(size![1]) * 1000).toBeGreaterThan(APPLY_BODY_LIMIT)
+    expect(Number(size![1]) * 1000).toBeLessThan(WORKSPACE_BODY_LIMIT / 100)
+    // Each host's HSTS covers that host alone: the careers hosts and the app never pin each other.
+    expect(caddyCode()).not.toMatch(/includeSubDomains/i)
+    // The template's own placeholders appear only inside it.
+    expect(caddyfile.replace(m![0], '')).not.toMatch(/^(http:\/\/)?careers\.example\.com \{$/m)
   })
 })
 
@@ -936,6 +979,141 @@ echo "--- imported"; ACME_EMAIL=ops@example.test render_caddyfile "$DEPLOY/Caddy
     // Setup picks the file before rendering, and warns about the timeouts when it is not the main one.
     expect(setup.indexOf('TARGET=/etc/caddy/first-twenty.caddy')).toBeLessThan(setup.indexOf('render_caddyfile "$CADDY_SRC" site-only'))
     expect(setup).toContain('Caddy reads global options only from the top of $CADDYFILE')
+    // Without careers domains, no careers site and no template.
+    for (const s of [out.main, out.imported]) {
+      expect(s).not.toMatch(/^(http:\/\/)?careers\.example\.com \{$/m)
+      expect(s).not.toMatch(/^# (BEGIN|END) careers site$/m)
+      expect(s).not.toContain('max_size 64KB')
+    }
+  })
+
+  it('renders one careers site per careers domain, after the app, with the tls line in every site', () => {
+    const setup = script('setup-ec2.sh')
+    const r = bash(`${prelude}
+${shellFunction(setup, 'render_caddyfile')}
+MARKER='# Managed by First Twenty setup-ec2.sh. Re-running the script rewrites this file.'
+DOMAIN=hr-3-14-15-92.sslip.io
+CAREERS_DOMAINS='careers-3-14-15-92.sslip.io jobs-3-14-15-92.sslip.io'
+echo "--- main"; ACME_EMAIL=ops@example.test render_caddyfile "$DEPLOY/Caddyfile"
+echo "--- imported"; ACME_EMAIL= render_caddyfile "$DEPLOY/Caddyfile" site-only
+`)
+    expect(r.stderr).toBe('')
+    const out = sections(r.stdout)
+    for (const s of [out.main, out.imported]) {
+      expect(s).not.toContain('example.com {')
+      expect(s).not.toMatch(/^# (BEGIN|END) careers site$/m)
+      for (const host of ['careers-3-14-15-92.sslip.io', 'jobs-3-14-15-92.sslip.io']) {
+        const esc = host.replace(/\./g, '\\.')
+        expect(s.match(new RegExp(`^http://${esc} \\{\\n\\tredir https://\\{host\\}\\{uri\\} permanent\\n\\}$`, 'gm'))?.length, host).toBe(1)
+        expect(s.match(new RegExp(`^${esc} \\{$`, 'gm'))?.length, host).toBe(1)
+      }
+      // Both careers sites come after the app's, each proxied with the app's headers and its own small limit.
+      expect(s.indexOf('hr-3-14-15-92.sslip.io {')).toBeLessThan(s.indexOf('careers-3-14-15-92.sslip.io {'))
+      expect(s.indexOf('careers-3-14-15-92.sslip.io {')).toBeLessThan(s.indexOf('jobs-3-14-15-92.sslip.io {'))
+      expect(s.match(/^\treverse_proxy 127\.0\.0\.1:8787 \{$/gm)?.length).toBe(3)
+      expect(s.match(/^\theader -Set-Cookie$/gm)?.length).toBe(2)
+      expect(s.match(/^\t\tmax_size 64KB$/gm)?.length).toBe(2)
+      expect(s.match(/^\t\tmax_size 12MB$/gm)?.length).toBe(1)
+      // Every brace opened is closed, and no HSTS covers other hosts (comments aside).
+      const code = s
+        .split('\n')
+        .filter((l) => !l.trimStart().startsWith('#'))
+        .join('\n')
+      expect(code).not.toMatch(/includeSubDomains/i)
+      expect((code.match(/\{/g) ?? []).length).toBe((code.match(/\}/g) ?? []).length)
+    }
+    expect(out.main.match(/^\ttls ops@example\.test$/gm)?.length).toBe(3)
+    expect(out.imported).not.toMatch(/^\ttls /m)
+    expect(out.imported).not.toContain('read_header')
+  })
+
+  it('takes --careers-domain more than once, normalized and once each, and never the app domain', () => {
+    const setup = script('setup-ec2.sh')
+    const r = bash(`${prelude}
+die() { echo "die: $*"; exit 1; }
+${['normalize_domain', 'is_domain', 'add_careers_domain'].map((name) => shellFunction(setup, name)).join('\n')}
+CAREERS_DOMAINS=''
+add_careers_domain 'Careers-3-14-15-92.sslip.io'
+add_careers_domain 'https://jobs-3-14-15-92.sslip.io/'
+add_careers_domain 'careers-3-14-15-92.sslip.io'
+echo "list=[$CAREERS_DOMAINS]"
+for bad in 'not a host' 'careers' 'careers.example.com:8443' '-x.example.com'; do (add_careers_domain "$bad") || true; done
+`)
+    expect(r.stderr).toBe('')
+    expect(r.stdout).toContain('list=[careers-3-14-15-92.sslip.io jobs-3-14-15-92.sslip.io]')
+    expect(r.stdout.match(/^die: .* does not look like a host name for --careers-domain/gm)?.length).toBe(4)
+    expect(setup).toContain('--careers-domain) need_value "$1" "${2:-}"; add_careers_domain "$2"; shift 2 ;;')
+    expect(setup).toContain('--careers-domain=*) add_careers_domain "${1#*=}"; shift ;;')
+    expect(setup).toContain('--careers-domain $d is the app\'s own domain.')
+    // Each careers domain gets the DNS check the app's domain gets.
+    expect(setup).toContain('for name in "$DOMAIN" $CAREERS_DOMAINS; do')
+  })
+
+  it('turns CAREERS_HOSTS on in a new settings file, and says how to set it in one it kept', () => {
+    const setup = script('setup-ec2.sh')
+    const r = bash(`${prelude}
+${['env_setting', 'careers_from_settings', 'host_set', 'set_careers_hosts', 'careers_hosts_fix'].map((name) => shellFunction(setup, name)).join('\n')}
+SERVICE=first-twenty
+CAREERS_DOMAINS='careers-3-14-15-92.sslip.io jobs-3-14-15-92.sslip.io'
+cp "$REPO/.env.example" "$work/new.env"
+set_careers_hosts "$work/new.env"
+grep -c '^CAREERS_HOSTS=' "$work/new.env" | sed 's/^/active=/'
+grep -c 'CAREERS_HOSTS=' "$work/new.env" | sed 's/^/all=/'
+printf 'PORT=8787\\n' > "$work/none.env"; set_careers_hosts "$work/none.env"; echo "appended=[$(env_setting CAREERS_HOSTS "$work/none.env")]"
+check() { printf '%s\\n' "$2" > "$work/$1.env"; cp "$work/$1.env" "$work/$1.before"; echo "$1=[$(careers_hosts_fix "$work/$1.env")]"; cmp -s "$work/$1.env" "$work/$1.before" && echo "$1 unchanged"; }
+check same 'CAREERS_HOSTS=careers-3-14-15-92.sslip.io,jobs-3-14-15-92.sslip.io'
+check reordered 'CAREERS_HOSTS="JOBS-3-14-15-92.sslip.io, careers-3-14-15-92.sslip.io"'
+check other 'CAREERS_HOSTS=careers-18-223-195-215.sslip.io'
+check commented '# CAREERS_HOSTS=careers.example.com'
+echo "read=[$(careers_from_settings "$work/reordered.env")]"
+CAREERS_DOMAINS='' check off 'CAREERS_HOSTS=careers.example.com'
+# The printed command does what it says (GNU sed, as on the instance).
+printf 'PORT=8787\\nCAREERS_HOSTS=old.example.com\\n' > "$work/apply.env"
+cmd=$(careers_hosts_fix "$work/apply.env")
+cmd=\${cmd% && sudo systemctl restart first-twenty}
+eval "\${cmd#sudo }"
+echo "applied=[$(careers_hosts_fix "$work/apply.env")] $(env_setting CAREERS_HOSTS "$work/apply.env")"
+`)
+    expect(r.stderr).toBe('')
+    expect(r.stdout).toContain('active=1')
+    expect(r.stdout).toContain('all=1')
+    expect(r.stdout).toContain('appended=[careers-3-14-15-92.sslip.io,jobs-3-14-15-92.sslip.io]')
+    const env = parseDotEnv(bash(`${prelude}
+${['set_careers_hosts'].map((name) => shellFunction(setup, name)).join('\n')}
+CAREERS_DOMAINS='careers-3-14-15-92.sslip.io jobs-3-14-15-92.sslip.io'
+cp "$REPO/.env.example" "$work/e.env"; set_careers_hosts "$work/e.env"; cat "$work/e.env"
+`).stdout)
+    expect(env.CAREERS_HOSTS).toBe('careers-3-14-15-92.sslip.io,jobs-3-14-15-92.sslip.io')
+    for (const name of ['same', 'reordered']) expect(r.stdout, name).toContain(`${name}=[]`)
+    expect(r.stdout).toContain('off=[]')
+    expect(r.stdout).toMatch(/^other=\[sudo sed -i -E 's#.*#CAREERS_HOSTS=careers-3-14-15-92\.sslip\.io,jobs-3-14-15-92\.sslip\.io#' \S+other\.env && sudo systemctl restart first-twenty\]$/m)
+    expect(r.stdout).toMatch(/^commented=\[echo 'CAREERS_HOSTS=careers-3-14-15-92\.sslip\.io,jobs-3-14-15-92\.sslip\.io' \| sudo tee -a \S+commented\.env/m)
+    for (const name of ['same', 'reordered', 'other', 'commented']) expect(r.stdout, name).toContain(`${name} unchanged`)
+    expect(r.stdout).toContain('read=[jobs-3-14-15-92.sslip.io careers-3-14-15-92.sslip.io]')
+    expect(r.stdout).toContain('applied=[] careers-3-14-15-92.sslip.io,jobs-3-14-15-92.sslip.io')
+    // A re-run without --careers-domain keeps the sites CAREERS_HOSTS names, decided before Caddy is configured.
+    expect(setup.indexOf('for d in $(careers_from_settings "$ENV_FILE"); do')).toBeGreaterThan(0)
+    expect(setup.indexOf('for d in $(careers_from_settings "$ENV_FILE"); do')).toBeLessThan(setup.indexOf('render_caddyfile "$CADDY_SRC"'))
+    expect(setup).toContain('CAREERS_FIX=$(careers_hosts_fix "$ENV_FILE")')
+  })
+
+  it('names the careers address in the next steps, and how to fix CAREERS_HOSTS when setup could not', () => {
+    const setup = script('setup-ec2.sh')
+    const next = bash(`${prelude}
+${shellFunction(setup, 'next_steps')}
+APP_DIR=/opt/first-twenty ENV_FILE=/etc/first-twenty/env DEPLOY_USER=ubuntu SERVICE=first-twenty DOMAIN=hr.example.com DB_STATE='t|t|t' ORIGIN_FIX=
+echo "--- none"; next_steps
+echo "--- careers"; CAREERS_DOMAINS='careers.example.com jobs.example.com' next_steps
+echo "--- fix"; CAREERS_DOMAINS='careers.example.com' CAREERS_FIX='sudo sed -i -E careers-example' next_steps
+`)
+    expect(next.stderr).toBe('')
+    const out = sections(next.stdout)
+    expect(out.none).not.toMatch(/careers/i)
+    expect(out.careers).toContain('https://careers.example.com/<its slug>/')
+    expect(out.careers).toContain('curl -I https://careers.example.com/')
+    expect(out.careers).not.toContain('CAREERS_HOSTS')
+    expect(out.fix).toContain('CAREERS_HOSTS in /etc/first-twenty/env does not name careers.example.com yet')
+    expect(out.fix).toContain('sudo sed -i -E careers-example')
   })
 
   it('lets unattended-upgrades install Node.js from NodeSource and reboot after the backup, and writes that only once', () => {
@@ -1578,5 +1756,20 @@ describe('docs/SERVER.md', () => {
     expect(step2).toMatch(/2 GB swap file/)
     expect(step2).toMatch(/1 GB/)
     expect(section('### The build runs out of memory')).toContain('--swap')
+  })
+
+  it('documents careers pages: DNS, --careers-domain, the settings, what the host answers and the limits', () => {
+    const careers = section('## Careers pages')
+    for (const text of ['--careers-domain', 'CAREERS_HOSTS', 'CAREERS_ORIGIN', 'curl -I https://careers.example.com/', 'answer 404', 'includeSubDomains', 'no file upload']) {
+      expect(careers, text).toContain(text)
+    }
+    // The limits it states are the server's.
+    expect(careers).toContain(`${DEFAULT_APPLY_LIMITS.postsPerAddress} form posts and ${DEFAULT_APPLY_LIMITS.perAddress} applications per address`)
+    expect(careers).toContain(`${DEFAULT_APPLY_LIMITS.perWorkspace} applications per company`)
+    expect(careers).toContain(`${APPLY_BODY_LIMIT / 1024} KB at most`)
+    expect(careers).toContain(`${CAREERS_CACHE_BYTES / (1024 * 1024)} MB of pages`)
+    expect(careers).toContain(`${MAX_LISTED_JOBS} open roles`)
+    expect(careers).toContain(`${LOAD_BUDGET.jobs / (1024 * 1024)} MB of job records`)
+    expect(section('## Step 2: copy the code and run the setup script')).toContain('--careers-domain')
   })
 })

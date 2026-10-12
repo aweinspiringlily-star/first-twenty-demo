@@ -7,6 +7,14 @@ import { createHash } from 'node:crypto'
 export const API_CSP = "default-src 'none'; frame-ancestors 'none'"
 
 /**
+ * For every answer on a careers host (CAREERS_HOSTS): its own stylesheet, script and fonts, images from
+ * itself or data: URLs, forms posting back to itself, and nothing else. app.ts sets it on careers-host
+ * answers that carry no policy of their own.
+ */
+export const CAREERS_CSP =
+  "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+
+/**
  * The app's policy: inline scripts only by hash; styles may be inline (the app sets style attributes);
  * workers only from this server (the offline worker, /sw.js).
  */

@@ -9,8 +9,14 @@ Decisions (from the user, October 2026):
 
 - The API server runs **on the same EC2 instance as Postgres**. Postgres listens on localhost only; port
   5432 is never opened to the internet. The API is reached over HTTPS through Caddy on port 443.
-- **One admin login** protects the data. Viewing as stays a preview (not security). Team logins with
-  server-enforced roles can come later; the schema leaves room for them (`users.role`).
+- **Logins protect the data.** The server's own company starts with one admin login
+  (`server:create-admin`); an admin can invite teammates with single-use links. Every login has full
+  access to its company: Viewing as stays a preview (not security). Server-enforced roles can come later;
+  the schema leaves room for them (`users.role`).
+- **One server can hold many companies** (October 2026, for demos): with `SIGNUP_MODE=open` anyone can
+  create a login and a demo company of their own, and many people use the server at once. Each login
+  belongs to exactly one company, and the server takes the company from the session, never from a request
+  (see Companies). Demo companies unused for `DEMO_EXPIRE_DAYS` are deleted.
 - **One table per record type, holding JSONB**: `people`, `candidates`, `jobs`, ... each with
   `(workspace_id, id, data jsonb, version, updated_at, updated_by)`.
 
@@ -40,24 +46,42 @@ Decisions (from the user, October 2026):
 - **Versions** are the change-log `seq` of the write that produced them (migration 002). They never
   repeat within a workspace and only grow per record, across delete and re-create, a full replace and a
   restore, so a stale `baseVersion` can only match the write it was based on. Clients must treat them as
-  opaque numbers up to 2^53 (they jump by a billion after a restore).
+  opaque numbers up to 2^53 (they jump by a billion after a restore). Each workspace counts its own seqs
+  (migration 005: `workspaces.last_seq + 1`, taken under the workspace row lock every write holds), so two
+  companies' numbers say nothing about each other's writes, and the same number means different writes in
+  different workspaces.
 - **Documents** (non-array keys): `meta`, `company`, `equity`, `complianceStatus`, `inboxState`,
   `settings` live in `workspace_docs (workspace_id, key, data jsonb, version, updated_at, updated_by)`.
   In the protocol they use the collection name `$doc` and `id` = the key.
 - `schemaVersion` is not stored per row; the snapshot sets it.
-- **Change log** `change_log (seq bigserial primary key, workspace_id, collection, record_id, op, version,
-  data jsonb null, at timestamptz, user_id uuid null)`: every accepted write appends a row. Pulls read it.
-  Rows older than 120 days are pruned daily; a client whose `since` is older than the oldest kept row gets
-  `resync: true`. Seqs in a pull need not be contiguous: applying a delete removes that record's earlier
-  rows (the delete row stays), and a full replace removes every earlier row.
+- **Change log** `change_log (workspace_id, seq, collection, record_id, op, version, data jsonb null, at
+  timestamptz, user_id uuid null)`, primary key `(workspace_id, seq)` (migration 005; before it, `seq` was
+  one server-wide `bigserial`): every accepted write appends a row. Pulls read it. Rows older than 120 days
+  are pruned daily; a client whose `since` is older than the oldest kept row gets `resync: true`. Seqs in a
+  pull need not be contiguous: applying a delete removes that record's earlier rows (the delete row stays),
+  in a demo company an upsert does too (one row per record), and a full replace removes every earlier row.
 - **History id**: `workspaces.history_id uuid` names the current history. A full replace and
   `npm run server:after-restore` (run once after restoring a backup; it also moves the seq a billion
   ahead and sets `reset_seq` there) give it a new value.
 - **Auth**: `users (id uuid, email text unique (stored lowercase), password_hash text, role text default
-  'admin', created_at, last_login_at)`, `sessions (token_hash text primary key, user_id, created_at,
-  last_seen_at, expires_at, ip, user_agent)`, `trusted_devices (token_hash text primary key, user_id,
-  created_at, expires_at)` (migration 003).
-- One workspace per server for now: `workspace_id = 'default'` (a `workspaces` table holds it).
+  'admin', created_at, last_login_at, workspace_id text not null)`, `sessions (token_hash text primary key,
+  user_id, created_at, last_seen_at, expires_at, ip, user_agent)`, `trusted_devices (token_hash text
+  primary key, user_id, created_at, expires_at)` (migration 003), `invites (token_hash text primary key,
+  workspace_id, created_by, created_at, expires_at, used_at, used_by)` (migration 004) with `id uuid
+  unique` (a handle to list and revoke one by) and `refused` (its `email_taken` answers) from migration 005.
+- **Companies** (migrations 004 and 005): `workspaces (id, name, slug unique, keep, careers, bytes_used,
+  created_by, last_active_at, ...)`. The server's own workspace is `'default'` (`WORKSPACE_ID`, kept); a
+  demo sign-up adds one with a random id (`w-` and 24 hex characters) and `keep = false`. `slug` is the
+  company's part of its careers page address: lowercase a-z, 0-9 and `-`, 3 to 40 characters, unique,
+  never one of the reserved words (`admin`, `api`, `assets`, `careers`, `jobs`, `static`, `www`). A demo
+  company's slug is its name's base and six random characters (`acme-robotics-k7m2qx`); the owner's
+  workspace takes its name's base (`-2`, `-3` ... when taken) on its first upload while it still has the
+  placeholder `default-workspace`. `released_slugs (slug, released_at)` keeps the slug of every deleted demo
+  company, and no slug in it is handed out again. `careers` says whether the careers page is public (demo
+  companies start on, kept workspaces off). `bytes_used` is the length of the workspace's record and
+  document JSON, kept by every write once known (NULL until a demo company's first write counts it).
+  Deleting a workspace deletes its logins and invites (foreign keys), and the expiry deletes its records,
+  documents and change log in the same transaction.
 
 ## Protocol (`/api`, JSON)
 
@@ -96,15 +120,24 @@ scripts) are not affected, and the development origin (`ALLOWED_ORIGIN`) is exem
 | Method and path | Body | Response |
 |---|---|---|
 | `GET /api/health` | | `200 {ok: true, db: 'up', version}` or `503 {ok: false, db: 'down'}`. No auth. Never leaks details. |
-| `POST /api/auth/login` | `{email, password, remember?: boolean}` (body limit 8 KB) | `200 {user: {id, email, role}}` + cookie (see `remember` above); `400` when `remember` is not a boolean; `401 {error: 'invalid_credentials'}`; `429 {error: 'rate_limited', retryAfter}` (per 15 minutes: 10 attempts per client address, IPv6 per /64; 10 per email from one address, cleared by a successful sign-in; 100 failures per email from all addresses; a sign-in with a valid trusted-device cookie for this login is held to none of these, only to 10 attempts per device, cleared by a successful sign-in, so failures from many addresses cannot lock its owner out); `429 {error: 'busy', retryAfter}` when too many password checks are waiting. The email is trimmed and lowercased once, and that one string is both the rate-limit key and the lookup (never cut short). A sign-in with no password check (empty email or password, an email over 254 characters after trimming, a password over 1,024 characters, or refused as busy) counts against the client address only. Each limit keeps at most 50,000 keys in memory. The two email limits never drop a key that holds a lockout; when every key of one holds one, a sign-in that needs a new email key gets `429 rate_limited` until the oldest lockout ends (filling them takes password checks, which run two at a time). Every sign-in adds an address key, even one with no password check, so when every address key holds a lockout the oldest one is forgotten instead: cheap sign-ins from many addresses cannot lock everyone else out. |
+| `POST /api/auth/login` | `{email, password, remember?: boolean}` (body limit 8 KB) | `200 {user: {id, email, role}, workspace: {id, name, slug}}` + cookie (`workspace`: the login's company; a browser that holds another company's copy refuses to carry on under it) (see `remember` above); `400` when `remember` is not a boolean; `401 {error: 'invalid_credentials'}`; `429 {error: 'rate_limited', retryAfter}` (per 15 minutes: 10 attempts per client address, IPv6 per /64; 10 per email from one address, cleared by a successful sign-in; 100 failures per email from all addresses; a sign-in with a valid trusted-device cookie for this login is held to none of these, only to 10 attempts per device, cleared by a successful sign-in, so failures from many addresses cannot lock its owner out); `429 {error: 'busy', retryAfter}` when too many password checks are waiting. The email is trimmed and lowercased once, and that one string is both the rate-limit key and the lookup (never cut short). A sign-in with no password check (empty email or password, an email over 254 characters after trimming, a password over 1,024 characters, or refused as busy) counts against the client address only. Each limit keeps at most 50,000 keys in memory. The two email limits never drop a key that holds a lockout; when every key of one holds one, a sign-in that needs a new email key gets `429 rate_limited` until the oldest lockout ends (filling them takes password checks, which run two at a time). Every sign-in adds an address key, even one with no password check, so when every address key holds a lockout the oldest one is forgotten instead: cheap sign-ins from many addresses cannot lock everyone else out. |
 | `POST /api/auth/logout` | | `204`, session deleted and the cookie cleared (the trusted-device cookie stays). Clients treat `204` and `401` as "no session left"; anything else (no answer, `5xx`) means the session may still be open (see Sign-out below). |
-| `GET /api/auth/me` | | `200 {user}` or `401`. |
-| `GET /api/auth/session` | | `200 {user}` when signed in, `200 {user: null}` when not: never `401`, which browsers log as a console error, so the app's checks on every page load (`checkServer`, the session probe on focus) use it. A cookie that names no live session is cleared, as on `/api/auth/me`. Servers from before it answer `404`; the client then asks `/api/auth/me` (a `401` there means nobody) for the rest of the page's life. |
+| `GET /api/auth/signup-mode` | | `200 {signupMode: 'open' \| 'closed', demoExpireDays}`. No auth. Servers from before companies answer `404`, which means closed. |
+| `POST /api/auth/signup` | `{email, password, companyName, remember?: boolean, website?: ''}` (body limit 8 KB) | Only with `SIGNUP_MODE=open`; otherwise the route does not exist (`404 {error: 'not_found'}`, before any body is read). Creates a company named `companyName` (2 to 80 characters, trimmed, no control characters) with a free slug (its base and six random characters, never one in use or released) and its careers page on, and its first login, an admin; signs in exactly like a sign-in (session and trusted-device cookies, `remember` as there). `201 {user: {id, email, role}, workspace: {id, name, slug}}`. The company starts empty: the app uploads a fresh one next (`PUT /api/workspace`, as for "Upload this browser's workspace"). `400` for a bad field (the email as for sign-in, the password rules of `server:create-admin`: 12 to 1,024 characters), or a `website` that is not empty (a field the app never shows). `409 {error: 'email_taken'}` when the email has a login anywhere on the server (after the same password hashing as a success, so it takes as long). `503 {error: 'demo_full'}` with `DEMO_MAX_WORKSPACES` demo companies (uploaded ones, and sign-ups from the last hour). `429 {error: 'rate_limited', retryAfter}` past 5 tries per client address (IPv6 per /64) or 60 companies created from all addresses per hour (only sign-ups that create a company stay in that count); `429 busy` as for sign-in. |
+| `GET /api/auth/me` | | `200 {user, workspace: {id, name, slug}, careersUrl, careersEnabled, signupMode}` or `401`. `name` is the company document's name once uploaded, else the sign-up's `companyName`. `careersUrl` is `CAREERS_ORIGIN + '/' + slug + '/'`, or `null` when the server serves no careers pages; `careersEnabled` says whether that page is public. |
+| `PUT /api/workspace/careers` | `{enabled: boolean}` (body limit 1 KB) | An admin of the signed-in login's company turns its careers page on or off: `200 {careersUrl, careersEnabled}`. `403 forbidden` for a login that is not an admin, `400` for a bad body. |
+| `POST /api/invites` | none (body limit 1 KB) | An admin of the signed-in login's company: `201 {url, expiresAt}`, where `url` is `PUBLIC_ORIGIN + '/#invite.' + token` (the request's own origin when `PUBLIC_ORIGIN` is unset) and the token is 32 random bytes in base64url (only its SHA-256 is stored). Single use, 7 days. `401` without a session, `403 {error: 'forbidden'}` for a login that is not an admin, `429 {error: 'too_many_invites', retryAfter}` with 20 open (unused, unexpired) links, `429 {error: 'too_many_logins', retryAfter}` when logins and open links reach 50. Works whatever `SIGNUP_MODE` says. |
+| `GET /api/invites` | | An admin: `200 {invites: [{id, createdAt, expiresAt, createdBy}]}`, the company's open links (never a token or its hash; `createdBy` is an email or null). |
+| `DELETE /api/invites/:id` | | An admin revokes one of the company's open links: `204`, or `404 {error: 'not_found'}` when the company has no such open link (any other company's id is 404 too). |
+| `POST /api/invites/lookup` | `{token}` (body limit 1 KB) | `200 {companyName}` for an unused, unexpired invite, else `404 {error: 'invalid_invite'}`. No auth (the token is the secret); 30 lookups per client address per 15 minutes (`429 rate_limited`), shared with `GET /api/invites/:token` and the token check of accept-invite. The app uses this form: the token stays out of every address, which proxies and access logs keep. |
+| `GET /api/invites/:token` | | The same, for older apps. The server's log and Caddy's access log cut the token out of the path. |
+| `POST /api/auth/accept-invite` | `{token, email, password, remember?: boolean}` (body limit 8 KB) | Creates the login (an admin) in the invite's company, marks the invite used and signs in like a sign-in: `201 {user, workspace}`. The token is checked first, against the lookup limit: `404 {error: 'invalid_invite'}` for a malformed, unknown, used, revoked or expired one, with no password hashing and no account limit spent. `409 email_taken` (the invite stops working after 3 of these), `400` for bad fields, `429 rate_limited` past 5 joins per client address per hour (no server-wide count: a company's 50 logins cap joins), `429 busy` as for sign-in. |
+| `GET /api/auth/session` | | `200 {user, workspace}` when signed in (`workspace` as for sign-in), `200 {user: null}` when not: never `401`, which browsers log as a console error, so the app's checks on every page load (`checkServer`, the session probe on focus) use it. A cookie that names no live session is cleared, as on `/api/auth/me`. Servers from before it answer `404`; the client then asks `/api/auth/me` (a `401` there means nobody) for the rest of the page's life. |
 | `GET /api/workspace` | | `200 {workspaceId, historyId, seq, db, versions}` where `versions` maps `"collection:id"` to version; `404 {error: 'empty'}` before the first upload (kept for older apps). |
 | `GET /api/workspace/status` | | `200 {empty: true}` before the first upload, else `200 {empty: false, workspaceId, historyId, seq}`, with no records read: the app's "is it empty?" looks (the connect step, the `server_empty` hold, `checkServer`) use it, so an empty server is an answer and not a `404` in the console. `401` without a session. Servers from before it answer `404`; the client (`workspaceStatus()`) then asks `GET /api/workspace` instead for the rest of the page's life (its `empty` becomes `{empty: true}`, and a workspace comes along as `snapshot`), or, with `fallback: false` (`checkServer`), answers kind `not_found` without asking. |
-| `PUT /api/workspace` | `{db, confirmReplace?: boolean}` | Replaces everything in one transaction and starts a new history. Allowed without `confirmReplace` only when the server is empty. `200 {historyId, seq, versions}`. Used for the first upload, Import and Start fresh. Body limit 10 MB. |
-| `GET /api/changes?since=<seq>&history=<historyId>` | | `200 {historyId, seq, changes: Change[]}` (oldest first, at most 5,000; `more: true` when truncated) or `200 {resync: true}`, also when `history` is given and is not the current history id. `history` is optional. |
-| `POST /api/changes` | `{changes: ClientChange[], historyId?}` (at most 2,000) | `200 {historyId, seq, applied: Applied[], conflicts: Conflict[]}`. Applied in one transaction; each change independently accepted or rejected. `409 {error: 'resync'}` (nothing applied) when `historyId` is given and is not the current one: load the snapshot, rebase, then push again. |
+| `PUT /api/workspace` | `{db, confirmReplace?: boolean}` | Replaces everything in one transaction and starts a new history. Allowed without `confirmReplace` only when the server is empty. `200 {workspaceId, historyId, seq, versions}` (`workspaceId`: the company that now holds it, which the browser keeps). Used for the first upload, Import and Start fresh. Body limit 10 MB. In a demo company, the demo limits of `POST /api/changes`. |
+| `GET /api/changes?since=<seq>&history=<historyId>` | | `200 {historyId, seq, changes: Change[]}` (oldest first, at most 5,000 changes, and stopping at the one that takes the page past 8 MB of record JSON; `more: true` when cut short) or `200 {resync: true}`, also when `history` is given and is not the current history id. `history` is optional. |
+| `POST /api/changes` | `{changes: ClientChange[], historyId?}` (at most 2,000) | `200 {historyId, seq, applied: Applied[], conflicts: Conflict[]}`. Applied in one transaction; each change independently accepted or rejected. `409 {error: 'resync'}` (nothing applied) when `historyId` is given and is not the current one: load the snapshot, rebase, then push again. In a demo company (see Companies), nothing applies on `413 {error: 'workspace_full'}` (past its records, its bytes, or what the demo companies may hold together), `413 {error: 'too_large'}` (a record over 64 KB) or `429 {error: 'write_limit', retryAfter}` (writing faster than the demo allows). |
 
 Types:
 
@@ -158,6 +191,51 @@ Rules:
 - Requests that need a session are refused (`401`) before their bodies are read, and so are unknown paths
   and methods (`404 {error: 'not_found'}`). A request whose body has not arrived in full after 3 minutes
   is dropped (Node's `requestTimeout`; Caddy's `read_body` timeout matches it).
+
+## Companies (`server/src/workspaces.ts`, migration 004)
+
+- **The company comes from the session, and only from there.** Every route that needs a session works on
+  the workspace of the session's login (`users.workspace_id`): `GET/PUT /api/workspace`,
+  `/api/workspace/status`, `GET/POST /api/changes`, `/api/auth/me`, `POST /api/invites`. A workspace id,
+  history id or record named in a request never reaches another company: an id names a record in the
+  login's own company, and another company's history id is just a history this one does not have
+  (`resync`). `server/src/tenants.test.ts` checks this for every registered route and fails when a route
+  is added without a check. An invite token is the one way into a company from outside, and it joins
+  only the company that made it.
+- **Sign-up** (`SIGNUP_MODE=open`) makes a demo company: `keep = false`, its first login an admin, empty
+  until the app uploads a fresh company (Settings > Server does that right after sign-up, the same flow as
+  Start fresh without the sample). The owner's own workspace (`'default'`, kept) and its admin
+  (`server:create-admin`, which only ever touches that workspace's logins) work as before.
+- **Demo limits**, so one t3.micro serves many people at once and strangers cannot fill its disk or its
+  memory: a demo company holds at most 20,000 records and 16 MB of record and document JSON (`413 {error:
+  'workspace_full'}` on the push or upload that would pass either; the client sets such a change aside like
+  a record over 256 KB), records of 64 KB at most (`413 too_large`), and the demo companies together at most
+  `DEMO_MAX_TOTAL_MB` (`413 workspace_full`); a write that only removes bytes always goes through. Its
+  change log holds one row per record (an upsert removes the record's earlier rows) and its newest 50,000
+  rows, pruned in the write that passes them and again daily (browsers behind them resync; a retried push
+  then finds only the newest copy, so `landed` is rarer there). It writes at most 120 times a minute and 64
+  MB an hour (`429 write_limit`, `writeBudget.ts`). The workspace upload keeps its 10 MB limit. Kept
+  workspaces have none of these limits.
+- **Sign-up and invite limits:** sign-ups count every try per address and only the companies they create
+  server-wide; joining with an invite checks the token before any password work and has a per-address
+  limit of its own. An email that already has a login is answered as such (`409 email_taken`), as a person
+  who mistyped needs; that tells a stranger whether one email has a login, at 5 tries per address an hour,
+  and an invite stops working after 3 such answers. This is accepted: the owner's login email is not a
+  secret, its password is.
+- **Activity and expiry**: `workspaces.last_active_at` moves on every write that changes something (in the
+  same transaction) and on every sign-in, sign-up and accepted invite. Applications from a public careers
+  page do not count (`applyChanges(..., {markActive: false})`), so strangers cannot keep an abandoned demo
+  alive. Once a day, and at startup, the server deletes every demo company with no activity for
+  `DEMO_EXPIRE_DAYS` (default 30; 0 never), and every sign-up never uploaded a day after it (while demo
+  companies expire at all), each in one transaction: records, documents, change log, invites, logins with
+  their sessions and trusted devices, then the workspace, whose slug goes to `released_slugs`. A kept
+  workspace is never deleted. A session whose company is gone ends with it (`401`), and so does a write that raced the
+  delete: a workspace row is never re-created by a write.
+- **Careers hosts** (`CAREERS_HOSTS`): a request whose `Host` is one of them (with or without the trailing
+  dot of a fully qualified name) reaches the careers pages (`server/src/careers`) and nothing else; `/`,
+  `/sw.js` and every `/api` route answer `404` there, the careers routes answer only there, and no cookie
+  is read or set there (the session cookies are `__Host-` cookies of the app's own host anyway). Only
+  companies whose careers page is on have one.
 
 ## Browser sync engine (`src/sync/**`)
 
@@ -389,6 +467,31 @@ Rules:
   server's copy. The header chip, the sync banners and the rail note (`src/app/Header.tsx`,
   `Shell.tsx`) show `useSyncStatus`. Removing this browser's data calls `stopPersisting()` from
   `@/store/db` first, so the store never writes a workspace back on the way to the reload.
+- **Companies and demo servers** (see Companies above; `src/sync/index.ts`, `account.ts`, `demo.ts`):
+  `connect.signUp({email, password, companyName, remember?})` and `connect.acceptInvite({token, email,
+  password, remember?})` create a login and sign in exactly as `signIn` does, and are refused (kind
+  `'pending'`, `CONNECTED_ACCOUNT_MESSAGE`) while this browser syncs with a server, so changes queued for
+  one company never go out under another company's login. A sign-in on a browser that syncs with a server
+  is held to the same rule: when the login's company (`workspace` in the sign-in answer) is not the one
+  the connection names (`workspaceId`, from the snapshot or the upload's answer), the engine ends that
+  session again (retried like an unconfirmed sign-out when the server cannot be reached), stays signed out
+  with its copy and queued changes as they were, and answers kind `'other_company'` (`otherCompanyMessage`:
+  sign in with a login of this company, or Disconnect first). The session check (`checkServer`, the probe
+  on focus) never resumes under such a session either, and stops syncing when the session it was syncing
+  under turns out to be one. Behind those, a resync whose snapshot names another server workspace than the
+  connection's is always a swap (`takeRemoteSwap`), whatever `meta.workspaceId` says: another company can
+  carry this one's, and a merge would send this company's queued edits into it. After a sign-up, `connect.uploadNew(db)` puts
+  the new company (Start fresh's defaults, named as typed: `demoCompanyDB` in
+  `src/features/settings/demoLogic.ts`) on the empty server workspace (`PUT` without `confirmReplace`); the
+  store takes it only once the server has it, and it never sends the sample. After joining by invite,
+  `connect.useServerCopy()` takes the company's workspace. `demoSignup()` asks `GET
+  /api/auth/signup-mode` once per page load (a `404` from an older server counts as closed);
+  `useServerAccount(ask)` asks `GET /api/auth/me` once per sign-in for the company name, slug, careers
+  page (and whether it is on) and role, and forgets the answer the moment the signed-in user changes;
+  `createInvite()`, `listInvites()`, `revokeInvite(id)` and `inviteInfo(token)` (a `POST` with the token in
+  its body) wrap the invite routes, and `setCareers(enabled)` the careers switch. Addresses the server
+  sends (careers page, invite link) are kept only when they are http(s). The API client adds the error
+  kinds `'email_taken'` (409) and `'demo_full'` (503).
 - Known limit: two tabs of one browser each run an engine on the same localStorage key; the saved outbox
   is last-writer-wins between them (a Web Locks leader tab would fix it). Removing this browser's data
   stops the other tabs (see Other tabs), but changes another tab queued and never saved are lost with it.
@@ -399,10 +502,20 @@ Rules:
   from environment variables (`/etc/first-twenty/env` on EC2, `.env` locally; `.env` is git-ignored).
 - Passwords are hashed with scrypt (`node:crypto`, N=2^15, r=8, p=1, 16-byte salt); compared in constant
   time. The admin is created from the command line (`npm run server:create-admin -- --email you@company.com`),
-  which asks for the password without echoing it. At most two password checks run at once (16 may wait).
+  which asks for the password without echoing it. At most two password checks run at once (16 may wait);
+  sign-ups and accepted invites hash their passwords through the same gate.
+- Sign-ups are limited per client address (every try) and for the whole server (only those that create a
+  company), 5 and 60 per hour; joining with an invite checks the token first and is limited per address;
+  demo companies are capped (`DEMO_MAX_WORKSPACES`) and held to the demo limits (see Companies). Invite
+  tokens, like session and device tokens, are stored as SHA-256 hashes only; the app sends them in request
+  bodies, and both the server's request log (`redactPath`) and Caddy's access log cut them out of paths.
+- Seqs and versions count per company, so no company can count another's writes from its own numbers.
+  Careers pages appear only for companies whose page is on, under slugs nobody can guess and nobody can
+  take over after a company is deleted.
 - SQL uses parameters only; table names come from the collection whitelist, never from input.
-- Security headers on every response (CSP for the served app, `X-Content-Type-Options`, `Referrer-Policy`,
-  `Frame-Options`); no CORS by default (`ALLOWED_ORIGIN` only for development). The app's CSP allows its
+- Security headers on every response (CSP for the served app, the strict careers policy on careers hosts,
+  `X-Content-Type-Options`, `Referrer-Policy`, `Frame-Options`); no CORS by default (`ALLOWED_ORIGIN` only
+  for development). The app's CSP allows its
   inline scripts by SHA-256 hash (computed from `APP_FILE` at startup, which is then served from memory),
   never `'unsafe-inline'` for scripts, and workers from its own origin only (`worker-src 'self'`). The
   offline worker's script (`/sw.js`, `application/javascript`, `no-cache`) carries its own policy,

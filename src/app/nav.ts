@@ -34,7 +34,12 @@ export function visibleNav(viewer: Viewer): NavItem[] {
   return NAV.filter((n) => canSeeSection(viewer, n.key))
 }
 
-export function activeNavKey(view: string, viewer: Viewer): string {
+/** Route views that belong to no section, so no nav item is current on them (an invite link's page). */
+const NO_SECTION = new Set(['invite'])
+
+/** The nav item that is the current page, or null on a page of no section. Unknown views count as Home. */
+export function activeNavKey(view: string, viewer: Viewer): string | null {
+  if (NO_SECTION.has(view)) return null
   if ((view === 'home' || view === '') && viewer.role === 'employee') return 'me'
   return NAV.find((n) => n.matches.includes(view))?.key ?? 'home'
 }

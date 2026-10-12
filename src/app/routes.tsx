@@ -7,7 +7,7 @@ import { CandidatePage, HiringPage, JobPage } from '@/features/hiring'
 import { HomePage } from '@/features/home'
 import { MePage } from '@/features/me'
 import { ChecklistPage, ContractorPage, PeoplePage, PersonPage } from '@/features/people'
-import { SettingsPage } from '@/features/settings'
+import { InvitePage, SettingsPage } from '@/features/settings'
 import type { Route } from './router'
 
 export type PageProps = { route: Route }
@@ -25,6 +25,8 @@ export const ROUTES: Record<string, ComponentType<PageProps>> = {
   compliance: CompliancePage,
   me: MePage,
   settings: SettingsPage,
+  // An invite link from Settings, Server (#invite.<token>): any role, no section.
+  invite: InvitePage,
 }
 
 /** Old or shorthand routes that redirect: #timeoff -> #people.timeoff, #plan -> #comp.plan. */

@@ -1045,6 +1045,11 @@ export type DB = {
     /** Days the sample was shifted on load (whole weeks). */
     sampleShiftDays?: number
     lastExportedOn?: ISODateTime
+    /**
+     * Facts a demo sign-up filled in rather than asked for, as it filled them (src/features/settings/
+     * demoLogic.ts). The public careers page shows each one only once the company changed it.
+     */
+    signupDefaults?: { hqCity: string; hqState: string; stage: string; workweek: string; foundedOn: ISODate }
   }
   company: Company
   departments: Department[]

@@ -1,6 +1,8 @@
 /*
-  Careers site (scripts/careers/build.ts): First Twenty's default look, "Swiss precision"
-  (src/themes/sleek.css), restated for static public pages. Tokens and rules are copied, not imported.
+  Careers pages (src/careers/render.ts): the static demo site (scripts/careers/build.ts) and the server's
+  live careers pages (server/src/careers/routes.ts, served at /assets/careers.css on a careers host).
+  First Twenty's default look, "Swiss precision" (src/themes/sleek.css), restated for public pages.
+  Tokens and rules are copied, not imported.
 
   White ground, true-black ink, one grotesk (Archivo), square corners. Structure comes from rules:
   a page head opens under a thick-and-thin rule (3px ink, 2px paper, 1px ink); a 2px ink rule starts a

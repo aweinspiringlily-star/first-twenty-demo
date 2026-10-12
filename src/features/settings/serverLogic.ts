@@ -128,10 +128,16 @@ export function statusView(s: StatusInput): StatusView {
  * keeps saying so, even after changes queue or the page reloads; only a session that ended on its own
  * (a 401 nobody asked for) says it ended.
  */
-export function signInSubtitle(s: { signedOutByUser: boolean }): string {
-  return s.signedOutByUser
+/**
+ * The subtitle of "Sign in to keep syncing". company: on a server that holds many companies (a demo
+ * server), the company this browser holds the copy of: only a login of that company carries on with it.
+ */
+export function signInSubtitle(s: { signedOutByUser: boolean; company?: string }): string {
+  const base = s.signedOutByUser
     ? 'You signed out. This browser keeps an offline copy; changes you make wait here until you sign in again.'
     : 'Your session on the server ended. Keep working: this browser keeps an offline copy and holds your changes until you sign in.'
+  const company = s.company?.trim()
+  return company ? `${base} Sign in with a login of ${company}.` : base
 }
 
 export function holdSentence(hold: HoldReason): string {

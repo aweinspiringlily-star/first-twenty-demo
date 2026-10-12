@@ -18,10 +18,15 @@
 //   lockout is never dropped to make room for others; when every address key holds one, the oldest
 //   address lockout is forgotten, so cheap sign-ins from many addresses cannot lock everyone out.
 // - Password checks (scrypt, 32 MiB each) run at most two at a time; a long queue is refused.
+// - Every login belongs to one workspace (users.workspace_id, migration 004). A session resolves to its
+//   login's workspace, and that is the only place any route takes a workspace from.
+// - Account creation (demo sign-ups and accepted invites) has a limit of its own, per client address and
+//   for the whole server, in sliding windows of an hour (AddressRateLimiter).
 import { createHash, randomBytes, scrypt as scryptCb, type ScryptOptions, timingSafeEqual } from 'node:crypto'
 import { isIPv4, isIPv6 } from 'node:net'
 import type { Config } from './config'
 import type { Db, Queryable } from './db'
+import { WORKSPACE_ID } from './sqlgen'
 
 /** The session cookie over plain http (development, the SSH tunnel): host-only, sent to /api only. */
 export const SESSION_COOKIE = 'ft_session'
@@ -124,7 +129,19 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex')
 }
 
+/** A login as the API shows it ({user} in every answer). */
 export type SessionUser = { id: string; email: string; role: string }
+/**
+ * A login as the server uses it: the API's fields plus the one workspace it belongs to (never sent in
+ * {user}). keep: whether that workspace is kept (findSession says; absent elsewhere), so the routes know a
+ * demo company's login, which the demo write limits apply to.
+ */
+export type AuthUser = SessionUser & { workspaceId: string; keep?: boolean }
+
+/** The {user} the API answers with: the workspace id stays out of every answer that names a user. */
+export function publicUser(user: SessionUser): SessionUser {
+  return { id: user.id, email: user.email, role: user.role }
+}
 
 export type SessionMeta = { ip?: string; userAgent?: string }
 
@@ -162,17 +179,28 @@ export async function createSession(
 
 const REFRESH_MS = 60_000
 
-/** The signed-in user for a cookie token, or null when it is unknown, idle too long or past its expiry. */
+/**
+ * The signed-in user for a cookie token, with the workspace its login belongs to, or null when it is
+ * unknown, idle too long or past its expiry.
+ */
 export async function findSession(
   db: Queryable,
   token: string | undefined,
   config: Pick<Config, 'sessionIdleHours'>,
-): Promise<SessionUser | null> {
+): Promise<AuthUser | null> {
   if (!token || token.length > 200) return null
   const hash = hashToken(token)
-  const r = await db.query<{ user_id: string; email: string; role: string; last_seen_at: Date | string; expires_at: Date | string }>(
-    `SELECT s.user_id, s.last_seen_at, s.expires_at, u.email, u.role
-       FROM sessions s JOIN users u ON u.id = s.user_id
+  const r = await db.query<{
+    user_id: string
+    email: string
+    role: string
+    workspace_id: string
+    keep: boolean
+    last_seen_at: Date | string
+    expires_at: Date | string
+  }>(
+    `SELECT s.user_id, s.last_seen_at, s.expires_at, u.email, u.role, u.workspace_id, w.keep
+       FROM sessions s JOIN users u ON u.id = s.user_id JOIN workspaces w ON w.id = u.workspace_id
       WHERE s.token_hash = $1`,
     [hash],
   )
@@ -188,7 +216,7 @@ export async function findSession(
   if (now - lastSeen > REFRESH_MS) {
     await db.query('UPDATE sessions SET last_seen_at = now() WHERE token_hash = $1', [hash])
   }
-  return { id: row.user_id, email: row.email, role: row.role }
+  return { id: row.user_id, email: row.email, role: row.role, workspaceId: row.workspace_id, keep: row.keep === true }
 }
 
 export async function deleteSession(db: Queryable, token: string | undefined): Promise<void> {
@@ -198,6 +226,16 @@ export async function deleteSession(db: Queryable, token: string | undefined): P
 
 /** The shape of every token this server makes: 32 random bytes in base64url. Anything else is not looked up. */
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
+
+/** True for a string shaped like a token this server makes (sessions, devices, invites); only those are looked up. */
+export function isTokenShape(value: unknown): value is string {
+  return typeof value === 'string' && TOKEN_RE.test(value)
+}
+
+/** A new random token (32 bytes, base64url) for a cookie or a link. Only its hashToken() is ever stored. */
+export function newToken(): string {
+  return randomBytes(32).toString('base64url')
+}
 
 /**
  * The hash of a trusted-device token when it belongs to the login `email` (from loginEmail) and has not
@@ -251,9 +289,9 @@ export async function purgeSessions(db: Queryable, config: Pick<Config, 'session
  * The email is normalized again here, which leaves a loginEmail() string unchanged, so the login route
  * looks up the very string it rate-limited.
  */
-export async function checkCredentials(db: Queryable, email: string, password: string): Promise<SessionUser | null> {
-  const r = await db.query<{ id: string; email: string; role: string; password_hash: string }>(
-    'SELECT id, email, role, password_hash FROM users WHERE email = $1',
+export async function checkCredentials(db: Queryable, email: string, password: string): Promise<AuthUser | null> {
+  const r = await db.query<{ id: string; email: string; role: string; workspace_id: string; password_hash: string }>(
+    'SELECT id, email, role, workspace_id, password_hash FROM users WHERE email = $1',
     [normalizeEmail(email)],
   )
   const user = r.rows[0]
@@ -262,7 +300,7 @@ export async function checkCredentials(db: Queryable, email: string, password: s
     return null
   }
   if (!(await verifyPassword(password, user.password_hash))) return null
-  return { id: user.id, email: user.email, role: user.role }
+  return { id: user.id, email: user.email, role: user.role, workspaceId: user.workspace_id }
 }
 
 export function passwordProblem(password: string): string | null {
@@ -274,27 +312,35 @@ export function passwordProblem(password: string): string | null {
 export type UpsertAdminResult = { id: string; email: string; created: boolean; previousEmail: string | null }
 
 /**
- * Creates the single admin, or updates it (email and password) when one exists. Existing sessions of
- * that admin are signed out and its trusted devices forgotten. The id is kept, so updated_by
- * references stay valid.
+ * Creates the admin of a workspace (the server's own, WORKSPACE_ID, by default), or updates it (email and
+ * password) when one exists. Existing sessions of that admin are signed out and its trusted devices
+ * forgotten. The id is kept, so updated_by references stay valid. Only this workspace's logins count:
+ * the admins of demo companies on the same server are never touched, and an email that already signs in
+ * to another company is refused (one login belongs to one company).
  */
-export async function upsertAdmin(db: Db, rawEmail: string, password: string): Promise<UpsertAdminResult> {
+export async function upsertAdmin(db: Db, rawEmail: string, password: string, workspaceId = WORKSPACE_ID): Promise<UpsertAdminResult> {
   const email = normalizeEmail(rawEmail)
   if (!isValidEmail(email)) throw new Error('Enter a valid email address, like you@company.com.')
   const problem = passwordProblem(password)
   if (problem) throw new Error(problem)
   const hash = await hashPassword(password)
   return db.tx(async (q) => {
-    const admins = await q.query<{ id: string; email: string }>(`SELECT id, email FROM users WHERE role = 'admin' ORDER BY created_at FOR UPDATE`)
+    const admins = await q.query<{ id: string; email: string }>(
+      `SELECT id, email FROM users WHERE role = 'admin' AND workspace_id = $1 ORDER BY created_at FOR UPDATE`,
+      [workspaceId],
+    )
     const target = admins.rows.find((a) => a.email === email) ?? admins.rows[0]
     if (!target) {
-      // A non-admin user could hold this email once team logins exist; promote it instead of failing.
+      // A non-admin login of this workspace may hold this email; promote it instead of failing. A login
+      // of another workspace is left alone: the WHERE leaves that conflict unresolved, so no row returns.
       const r = await q.query<{ id: string }>(
-        `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin')
+        `INSERT INTO users (email, password_hash, role, workspace_id) VALUES ($1, $2, 'admin', $3)
          ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'admin'
+           WHERE users.workspace_id = EXCLUDED.workspace_id
          RETURNING id`,
-        [email, hash],
+        [email, hash, workspaceId],
       )
+      if (r.rows.length === 0) throw new Error(`Another company on this server already has a login with ${email}. Choose another email.`)
       await q.query('DELETE FROM sessions WHERE user_id = $1', [r.rows[0].id])
       await q.query('DELETE FROM trusted_devices WHERE user_id = $1', [r.rows[0].id])
       return { id: r.rows[0].id, email, created: true, previousEmail: null }
@@ -636,6 +682,97 @@ export class LoginRateLimiter {
 
   get size(): number {
     return this.byAddress.size + this.byEmailAddress.size + this.byEmail.size + this.byDevice.size
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Public routes that are not sign-ins (demo sign-ups, invites)
+// ---------------------------------------------------------------------------------------------
+
+export type AddressLimits = {
+  windowMs: number
+  /** Requests per client address (a clientAddressKey: IPv6 per /64). */
+  perAddress: number
+  /** Requests from all addresses together (Infinity: no such limit). */
+  global: number
+  /** Most address keys kept in memory. */
+  maxKeys: number
+}
+
+/**
+ * Demo sign-ups (POST /api/auth/signup): 5 tries per address and 60 companies created in all, per hour.
+ * Only sign-ups that create a company stay in the server-wide count (see AddressRateLimiter.failed), so
+ * tries that create nothing cannot use it up for everyone.
+ */
+export const ACCOUNT_LIMITS: AddressLimits = { windowMs: 3_600_000, perAddress: 5, global: 60, maxKeys: 50_000 }
+/**
+ * Joining with an invite (POST /api/auth/accept-invite) once its token checked out: 5 per address per
+ * hour, and no server-wide count, which strangers could use up: a company's logins are capped anyway
+ * (workspaces.ts MAX_LOGINS_PER_WORKSPACE), and only a working token gets this far.
+ */
+export const INVITE_ACCEPT_LIMITS: AddressLimits = { windowMs: 3_600_000, perAddress: 5, global: Number.POSITIVE_INFINITY, maxKeys: 50_000 }
+/**
+ * Invite token checks (looking an invite up, and the token check that comes first when joining with one):
+ * 30 per address per 15 minutes. A token is 256 random bits; this only spares the database.
+ */
+export const INVITE_LOOKUP_LIMITS: AddressLimits = { windowMs: 15 * 60_000, perAddress: 30, global: Number.POSITIVE_INFINITY, maxKeys: 50_000 }
+
+/**
+ * A sliding-window limit per client address, with an optional limit for the whole server on top. A
+ * request counts against both when neither is reached, and against neither when one is. Address keys
+ * are cheap to fill (no password check needs to run first), so when every key holds a lockout the oldest
+ * is forgotten instead of refusing new addresses (see LoginRateLimiter). The server-wide limit is the
+ * one that cannot be spread over many addresses: it caps what all of them together can create.
+ */
+export class AddressRateLimiter {
+  readonly limits: AddressLimits
+  private readonly byAddress: SlidingWindowCounter
+  private readonly all: SlidingWindowCounter | null
+  private readonly now: () => number
+
+  constructor(limits: AddressLimits, options: { now?: () => number } = {}) {
+    this.limits = limits
+    this.byAddress = new SlidingWindowCounter(limits.windowMs, limits.maxKeys, limits.perAddress, { forgetLockouts: true })
+    this.all = Number.isFinite(limits.global) ? new SlidingWindowCounter(limits.windowMs, 1, limits.global) : null
+    this.now = options.now ?? Date.now
+  }
+
+  /** Checks both limits for a request from `address` (a clientAddressKey) and counts it when neither is reached. */
+  begin(address: string): RateLimitResult {
+    const now = this.now()
+    const key = `ip:${address}`
+    const retryAfter = Math.max(this.byAddress.retryAfter(key, now), this.all?.retryAfter('all', now) ?? 0)
+    if (retryAfter > 0) return { ok: false, retryAfter }
+    this.byAddress.add(key, now)
+    this.all?.add('all', now)
+    return { ok: true }
+  }
+
+  /** Takes the request back (it was refused as busy before doing anything). */
+  cancelled(address: string): void {
+    this.byAddress.removeLast(`ip:${address}`)
+    this.all?.removeLast('all')
+  }
+
+  /**
+   * The request ran and created nothing (an email that has a login, a full demo server, an error): it
+   * leaves the server-wide count, where only what was created stays, and keeps counting for its address.
+   * begin() counted it in both first, so requests running at the same time cannot all get past the
+   * server-wide limit before any of them is counted.
+   */
+  failed(): void {
+    this.all?.removeLast('all')
+  }
+
+  /** How many requests an address ('ip:…') or the whole server ('all') holds now (tests and diagnostics). */
+  count(key: string): number {
+    return key === 'all' ? (this.all?.count('all', this.now()) ?? 0) : this.byAddress.count(key, this.now())
+  }
+
+  /** Drops keys with no recent requests; buildApp runs it on a timer. */
+  sweep(now = this.now()): void {
+    this.byAddress.sweep(now)
+    this.all?.sweep(now)
   }
 }
 

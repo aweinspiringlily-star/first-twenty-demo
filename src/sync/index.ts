@@ -12,6 +12,16 @@
 //   connect.inspectServer()          empty, or what the server holds (company name, counts)
 //   connect.uploadLocal({confirmReplace?, includeSample?})   this browser's workspace -> server
 //   connect.useServerCopy({discardPending?})                 server's workspace -> this browser
+//   connect.signUp({email, password, companyName, remember?})   a demo server (signupMode 'open'): a new
+//                                    login and company, signed in; then connect.uploadNew(db) puts the new
+//                                    company's workspace there and starts syncing
+//   connect.acceptInvite({token, email, password, remember?})   a new login in an invite's company, signed
+//                                    in; then connect.useServerCopy() takes its workspace
+//   demoSignup()                     may anyone create a demo company here? (once per page load)
+//   inviteInfo(token), createInvite() the company an invite joins; a new invite link (admins)
+//   listInvites(), revokeInvite(id)  the company's open invite links, and revoking one (admins)
+//   setCareers(enabled)              turns the company's careers page on or off (admins)
+//   useServerAccount(ask)            the signed-in login's company on the server (name, careers page)
 //   replaceWorkspace(db, label)      Import and Start fresh: use this instead of useDB.replace, so a
 //                                    connected browser replaces the server's workspace as a whole
 //   signOut()                        sends queued changes (a few seconds at most), then ends the session;
@@ -32,18 +42,26 @@
 //   takeReloadNotice()               a notice the page before a reload left (Sign out and remove data), once
 // Other tabs: removing this browser's data or disconnecting in one tab stops the engine in the others
 // (storage events plus a BroadcastChannel), so no tab writes the workspace or the connection back.
+import { useEffect } from 'react'
+import { useStore } from 'zustand'
 import type { DB } from '@/domain/types'
 import { getClockOverride } from '@/lib/dates'
 import { applyLoadChanges, loadSample, migrate, stopPersisting, STORAGE_KEY, useDB } from '@/store/db'
-import { createApi, type LoginOptions } from './api'
-import { createSyncEngine, type FlowResult, type SignOutOptions, type SyncEngine, type UploadOptions } from './engine'
-import { SERVED_MARKER } from './protocol'
+import { type AccountLoader, createAccountLoader, type ServerAccount } from './account'
+import { type AcceptInviteInput, type ApiFailure, createApi, describeFailure, type LoginOptions, type SignupInput, type SyncApi } from './api'
+import { type DemoSignup, demoSignupOf, inviteFailureText, isInviteToken } from './demo'
+import { createSyncEngine, type FlowFailure, type FlowResult, type SignOutOptions, type SyncEngine, type UploadOptions } from './engine'
+import { type CareersSwitchResponse, type InviteInfo, type InviteResponse, type OpenInvite, SERVED_MARKER } from './protocol'
 import { defaultStorage, LOGOUT_PENDING_KEY, loadConnection, readLogoutPending, type StorageLike, SYNC_STORAGE_KEY } from './state'
-import type { RecordRef } from './status'
+import { type RecordRef, useSyncStatus } from './status'
 
-export type { ApiErrorKind, ApiFailure, ApiResult, LoginOptions, SyncApi } from './api'
+export type { ServerAccount } from './account'
+export type { AcceptInviteInput, ApiErrorKind, ApiFailure, ApiResult, LoginOptions, SignupInput, SyncApi } from './api'
 export { describeFailure } from './api'
+export type { DemoSignup } from './demo'
+export { companyNameProblem, demoNotice, newPasswordProblem, signupEmailProblem } from './demo'
 export type {
+  AccountResult,
   CheckServerResult,
   DisconnectResult,
   FlowFailure,
@@ -57,6 +75,7 @@ export type {
 } from './engine'
 export {
   CLOCK_MESSAGE,
+  CONNECTED_ACCOUNT_MESSAGE,
   DISCONNECTED_MESSAGE,
   DISCONNECTED_PENDING_MESSAGE,
   FORGOTTEN_MESSAGE,
@@ -70,7 +89,8 @@ export {
   SWITCHED_MESSAGE,
   JOINED_MESSAGE,
 } from './engine'
-export type { SyncUser } from './protocol'
+export type { InviteInfo, InviteResponse, OpenInvite, ServerWorkspace, SignupMode, SyncUser } from './protocol'
+export { INVITE_ROUTE, MAX_COMPANY_NAME_LENGTH, MIN_PASSWORD_LENGTH } from './protocol'
 export type { HoldReason, SyncMode } from './state'
 export type { RecordRef, RefreshedRef, RejectedRef, ReplacedRemotely, RestoredRemotely, SyncStatus, SyncStatusState } from './status'
 export { useSyncStatus, waitingCount } from './status'
@@ -93,6 +113,13 @@ export function isServedPage(): boolean {
 }
 
 let engine: SyncEngine | null = null
+let sharedApi: SyncApi | null = null
+
+/** The one API client of this page, shared by the engine and the account and invite calls below. */
+function getApi(): SyncApi {
+  sharedApi ??= createApi()
+  return sharedApi
+}
 
 /** The workspace as db.ts last saved it (before this load's effective-dated changes), or null. */
 export function readSavedDB(storage: StorageLike | null): DB | null {
@@ -266,7 +293,7 @@ export function getSyncEngine(): SyncEngine {
   const storage = defaultStorage()
   engine = createSyncEngine({
     store: useDB,
-    api: createApi(),
+    api: getApi(),
     storage,
     prepareSnapshot: migrate,
     // db.ts applies effective-dated changes before the engine starts and saves them only with the next
@@ -325,6 +352,116 @@ export const connect = {
   inspectServer: () => getSyncEngine().inspectServer(),
   uploadLocal: (opts?: UploadOptions) => getSyncEngine().uploadLocal(opts),
   useServerCopy: (opts?: { discardPending?: boolean }) => getSyncEngine().useServerCopy(opts),
+  signUp: (input: SignupInput) => getSyncEngine().signUp(input),
+  acceptInvite: (input: AcceptInviteInput) => getSyncEngine().acceptInvite(input),
+  uploadNew: (db: DB) => getSyncEngine().uploadNew(db),
+}
+
+// ---------------------------------------------------------------------------------------------
+// The signed-in login's company, and invites (a server that holds companies: docs/SERVER.md)
+// ---------------------------------------------------------------------------------------------
+
+let accountLoader: AccountLoader | null = null
+
+function getAccountLoader(): AccountLoader {
+  accountLoader ??= createAccountLoader(getApi(), useSyncStatus)
+  return accountLoader
+}
+
+/**
+ * Asks the server about the signed-in login's company again (after a sign-up or joining with an invite,
+ * whose answers do not carry the careers page address).
+ */
+export function refreshServerAccount(): Promise<ServerAccount | null> {
+  return getAccountLoader().load({ force: true })
+}
+
+/**
+ * The signed-in login's company on the server: its name and slug, its careers page, the login's role.
+ * ask: ask the server now if this sign-in has not been asked about yet (one GET /api/auth/me per sign-in
+ * and page). null while nobody is signed in, before the answer, on a server that cannot say, or once the
+ * sync status's user changed.
+ */
+export function useServerAccount(ask: boolean): ServerAccount | null {
+  const loader = getAccountLoader()
+  const account = useStore(loader.store, (s) => s.account)
+  const userId = useSyncStatus((s) => s.user?.id ?? null)
+  useEffect(() => {
+    if (ask && userId) void loader.load()
+  }, [ask, userId, loader])
+  return account && account.userId === userId ? account : null
+}
+
+let demoAsked: Promise<DemoSignup | null> | null = null
+
+/**
+ * Whether anyone may create a demo company on the server at this page's origin (GET
+ * /api/auth/signup-mode), asked once per page load; an answer that did not come is asked again next time.
+ * null: no (a server that holds one company, or one from before demo sign-ups), or it could not say.
+ * Only for a page where a server can live (Settings, Server and the sample banner check that first).
+ */
+export function demoSignup(): Promise<DemoSignup | null> {
+  demoAsked ??= getApi()
+    .signupMode()
+    .then((r) => {
+      if (!r.ok) {
+        demoAsked = null
+        return null
+      }
+      return demoSignupOf(r.data)
+    })
+  return demoAsked
+}
+
+/** A FlowFailure for an invite call, worded for its step. */
+function inviteFailure(f: Pick<ApiFailure, 'kind' | 'status' | 'error' | 'retryAfter'>, step: 'look' | 'create'): FlowFailure {
+  const out: FlowFailure = { ok: false, kind: f.kind, status: f.status, message: inviteFailureText(f, step) }
+  if (f.retryAfter !== undefined) out.retryAfter = f.retryAfter
+  return out
+}
+
+/**
+ * The company an invite link joins (public: no sign-in needed). A token that cannot be one is answered
+ * here, without asking the server (kind 'not_found').
+ */
+export async function inviteInfo(token: string): Promise<({ ok: true } & InviteInfo) | FlowFailure> {
+  if (!isInviteToken(token)) return inviteFailure({ kind: 'not_found', status: null, error: null }, 'look')
+  const r = await getApi().inviteInfo(token)
+  return r.ok ? { ok: true, companyName: r.data.companyName } : inviteFailure(r, 'look')
+}
+
+/** A new single-use link that lets someone join the signed-in admin's company (it expires: see expiresAt). */
+export async function createInvite(): Promise<({ ok: true } & InviteResponse) | FlowFailure> {
+  const r = await getApi().createInvite()
+  return r.ok ? { ok: true, ...r.data } : inviteFailure(r, 'create')
+}
+
+/** The signed-in admin's company's open invite links (no tokens: the server keeps only hashes). */
+export async function listInvites(): Promise<{ ok: true; invites: OpenInvite[] } | FlowFailure> {
+  const r = await getApi().listInvites()
+  return r.ok ? { ok: true, invites: r.data } : inviteFailure(r, 'create')
+}
+
+/** Revokes an open invite link of the signed-in admin's company: it never works again. */
+export async function revokeInvite(id: string): Promise<{ ok: true } | FlowFailure> {
+  const r = await getApi().revokeInvite(id)
+  if (r.ok) return { ok: true }
+  if (r.kind === 'not_found') return { ok: false, kind: 'not_found', status: r.status, message: 'That link was used, revoked or expired already.' }
+  return inviteFailure(r, 'create')
+}
+
+/**
+ * Turns the signed-in admin's company's careers page on or off, then asks the server about the company
+ * again, so every screen shows the new state.
+ */
+export async function setCareers(enabled: boolean): Promise<({ ok: true } & CareersSwitchResponse) | FlowFailure> {
+  const r = await getApi().setCareers(enabled)
+  if (!r.ok) {
+    const message = r.kind === 'forbidden' ? 'Only an admin of this company can turn its careers page on or off.' : describeFailure(r)
+    return { ok: false, kind: r.kind, status: r.status, message }
+  }
+  await getAccountLoader().load({ force: true })
+  return { ok: true, ...r.data }
 }
 
 /**

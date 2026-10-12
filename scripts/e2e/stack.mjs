@@ -2,8 +2,15 @@
 // its own PGlite database, serving the built app (first-twenty.html) same-origin, the way production
 // does, plus an admin login with a random password made for this run.
 //
-//   node scripts/e2e/stack.mjs start <port> <stateDir>   starts it in the background, waits until healthy
+//   node scripts/e2e/stack.mjs start <port> <stateDir> [--env KEY=VALUE]...
+//                                                        starts it in the background, waits until healthy
 //   node scripts/e2e/stack.mjs stop <stateDir>           stops it
+//
+// --env (optional, repeatable) adds or overrides one server setting for this run, for example a public
+// demo server with careers pages:
+//   node scripts/e2e/stack.mjs start 8901 <stateDir> --env SIGNUP_MODE=open --env CAREERS_HOSTS=careers.localhost
+// It applies to create-admin too. DATABASE_URL and NODE_ENV cannot be changed: the stack always runs on
+// its own throwaway PGlite database in development mode.
 //
 // Build first (npm run build:all). <stateDir> must be outside the repo; it gets the database (pg/), the
 // server log (server.log), the process id (server.pid) and the test login (credentials.json: email,
@@ -35,7 +42,22 @@ function stop(stateDir) {
   rmSync(pidFile, { force: true })
 }
 
-async function start(port, stateDir) {
+/** The settings the stack itself pins: an --env flag may not change them. */
+const PINNED = new Set(['DATABASE_URL', 'NODE_ENV'])
+
+/** --env KEY=VALUE flags as an object, or a usage error. */
+function extraEnv(args) {
+  const out = {}
+  for (let i = 0; i < args.length; i += 2) {
+    const m = args[i] === '--env' && typeof args[i + 1] === 'string' ? /^([A-Z][A-Z0-9_]*)=(.*)$/s.exec(args[i + 1]) : null
+    if (!m) die(`expected --env KEY=VALUE, got "${args.slice(i, i + 2).join(' ')}"`)
+    if (PINNED.has(m[1])) die(`--env cannot set ${m[1]}: the stack always uses its own PGlite database in development mode`)
+    out[m[1]] = m[2]
+  }
+  return out
+}
+
+async function start(port, stateDir, extra = {}) {
   if (!/^\d{4,5}$/.test(port)) die('port must be a number such as 8901')
   if (path.resolve(stateDir).startsWith(root)) die('keep <stateDir> outside the repo')
   for (const f of ['dist-server/server.mjs', 'first-twenty.html']) {
@@ -62,6 +84,8 @@ async function start(port, stateDir) {
     LOG_LEVEL: 'info',
   }
   delete env.ALLOWED_ORIGIN
+  Object.assign(env, extra)
+  if (Object.keys(extra).length > 0) console.log(`stack: extra settings ${Object.keys(extra).join(', ')}`)
 
   // PGlite allows one process at a time, so the admin is made before the server starts.
   const admin = spawnSync(process.execPath, ['server/src/cli/run.mjs', 'create-admin', '--email', credentials.email], {
@@ -90,6 +114,6 @@ async function start(port, stateDir) {
   die(`the server did not become healthy; see ${path.join(stateDir, 'server.log')}`)
 }
 
-if (command === 'start' && rest.length === 2) await start(rest[0], rest[1])
+if (command === 'start' && rest.length >= 2) await start(rest[0], rest[1], extraEnv(rest.slice(2)))
 else if (command === 'stop' && rest.length === 1) stop(rest[0])
-else die('usage: node scripts/e2e/stack.mjs start <port> <stateDir> | stop <stateDir>')
+else die('usage: node scripts/e2e/stack.mjs start <port> <stateDir> [--env KEY=VALUE]... | stop <stateDir>')

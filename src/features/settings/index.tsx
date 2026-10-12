@@ -18,6 +18,8 @@ import { RulesTab } from './RulesTab'
 import { ServerTab } from './ServerTab'
 import { TimeOffPoliciesTab } from './TimeOffPoliciesTab'
 
+export { InvitePage } from './InvitePage'
+
 type TabKey = 'company' | 'org' | 'hiring' | 'templates' | 'timeoff' | 'rules' | 'links' | 'data' | 'server'
 
 const TABS: Array<{ key: TabKey; label: string; title: string; blurb: string; blurbConnected?: string; view: ComponentType }> = [

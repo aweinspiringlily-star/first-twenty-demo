@@ -1,6 +1,7 @@
-# First Twenty: Caddy site for the API server and the app.
+# First Twenty: Caddy site for the API server and the app, and for the companies' careers pages.
 # setup-ec2.sh renders this file to /etc/caddy/Caddyfile, replacing hr.example.com with your domain in
-# both site blocks (and turning on the tls email line when you pass --email). To edit by hand:
+# both site blocks, writing the careers site at the end once per --careers-domain (or not at all), and
+# turning on the tls email lines when you pass --email. To edit by hand:
 #   sudo nano /etc/caddy/Caddyfile
 #   sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 #   sudo systemctl reload caddy
@@ -61,7 +62,56 @@ hr.example.com {
 		header_up -X-Real-IP
 	}
 
-	# Access log without bodies; Caddy redacts Cookie and Set-Cookie headers by default.
+	# Access log without bodies; Caddy redacts Cookie and Set-Cookie headers by default. An invite token
+	# is a key to a company until it is used, so it never reaches the log: the app sends it in a request
+	# body, and the path form older apps use (GET /api/invites/<token>) is logged with the token cut out,
+	# as the server's own log does (redactPath in server/src/app.ts).
+	log {
+		output file /var/log/caddy/first-twenty-access.log {
+			roll_size 20MiB
+			roll_keep 10
+		}
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "(?i)/invites/[^/?#]+" "/invites/[redacted]"
+			}
+		}
+	}
+}
+
+# Careers pages (CAREERS_HOSTS in /etc/first-twenty/env; docs/SERVER.md, "Careers pages"). setup-ec2.sh
+# writes the template between the BEGIN and END lines once per --careers-domain, with careers.example.com
+# replaced, and leaves it out when there is none. Each careers host proxies to the same server, which
+# answers only careers pages there. Its HSTS covers that host alone (no includeSubDomains, here or on the
+# app's site), and it never carries a cookie: the app's cookies are __Host- cookies of the app's host, and
+# this site drops any Set-Cookie on the way out.
+# BEGIN careers site
+http://careers.example.com {
+	redir https://{host}{uri} permanent
+}
+
+careers.example.com {
+	# tls you@example.com
+
+	encode zstd gzip
+
+	# An application is a few KB (the server takes 32 KB at most); nothing here needs more.
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		defer
+	}
+	header -Server
+	header -Set-Cookie
+
+	reverse_proxy 127.0.0.1:8787 {
+		header_up -X-Real-IP
+	}
+
 	log {
 		output file /var/log/caddy/first-twenty-access.log {
 			roll_size 20MiB
@@ -70,3 +120,4 @@ hr.example.com {
 		format json
 	}
 }
+# END careers site

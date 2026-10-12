@@ -10,7 +10,8 @@
 #   - creates the firsttwenty system user that runs the server
 #   - puts the code in /opt/first-twenty (copied from wherever you unpacked or cloned it)
 #   - creates /etc/first-twenty/env from .env.example if it is missing (mode 600, root:firsttwenty)
-#   - installs the systemd unit, the Caddyfile for your domain and the nightly backup timer
+#   - installs the systemd unit, the Caddyfile for your domain (and a site per careers domain) and the
+#     nightly backup timer
 #   - enables the services, starts what can start, and prints the next steps
 #
 # What it does not do: install, upgrade or reconfigure Postgres if Postgres already exists on this
@@ -19,9 +20,15 @@
 # Usage (from the folder you cloned or unpacked):
 #   sudo bash server/deploy/setup-ec2.sh hr.example.com
 #   sudo bash server/deploy/setup-ec2.sh --domain hr.example.com --email you@example.com
+#   sudo bash server/deploy/setup-ec2.sh hr.example.com --careers-domain careers.example.com
 #
 # Options:
 #   --domain NAME        the domain people will open (its DNS A record points at this instance)
+#   --careers-domain NAME
+#                        a host name for the companies' careers pages (its DNS A record points at this
+#                        instance too); repeat it for more. Each gets a Caddy site of its own, and a new
+#                        settings file gets CAREERS_HOSTS. Without it, a re-run keeps the careers hosts
+#                        that CAREERS_HOSTS in the settings file names (docs/SERVER.md, "Careers pages")
 #   --email ADDRESS      optional contact email for certificate expiry notices
 #   --deploy-user NAME   the login that owns the code and runs deploy.sh (default: the user who ran sudo,
 #                        else ec2-user or ubuntu)
@@ -65,6 +72,10 @@ NO_SWAP=false
 ENABLE_BACKUPS=true
 # The command that sets PUBLIC_ORIGIN, when a settings file setup kept does not have https://$DOMAIN.
 ORIGIN_FIX=""
+# Careers host names (--careers-domain), space-separated, and the command that sets CAREERS_HOSTS when a
+# settings file setup kept names other ones.
+CAREERS_DOMAINS=""
+CAREERS_FIX=""
 UNATTENDED_CONF=/etc/apt/apt.conf.d/51first-twenty
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -80,10 +91,37 @@ need_value() {
   [ -n "${2:-}" ] && [ "${2#-}" = "$2" ] || die "$1 needs a value. Run with --help for usage."
 }
 
+normalize_domain() {
+  # Prints $1 as a host name: lowercase, without a leading https:// or http:// or a trailing slash.
+  local d
+  d=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  d=${d#https://}
+  d=${d#http://}
+  printf '%s' "${d%/}"
+}
+
+is_domain() {
+  # True when $1 is a host name Caddy can get a certificate for: dot-separated labels, a top-level domain.
+  printf '%s' "$1" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+}
+
+add_careers_domain() {
+  # Adds host name $1 (normalized) to CAREERS_DOMAINS once, or stops when it is not a host name.
+  local d
+  d=$(normalize_domain "$1")
+  is_domain "$d" || die "\"$1\" does not look like a host name for --careers-domain (expected something like careers.example.com)."
+  case " $CAREERS_DOMAINS " in
+    *" $d "*) ;;
+    *) CAREERS_DOMAINS="${CAREERS_DOMAINS:+$CAREERS_DOMAINS }$d" ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) need_value "$1" "${2:-}"; DOMAIN=$2; shift 2 ;;
     --domain=*) DOMAIN=${1#*=}; shift ;;
+    --careers-domain) need_value "$1" "${2:-}"; add_careers_domain "$2"; shift 2 ;;
+    --careers-domain=*) add_careers_domain "${1#*=}"; shift ;;
     --email) need_value "$1" "${2:-}"; ACME_EMAIL=$2; shift 2 ;;
     --email=*) ACME_EMAIL=${1#*=}; shift ;;
     --deploy-user) need_value "$1" "${2:-}"; DEPLOY_USER=$2; shift 2 ;;
@@ -110,13 +148,14 @@ done
 [ "$(id -u)" -eq 0 ] || die "Run this with sudo: sudo bash $0 your-domain.com"
 
 [ -n "$DOMAIN" ] || die "Pass your domain, for example: sudo bash $0 hr.example.com"
-DOMAIN=$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')
-DOMAIN=${DOMAIN#https://}
-DOMAIN=${DOMAIN#http://}
-DOMAIN=${DOMAIN%/}
-if ! printf '%s' "$DOMAIN" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+DOMAIN=$(normalize_domain "$DOMAIN")
+if ! is_domain "$DOMAIN"; then
   die "\"$DOMAIN\" does not look like a domain name (expected something like hr.example.com)."
 fi
+# The server answers only careers pages on a careers host, so the app's own domain can never be one.
+for d in $CAREERS_DOMAINS; do
+  [ "$d" != "$DOMAIN" ] || die "--careers-domain $d is the app's own domain. Careers pages need a host name of their own, like careers.example.com."
+done
 if [ -n "$ACME_EMAIL" ] && ! printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
   die "\"$ACME_EMAIL\" does not look like an email address."
 fi
@@ -234,6 +273,44 @@ public_origin_fix() {
   fi
 }
 
+careers_from_settings() {
+  # The host names in CAREERS_HOSTS of settings file $1, lowercase and space-separated, or nothing.
+  env_setting CAREERS_HOSTS "$1" | tr ',' ' ' | tr '[:upper:]' '[:lower:]' | awk '{ $1 = $1; print }'
+}
+
+host_set() {
+  # $1 (host names separated by commas or spaces) as one sorted, de-duplicated line, for comparing lists.
+  printf '%s\n' "$1" | tr ', ' '\n\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+}
+
+set_careers_hosts() {
+  # Sets CAREERS_HOSTS in settings file $1 (one setup just made from .env.example, where the line is
+  # commented out) to the careers domains, separated by commas: turns that line on, or adds one.
+  local list
+  list=$(printf '%s' "$CAREERS_DOMAINS" | tr ' ' ',')
+  if grep -Eq '^#?[[:space:]]*CAREERS_HOSTS=' "$1"; then
+    sed -i -E "s|^#?[[:space:]]*CAREERS_HOSTS=.*|CAREERS_HOSTS=${list}|" "$1"
+  else
+    echo "CAREERS_HOSTS=${list}" >>"$1"
+  fi
+}
+
+careers_hosts_fix() {
+  # The commands that make CAREERS_HOSTS in settings file $1 name the careers domains and apply it, or
+  # nothing when it already does (in any order or case) or there are none. Setup never rewrites a
+  # settings file it kept.
+  local want
+  [ -n "$CAREERS_DOMAINS" ] || return 0
+  want=$(printf '%s' "$CAREERS_DOMAINS" | tr ' ' ',')
+  [ "$(host_set "$(careers_from_settings "$1")")" != "$(host_set "$CAREERS_DOMAINS")" ] || return 0
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?CAREERS_HOSTS[[:space:]]*=' "$1"; then
+    printf "sudo sed -i -E 's#^[[:space:]]*(export[[:space:]]+)?CAREERS_HOSTS[[:space:]]*=.*#CAREERS_HOSTS=%s#' %s && sudo systemctl restart %s" \
+      "$want" "$1" "$SERVICE"
+  else
+    printf "echo 'CAREERS_HOSTS=%s' | sudo tee -a %s >/dev/null && sudo systemctl restart %s" "$want" "$1" "$SERVICE"
+  fi
+}
+
 local_server_major() {
   # The major version of the Postgres running on this instance (for example 16), or nothing.
   local num=""
@@ -259,6 +336,25 @@ node_major_at() {
     echo 0
   fi
 }
+
+# ------------------------------------------------------------------------------------------------
+# Careers hosts: --careers-domain, else the ones a settings file from an earlier run names
+# ------------------------------------------------------------------------------------------------
+
+# Re-running setup rewrites the Caddyfile, so a re-run without --careers-domain keeps the careers sites
+# that CAREERS_HOSTS asks for instead of dropping them.
+if [ -z "$CAREERS_DOMAINS" ] && [ -f "$ENV_FILE" ]; then
+  for d in $(careers_from_settings "$ENV_FILE"); do
+    if is_domain "$d" && [ "$d" != "$DOMAIN" ]; then
+      add_careers_domain "$d"
+    else
+      warn "Skipped \"$d\" in CAREERS_HOSTS of $ENV_FILE: it is not a host name setup can make a careers site for."
+    fi
+  done
+  [ -z "$CAREERS_DOMAINS" ] || info "Careers:     $CAREERS_DOMAINS (from CAREERS_HOSTS in $ENV_FILE)"
+elif [ -n "$CAREERS_DOMAINS" ]; then
+  info "Careers:     $CAREERS_DOMAINS"
+fi
 
 # ------------------------------------------------------------------------------------------------
 # 1. Base packages
@@ -723,11 +819,21 @@ if [ -f "$ENV_FILE" ]; then
     warn "Until it is, only requests that arrive through Caddy over https get Secure cookies and HSTS. Set it with:"
     warn "  $ORIGIN_FIX"
   fi
+  CAREERS_FIX=$(careers_hosts_fix "$ENV_FILE")
+  if [ -n "$CAREERS_FIX" ]; then
+    warn "CAREERS_HOSTS in $ENV_FILE does not name $CAREERS_DOMAINS, and setup does not change a settings file it kept."
+    warn "Until it does, the server answers 404 on the careers sites Caddy now has. Set it with:"
+    warn "  $CAREERS_FIX"
+  fi
 else
   [ -f "$EXAMPLE" ] || die "Cannot find .env.example to start $ENV_FILE from."
   install -m 0600 -o root -g "$APP_USER" "$EXAMPLE" "$ENV_FILE"
   sed -i -E "s#^PUBLIC_ORIGIN=.*#PUBLIC_ORIGIN=https://${DOMAIN}#" "$ENV_FILE"
   info "Created from .env.example with PUBLIC_ORIGIN=https://$DOMAIN."
+  if [ -n "$CAREERS_DOMAINS" ]; then
+    set_careers_hosts "$ENV_FILE"
+    info "Set CAREERS_HOSTS=$(printf '%s' "$CAREERS_DOMAINS" | tr ' ' ',')."
+  fi
 fi
 chown root:"$APP_USER" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
@@ -762,21 +868,28 @@ info "Enabled: it starts on boot."
 # 9. Caddy site
 # ------------------------------------------------------------------------------------------------
 
-step "Configuring Caddy for https://$DOMAIN"
+step "Configuring Caddy for https://$DOMAIN${CAREERS_DOMAINS:+ and careers pages on $CAREERS_DOMAINS}"
 CADDY_SRC=$(deploy_file Caddyfile)
 MARKER="# Managed by First Twenty setup-ec2.sh. Re-running the script rewrites this file."
 CADDYFILE=/etc/caddy/Caddyfile
 NEW=/etc/caddy/.first-twenty.Caddyfile.new
 
 # Prints the Caddyfile for $DOMAIN: the marker line, then server/deploy/Caddyfile ($1) with the domain in
-# both site blocks and the tls line on when --email was given. With "site-only" as $2 it leaves out the
-# global options block (from a line "{" to a line "}"), which Caddy accepts only at the top of the main
-# Caddyfile, never in a file that one imports.
+# both app site blocks, the careers site template (between its BEGIN and END lines) once per name in
+# CAREERS_DOMAINS and never as the template itself, and the tls lines on when --email was given. With
+# "site-only" as $2 it leaves out the global options block (from a line "{" to a line "}"), which Caddy
+# accepts only at the top of the main Caddyfile, never in a file that one imports.
 render_caddyfile() {
+  local careers domain
+  careers=$(sed -n -e '/^# BEGIN careers site$/,/^# END careers site$/p' "$1" | sed -e '/^# BEGIN careers site$/d' -e '/^# END careers site$/d')
   {
     echo "$MARKER"
-    if [ "${2:-}" = site-only ]; then sed -e '/^{$/,/^}$/d' "$1"; else cat "$1"; fi
-  } | sed -e "s/^hr\.example\.com {/${DOMAIN} {/" -e "s/^http:\/\/hr\.example\.com {/http:\/\/${DOMAIN} {/" |
+    if [ "${2:-}" = site-only ]; then sed -e '/^{$/,/^}$/d' "$1"; else cat "$1"; fi |
+      sed -e '/^# BEGIN careers site$/,/^# END careers site$/d' -e "s/^hr\.example\.com {/${DOMAIN} {/" -e "s/^http:\/\/hr\.example\.com {/http:\/\/${DOMAIN} {/"
+    for domain in ${CAREERS_DOMAINS:-}; do
+      printf '%s\n' "$careers" | sed -e "s/^careers\.example\.com {/${domain} {/" -e "s/^http:\/\/careers\.example\.com {/http:\/\/${domain} {/"
+    done
+  } |
     if [ -n "$ACME_EMAIL" ]; then
       sed -e "s|^\([[:space:]]*\)# tls you@example\.com|\1tls ${ACME_EMAIL}|"
     else
@@ -921,14 +1034,17 @@ if [ -n "$TOKEN" ]; then
   PUBLIC_IP=$(curl -fsS -m 2 -H "X-aws-ec2-metadata-token: $TOKEN" \
     http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
 fi
-DNS_IPS=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
 if [ -n "$PUBLIC_IP" ]; then
-  if [ -z "$DNS_IPS" ]; then
-    warn "$DOMAIN does not resolve yet. Point its A record at $PUBLIC_IP; Caddy retries on its own."
-  elif ! printf ' %s ' "$DNS_IPS" | grep -q " $PUBLIC_IP "; then
-    warn "$DOMAIN points at $DNS_IPS but this instance's public IP is $PUBLIC_IP."
-    warn "Caddy cannot get a certificate until the A record points here (use an Elastic IP)."
-  fi
+  # The app's domain and every careers domain need their own certificate, so each must point here.
+  for name in "$DOMAIN" $CAREERS_DOMAINS; do
+    DNS_IPS=$(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
+    if [ -z "$DNS_IPS" ]; then
+      warn "$name does not resolve yet. Point its A record at $PUBLIC_IP; Caddy retries on its own."
+    elif ! printf ' %s ' "$DNS_IPS" | grep -q " $PUBLIC_IP "; then
+      warn "$name points at $DNS_IPS but this instance's public IP is $PUBLIC_IP."
+      warn "Caddy cannot get a certificate until the A record points here (use an Elastic IP)."
+    fi
+  done
 fi
 
 # Prints what is left to do. DB_STATE is what first_twenty_objects found ("t|t|t" when the database and
@@ -986,11 +1102,26 @@ EOF
 
   6. Open https://$DOMAIN, then Settings > Data > Server, sign in and upload your workspace.
 EOF
+  if [ -n "${CAREERS_DOMAINS:-}" ]; then
+    cat <<EOF
+
+  7. Careers pages: each company's is at https://${CAREERS_DOMAINS%% *}/<its slug>/ (Settings > Server shows
+     the link). Check the careers site answers:
+       curl -I https://${CAREERS_DOMAINS%% *}/
+EOF
+  fi
   if [ -n "${ORIGIN_FIX:-}" ]; then
     cat <<EOF
 
   Before step 5: PUBLIC_ORIGIN in $ENV_FILE is not https://$DOMAIN yet. Set it with:
        $ORIGIN_FIX
+EOF
+  fi
+  if [ -n "${CAREERS_FIX:-}" ]; then
+    cat <<EOF
+
+  Before step 5: CAREERS_HOSTS in $ENV_FILE does not name ${CAREERS_DOMAINS:-} yet. Set it with:
+       $CAREERS_FIX
 EOF
   fi
   cat <<EOF

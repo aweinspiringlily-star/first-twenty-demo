@@ -52,11 +52,20 @@ export async function makeTestDb(): Promise<Db> {
   return db
 }
 
-/** Empties every table and recreates the default workspace row. */
+/** Empties every table and recreates the default workspace row (kept, as migration 004 leaves it). */
 export async function resetDb(db: Db): Promise<void> {
-  const tables = ['change_log', 'sessions', 'trusted_devices', 'workspace_docs', ...RECORD_COLLECTIONS.map(tableName), 'users', 'workspaces']
+  const tables = [
+    'change_log',
+    'sessions',
+    'trusted_devices',
+    'invites',
+    'workspace_docs',
+    ...RECORD_COLLECTIONS.map(tableName),
+    'users',
+    'workspaces',
+  ]
   await db.exec(`TRUNCATE ${tables.join(', ')} RESTART IDENTITY CASCADE`)
-  await db.query(`INSERT INTO workspaces (id, name) VALUES ($1, 'Default workspace')`, [WORKSPACE_ID])
+  await db.query(`INSERT INTO workspaces (id, name, slug, keep) VALUES ($1, 'Default workspace', 'default-workspace', true)`, [WORKSPACE_ID])
 }
 
 export async function makeApp(db: Db, overrides: Partial<Config> = {}): Promise<FastifyInstance> {
@@ -81,12 +90,36 @@ export function deviceCookie(res: LightMyRequestResponse): string | null {
   return c && c.value ? c.value : null
 }
 
-/** Signs in as the test admin over plain http; returns the Cookie header value. */
-export async function login(app: FastifyInstance): Promise<string> {
-  const res = await app.inject({ method: 'POST', url: '/api/auth/login', headers: CSRF, payload: { email: ADMIN.email, password: ADMIN.password } })
-  if (res.statusCode !== 200) throw new Error(`login failed: ${res.statusCode} ${res.body}`)
+/** The Cookie header value for the session a response sets. */
+function cookieHeader(res: LightMyRequestResponse): string {
   const token = sessionCookie(res)
   if (!token) throw new Error('no session cookie')
   const name = res.cookies.find((x) => x.value === token)!.name
   return `${name}=${token}`
+}
+
+/** Signs in as the test admin over plain http; returns the Cookie header value. */
+export async function login(app: FastifyInstance): Promise<string> {
+  const res = await app.inject({ method: 'POST', url: '/api/auth/login', headers: CSRF, payload: { email: ADMIN.email, password: ADMIN.password } })
+  if (res.statusCode !== 200) throw new Error(`login failed: ${res.statusCode} ${res.body}`)
+  return cookieHeader(res)
+}
+
+export type SignedUp = { cookie: string; userId: string; workspace: { id: string; name: string; slug: string } }
+
+/**
+ * Signs up a demo company (the app needs SIGNUP_MODE=open: makeApp(db, {signupMode: 'open'})) from its
+ * own client address, so the account limit never gets in the way; returns its Cookie header and company.
+ */
+export async function signUp(app: FastifyInstance, email: string, companyName: string, remoteAddress = `10.9.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}`): Promise<SignedUp> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/signup',
+    headers: CSRF,
+    payload: { email, password: ADMIN.password, companyName },
+    remoteAddress,
+  })
+  if (res.statusCode !== 201) throw new Error(`sign-up failed: ${res.statusCode} ${res.body}`)
+  const body = res.json() as { user: { id: string }; workspace: SignedUp['workspace'] }
+  return { cookie: cookieHeader(res), userId: body.user.id, workspace: body.workspace }
 }

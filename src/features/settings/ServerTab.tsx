@@ -3,6 +3,9 @@
 // what the server is and how to set it up (docs/SERVER.md), with no sign-in form and no network call.
 // Where a server answers it walks through sign-in, then Upload or Use the server's copy, and once
 // connected shows the live sync status (useSyncStatus) with Sync now, Sign out and Disconnect.
+// On a demo server (anyone may sign up) Create a demo company sits next to Sign in
+// (#settings.server.signup puts focus there), and a signed-in login sees its company on the server with
+// invite links and its careers page.
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { replaceRoute, useRoute } from '@/app/router'
@@ -11,6 +14,8 @@ import { useDB } from '@/store/db'
 import {
   clearRefreshed,
   connect,
+  type DemoSignup,
+  demoSignup,
   discardRejected,
   disconnect,
   type RecordRef,
@@ -20,12 +25,15 @@ import {
   type SyncMode,
   syncNow,
   type SyncUser,
+  useServerAccount,
   useSyncStatus,
   waitingCount,
 } from '@/sync'
 import { Badge, Button, Callout, ConfirmButton, DescriptionList, Icon, Panel, toast } from '@/ui'
 import { downloadBackup, StartFreshSheet } from './DataTab'
-import { focusPanelTitle, focusSignInField } from './serverFocus'
+import { signInFootnote } from './demoLogic'
+import { CompanyPanel, SignupPanel } from './demoParts'
+import { focusPanelTitle, focusSignInField, focusSignupField } from './serverFocus'
 import { ButtonLink, Row, RowList } from './kit'
 import {
   agoText,
@@ -92,6 +100,7 @@ function useNow(ms = 15_000): number {
 export function ServerTab() {
   const route = useRoute()
   const wantsFresh = route.segments[2] === 'fresh'
+  const wantsSignup = route.segments[2] === 'signup'
   const host = useMemo(detectHostContext, [])
   const mode = useSyncStatus((s) => s.mode)
   const hold = useSyncStatus((s) => s.hold)
@@ -104,6 +113,12 @@ export function ServerTab() {
   const [notice, setNotice] = useState<string | null>(null)
   // Whether the server holds no workspace yet, from the check (signed in) or the connect step's look.
   const [serverEmpty, setServerEmpty] = useState<boolean | undefined>(undefined)
+  // A demo server: anyone may create a company here (asked with the check, once per page load).
+  const [demo, setDemo] = useState<DemoSignup | null>(null)
+  // A sign-up made its login and is putting the new company on the server: Sign in steps aside.
+  const [creating, setCreating] = useState(false)
+  // The company whose copy this browser holds (named in the demo server's sign-in subtitle).
+  const localCompany = useDB((s) => (typeof s.db.company?.name === 'string' ? s.db.company.name : ''))
 
   const runCheck = useCallback(
     async (focusAfter = false) => {
@@ -111,7 +126,9 @@ export function ServerTab() {
       if (host !== 'web') return
       const ranIn = useSyncStatus.getState().mode
       setCheck({ kind: 'checking', mode: ranIn })
-      const res = await connect.checkServer()
+      // Asked side by side, so a demo server's sign-up shows with the sign-in form, not after it.
+      const [res, demoHere] = await Promise.all([connect.checkServer(), demoSignup()])
+      setDemo(res.ok ? demoHere : null)
       if (res.ok) {
         setCheck({ kind: 'ready', mode: ranIn })
         setSession(res.signedIn ? res.user : null)
@@ -166,10 +183,15 @@ export function ServerTab() {
     const a = arrival.current
     if (!a?.pending || !settled) return
     a.pending = false
-    if (signInShown) focusSignInField()
+    if (signInShown && wantsSignup && demo && mode !== 'server') focusSignupField()
+    else if (signInShown) focusSignInField()
     else if (mode === 'server' && hold) focusPanelTitle('server-hold')
     else if (mode === 'server' && rejected > 0) focusPanelTitle('server-status')
-  }, [settled, signInShown, mode, hold, rejected])
+  }, [settled, signInShown, mode, hold, rejected, wantsSignup, demo])
+
+  // The signed-in login's company on the server (a server that holds companies), once per sign-in.
+  const account = useServerAccount(host === 'web' && (mode === 'server' ? !signInShown : check.kind === 'ready' && !!session && !!statusUser))
+  const companyPanel = account?.workspace ? <CompanyPanel account={account} /> : null
 
   const toSignIn = (text: string | null) => {
     setSession(null)
@@ -194,8 +216,11 @@ export function ServerTab() {
           <SignInPanel
             id="server-signin"
             title="Sign in to keep syncing"
-            // A sign-out the user chose keeps saying so after edits and reloads (status signedOutByUser).
-            subtitle={notice ?? signInSubtitle({ signedOutByUser })}
+            // A sign-out the user chose keeps saying so after edits and reloads (status signedOutByUser). On
+            // a demo server it names the company whose login carries on with this browser's copy.
+            subtitle={notice ?? signInSubtitle({ signedOutByUser, ...(demo ? { company: localCompany } : {}) })}
+            // Demo logins come from a sign-up or an invite, not from whoever set the server up.
+            footnote={signInFootnote(!!demo) ?? undefined}
             // After a deliberate sign-out the engine forgets the user; SignInPanel falls back to the remembered email.
             defaultEmail={email ?? undefined}
             onSignedIn={(user) => {
@@ -216,6 +241,7 @@ export function ServerTab() {
           />
         )}
         <StatusPanel email={showSignIn ? null : email} />
+        {!showSignIn && companyPanel}
         <AccountPanel
           signedOut={showSignIn}
           onSignedOut={(message) => {
@@ -264,28 +290,56 @@ export function ServerTab() {
   } else if (!session || !statusUser) {
     // statusUser drops to null the moment the engine ends the session (Disconnect, Sign out), before
     // this component hears back, so the connect step never flashes up (and never inspects) signed out.
-    content = (
+    const signInPanel = (
       <SignInPanel
         id="server-signin"
         title="Sign in to your server"
-        subtitle={notice ?? `A First Twenty server answers at ${serverAddress(pageOrigin())}. Sign in with its admin login to choose what syncs.`}
+        subtitle={
+          notice ??
+          (demo
+            ? `A First Twenty demo server answers at ${serverAddress(pageOrigin())}. Sign in to the company you created or joined here.`
+            : `A First Twenty server answers at ${serverAddress(pageOrigin())}. Sign in with its admin login to choose what syncs.`)
+        }
+        footnote={signInFootnote(!!demo) ?? undefined}
         onSignedIn={(user) => {
           signedIn(user)
           focusPanelTitle('server-connect')
         }}
       />
     )
+    content = demo ? (
+      <div className="grid items-start gap-5 xl:grid-cols-2">
+        {!creating && signInPanel}
+        <SignupPanel
+          id="server-signup"
+          demo={demo}
+          onAccount={() => setCreating(true)}
+          onCreated={(name, user) => {
+            setCreating(false)
+            signedIn(user)
+            toast({ text: `Created ${name} on this demo server. Every change now syncs.` })
+            if (wantsSignup) replaceRoute('settings', 'server')
+            focusPanelTitle('server-status')
+          }}
+        />
+      </div>
+    ) : (
+      signInPanel
+    )
   } else {
     content = (
-      <ConnectPanel
-        email={session.email}
-        onConnected={(how) => {
-          connectedToast(how)
-          focusPanelTitle('server-status')
-        }}
-        onSignedOut={() => toSignIn('Signed out. Sign in again to choose what syncs.')}
-        onInspected={setServerEmpty}
-      />
+      <>
+        <ConnectPanel
+          email={session.email}
+          onConnected={(how) => {
+            connectedToast(how)
+            focusPanelTitle('server-status')
+          }}
+          onSignedOut={() => toSignIn('Signed out. Sign in again to choose what syncs.')}
+          onInspected={setServerEmpty}
+        />
+        {companyPanel}
+      </>
     )
   }
 

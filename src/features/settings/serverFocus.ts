@@ -52,6 +52,14 @@ export function focusSignInField(panelId = 'server-signin'): void {
   })
 }
 
+/**
+ * The demo sign-up form's first field (the company name), for someone who came to create a demo company
+ * (#settings.server.signup, from the sample banner).
+ */
+export function focusSignupField(panelId = 'server-signup'): void {
+  focusWhenReady(() => document.querySelector<HTMLInputElement>(`#${panelId} form input:not([type="checkbox"])`))
+}
+
 /** Where the next step on Settings, Server starts: the sign-in form, else the first step panel that shows. */
 export type ServerStep = { kind: 'signin' } | { kind: 'panel'; id: string } | null
 
@@ -77,4 +85,16 @@ export function focusServerStep(): boolean {
   if (step.kind === 'signin') focusSignInField()
   else focusPanelTitle(step.id)
   return true
+}
+
+/**
+ * Scrolls `el` into view, nearest edge first, without animation when the person asked for less motion.
+ * A message that appears below the fold (a phone, a long form) would otherwise go unseen. `reduceMotion`
+ * is read from the browser unless given (tests).
+ */
+export function revealElement(el: Pick<HTMLElement, 'scrollIntoView'> | null, reduceMotion?: boolean): void {
+  if (!el || typeof el.scrollIntoView !== 'function') return
+  const reduce =
+    reduceMotion ?? (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+  el.scrollIntoView({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' })
 }

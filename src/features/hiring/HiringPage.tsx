@@ -12,11 +12,30 @@ import type { ID, SourceKind, StageKind, Viewer } from '@/domain/types'
 import { fmtDate, fmtQuarter, fmtShort, nowISO, today } from '@/lib/dates'
 import { plural } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Avatar, Badge, Button, ChipGroup, ChipMulti, type Column, DataTable, EmptyState, PageHeader, Panel, SearchInput, Select, Tabs } from '@/ui'
+import { useServerAccount, useSyncStatus } from '@/sync'
+import {
+  Avatar,
+  Badge,
+  Button,
+  buttonClass,
+  ChipGroup,
+  ChipMulti,
+  type Column,
+  DataTable,
+  EmptyState,
+  Icon,
+  PageHeader,
+  Panel,
+  SearchInput,
+  Select,
+  Tabs,
+} from '@/ui'
 import { HiringMetricsPanel, InterviewKitsTab } from './interviews'
 import { OffersTab } from './offers'
 import { commit } from './actions'
+import { CAREERS_SITE_DETAIL } from '@/domain/hiring/sources'
 import {
+  CAREERS_SITE_FILTER,
   type CandidateFilter,
   type CandidateFlag,
   type CandidateRow,
@@ -46,6 +65,11 @@ export function HiringPage({ route }: PageProps) {
   const isAdmin = viewer.role === 'admin'
   // Hiring managers request a job; it lands as an approval in Admin's inbox (no cost shown).
   const isManager = viewer.role === 'manager'
+  // Synced with a server that serves careers pages: the company's public page, with its posted jobs.
+  const connected = useSyncStatus((s) => s.mode === 'server')
+  // Only while that page is public: a page an admin turned off shows nothing worth linking to.
+  const account = useServerAccount(connected)
+  const careersUrl = account?.careersEnabled ? account.careersUrl : null
 
   return (
     <>
@@ -66,6 +90,13 @@ export function HiringPage({ route }: PageProps) {
               <Button icon="briefcase" onClick={() => navigate('hiring', 'new-job')}>
                 Request a job
               </Button>
+            )}
+            {connected && careersUrl && (
+              <a href={careersUrl} target="_blank" rel="noopener noreferrer" className={buttonClass('ghost')}>
+                <Icon name="external" size={18} className="ft-btn__icon shrink-0" />
+                Careers page
+                <span className="sr-only"> (opens in a new tab)</span>
+              </a>
             )}
           </>
         }
@@ -405,12 +436,17 @@ function CandidatesTab() {
           <span aria-hidden className="text-[13px] font-semibold text-ink-3">
             Source
           </span>
-          <ChipGroup<SourceKind | 'any'>
+          <ChipGroup<CandidateFilter['source'] | 'any'>
             size="sm"
             label="Source"
             value={f.source || 'any'}
             onChange={(v) => set('source', v === 'any' ? '' : v)}
-            options={[{ value: 'any', label: 'Any source' }, ...(['inbound', 'referral', 'outbound', 'agency'] as SourceKind[]).map((s) => ({ value: s, label: SOURCE_LABEL[s] }))]}
+            options={[
+              { value: 'any', label: 'Any source' },
+              ...(['inbound', 'referral', 'outbound', 'agency'] as SourceKind[]).map((s) => ({ value: s, label: SOURCE_LABEL[s] })),
+              // Inbound candidates who applied on the careers page, on their own.
+              { value: CAREERS_SITE_FILTER, label: CAREERS_SITE_DETAIL },
+            ]}
           />
         </div>
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-2">

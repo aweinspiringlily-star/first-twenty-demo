@@ -2,6 +2,7 @@
 // mini funnel, a media-query hook, the 'Not legal advice' line and the free-text guardrail notes.
 import { useEffect, useState } from 'react'
 import type { FunnelStep, SlaDetail } from '@/domain/hiring'
+import { sourceLabel } from '@/domain/hiring/sources'
 import type { Application, Candidate, EmploymentType, Job, SourceKind } from '@/domain/types'
 import { Badge, Callout, CitationChip, cx, Icon, type IconName, Kbd, type Tone } from '@/ui'
 import { slaBadge, type TextIssue } from './logic'
@@ -104,17 +105,15 @@ export function AppStatusBadge({ app }: { app: Application }) {
   }
 }
 
-export const SOURCE_LABEL: Record<SourceKind, string> = { inbound: 'Inbound', referral: 'Referral', outbound: 'Outbound', agency: 'Agency' }
+export { SOURCE_LABEL } from '@/domain/hiring/sources'
 const SOURCE_ICON: Record<SourceKind, IconName> = { inbound: 'inbox', referral: 'heart', outbound: 'send', agency: 'building' }
 
+/** The source as a chip; a careers page applicant always shows its detail (sourceLabel). */
 export function SourceChip({ candidate, detail = false }: { candidate: Pick<Candidate, 'source' | 'sourceDetail'>; detail?: boolean }) {
   return (
     <span className="ft-tag ft-tag--source inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-surface-2 px-2 text-[12px] font-semibold text-ink-2">
       <Icon name={SOURCE_ICON[candidate.source]} size={12} />
-      <span className="truncate">
-        {SOURCE_LABEL[candidate.source]}
-        {detail && candidate.sourceDetail ? `: ${candidate.sourceDetail}` : ''}
-      </span>
+      <span className="truncate">{sourceLabel(candidate, detail)}</span>
     </span>
   )
 }

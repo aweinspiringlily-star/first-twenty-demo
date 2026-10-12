@@ -3,14 +3,24 @@
 // engine can tell "offline" (network error or timeout) from "signed out" (401) from a server error.
 import type { DB } from '@/domain/types'
 import type {
+  AccountResponse,
   Applied,
+  CareersSwitchResponse,
   Change,
   ChangesResponse,
   ClientChange,
   Conflict,
   HealthResponse,
+  InviteInfo,
+  InviteResponse,
+  LoginResponse,
+  MeResponse,
+  OpenInvite,
   PostChangesResponse,
   PutWorkspaceResponse,
+  ServerWorkspace,
+  SessionResponse,
+  SignupModeResponse,
   SyncUser,
   WorkspaceSnapshot,
   WorkspaceStatus,
@@ -24,10 +34,12 @@ export type ApiErrorKind =
   | 'empty' // GET /api/workspace before the first upload (GET /api/workspace/status says so without an error)
   | 'not_empty' // PUT /api/workspace without confirmReplace on a server that has data
   | 'resync' // 409 {error: 'resync'} on POST /api/changes: the server's history changed (replace or restore)
+  | 'email_taken' // 409 {error: 'email_taken'} on sign-up or accepting an invite: that email already has a login
   | 'too_large' // 413
-  | 'forbidden' // 403 (CSRF guard, origin check)
-  | 'not_found' // 404 other than 'empty': not a First Twenty server at this address
+  | 'forbidden' // 403 (CSRF guard, origin check, an invite asked for by a login that is not an admin)
+  | 'not_found' // 404 other than 'empty': not a First Twenty server at this address (or sign-up closed, a bad invite)
   | 'bad_request' // other 4xx
+  | 'demo_full' // 503 {error: 'demo_full'} on sign-up: the demo server holds as many companies as it may
   | 'server' // 5xx, including 503 from /api/health when the database is down
   | 'bad_response' // an answer that is not the JSON this client expects
 
@@ -65,18 +77,53 @@ export type WorkspaceStatusResult = Extract<WorkspaceStatus, { empty: true }> | 
 /** fallback: on a server from before the status route, ask GET /api/workspace instead (default true). */
 export type WorkspaceStatusOptions = { fallback?: boolean }
 
+/** POST /api/auth/signup: a new login and a new company named companyName (remember as in LoginOptions). */
+export type SignupInput = { email: string; password: string; companyName: string; remember?: boolean }
+
+/** POST /api/auth/accept-invite: a new login in the company the invite token joins. */
+export type AcceptInviteInput = { token: string; email: string; password: string; remember?: boolean }
+
 export type SyncApi = {
   health(): Promise<ApiResult<HealthResponse>>
-  login(email: string, password: string, opts?: LoginOptions): Promise<ApiResult<{ user: SyncUser }>>
+  /** POST /api/auth/login: the login and, on servers that hold companies, its company. */
+  login(email: string, password: string, opts?: LoginOptions): Promise<ApiResult<LoginResponse>>
   logout(): Promise<ApiResult<null>>
-  /** GET /api/auth/me: 401 (kind 'signed_out') when there is no session. */
-  me(): Promise<ApiResult<{ user: SyncUser }>>
+  /**
+   * GET /api/auth/me: 401 (kind 'signed_out') when there is no session. Also names the login's company,
+   * its careers page and the sign-up mode on servers that hold companies (see MeResponse).
+   */
+  me(): Promise<ApiResult<MeResponse>>
+  /**
+   * GET /api/auth/signup-mode (public): whether anyone may create a demo company here. A server from
+   * before demo sign-ups answers 404, which is 'closed'.
+   */
+  signupMode(): Promise<ApiResult<SignupModeResponse>>
+  /**
+   * POST /api/auth/signup: creates a login and its company and signs in (a session cookie, like login).
+   * 404 (kind 'not_found') when sign-up is closed, 409 'email_taken', 503 'demo_full', 429 'rate_limited'.
+   */
+  signup(input: SignupInput): Promise<ApiResult<AccountResponse>>
+  /** POST /api/invites (an admin): a single-use link that lets someone join this login's company. */
+  createInvite(): Promise<ApiResult<InviteResponse>>
+  /** GET /api/invites (an admin): the company's open invite links, without tokens. */
+  listInvites(): Promise<ApiResult<OpenInvite[]>>
+  /** DELETE /api/invites/:id (an admin): revokes an open link; 404 (kind 'not_found') when it was used, revoked or expired. */
+  revokeInvite(id: string): Promise<ApiResult<null>>
+  /**
+   * POST /api/invites/lookup (public): the company an invite joins; 404 (kind 'not_found') for a bad,
+   * used or expired one. The token goes in the body, where no proxy or access log keeps it.
+   */
+  inviteInfo(token: string): Promise<ApiResult<InviteInfo>>
+  /** PUT /api/workspace/careers (an admin): turns the company's careers page on or off. */
+  setCareers(enabled: boolean): Promise<ApiResult<CareersSwitchResponse>>
+  /** POST /api/auth/accept-invite: creates a login in the invite's company and signs in; 404 bad token, 409 'email_taken'. */
+  acceptInvite(input: AcceptInviteInput): Promise<ApiResult<AccountResponse>>
   /**
    * Who is signed in, without an error when nobody is: GET /api/auth/session answers {user: null} instead
    * of a 401 (which browsers log as a console error on every page load). A server from before that route
    * answers 404: then /api/auth/me is asked instead, and its 401 becomes {user: null}.
    */
-  session(): Promise<ApiResult<{ user: SyncUser | null }>>
+  session(): Promise<ApiResult<SessionResponse>>
   getWorkspace(): Promise<ApiResult<WorkspaceSnapshot>>
   /**
    * Whether the server holds a workspace, without an error when it does not: GET /api/workspace/status
@@ -106,7 +153,7 @@ export type ApiOptions = {
 
 export const CSRF_HEADER = 'X-First-Twenty'
 
-type Method = 'GET' | 'POST' | 'PUT'
+type Method = 'GET' | 'POST' | 'PUT' | 'DELETE'
 
 type RequestSpec<T> = {
   method: Method
@@ -172,7 +219,7 @@ export function createApi(options: ApiOptions = {}): SyncApi {
     return errorFor(res, isJSON ? json : null, spec.login === true)
   }
 
-  const me = () => request<{ user: SyncUser }>({ method: 'GET', path: '/api/auth/me', timeoutMs, parse: parseUserBody })
+  const me = () => request<MeResponse>({ method: 'GET', path: '/api/auth/me', timeoutMs, parse: parseMe })
   /** False once the server answered 404 to /api/auth/session (it predates the route). */
   let sessionRoute = true
   const getWorkspace = () => request<WorkspaceSnapshot>({ method: 'GET', path: '/api/workspace', timeoutMs: longTimeoutMs, parse: parseSnapshot })
@@ -188,13 +235,13 @@ export function createApi(options: ApiOptions = {}): SyncApi {
         parse: (j) => (isObj(j) && j.ok === true ? { ok: true, db: 'up', version: typeof j.version === 'string' ? j.version : '' } : null),
       }),
     login: (email, password, opts) =>
-      request<{ user: SyncUser }>({
+      request<LoginResponse>({
         method: 'POST',
         path: '/api/auth/login',
         body: { email, password, remember: opts?.remember === true },
         timeoutMs,
         login: true,
-        parse: parseUserBody,
+        parse: parseLogin,
       }),
     // 204 with no body; any 2xx counts as signed out.
     logout: () =>
@@ -202,9 +249,54 @@ export function createApi(options: ApiOptions = {}): SyncApi {
         r.ok ? { ok: true, status: r.status, data: null } : r,
       ),
     me,
+    signupMode: async () => {
+      const r = await request<SignupModeResponse>({ method: 'GET', path: '/api/auth/signup-mode', timeoutMs, parse: parseSignupMode })
+      // A server from before demo sign-ups has no such route: nobody may sign up there.
+      return !r.ok && r.kind === 'not_found' ? { ok: true, status: r.status ?? 404, data: { signupMode: 'closed' } } : r
+    },
+    signup: (input) =>
+      request<AccountResponse>({
+        method: 'POST',
+        path: '/api/auth/signup',
+        body: { email: input.email, password: input.password, companyName: input.companyName, remember: input.remember === true },
+        timeoutMs,
+        parse: parseAccount,
+      }),
+    // No body: the route needs none, and Fastify refuses an empty body sent as JSON.
+    createInvite: () => request<InviteResponse>({ method: 'POST', path: '/api/invites', timeoutMs, parse: parseInvite }),
+    listInvites: () =>
+      request<OpenInvite[]>({ method: 'GET', path: '/api/invites', timeoutMs, parse: (j) => (isObj(j) && Array.isArray(j.invites) ? j.invites.flatMap(parseOpenInvite) : null) }),
+    revokeInvite: (id) =>
+      request<true>({ method: 'DELETE', path: `/api/invites/${encodeURIComponent(id)}`, timeoutMs, parse: () => true }).then((r): ApiResult<null> =>
+        r.ok ? { ok: true, status: r.status, data: null } : r,
+      ),
+    inviteInfo: (token) =>
+      request<InviteInfo>({
+        method: 'POST',
+        path: '/api/invites/lookup',
+        body: { token },
+        timeoutMs,
+        parse: (j) => (isObj(j) && typeof j.companyName === 'string' ? { companyName: j.companyName } : null),
+      }),
+    setCareers: (enabled) =>
+      request<CareersSwitchResponse>({
+        method: 'PUT',
+        path: '/api/workspace/careers',
+        body: { enabled },
+        timeoutMs,
+        parse: (j) => (isObj(j) && typeof j.careersEnabled === 'boolean' ? { careersUrl: httpUrl(j.careersUrl), careersEnabled: j.careersEnabled } : null),
+      }),
+    acceptInvite: (input) =>
+      request<AccountResponse>({
+        method: 'POST',
+        path: '/api/auth/accept-invite',
+        body: { token: input.token, email: input.email, password: input.password, remember: input.remember === true },
+        timeoutMs,
+        parse: parseAccount,
+      }),
     session: async () => {
       if (sessionRoute) {
-        const r = await request<{ user: SyncUser | null }>({ method: 'GET', path: '/api/auth/session', timeoutMs, parse: parseSessionBody })
+        const r = await request<SessionResponse>({ method: 'GET', path: '/api/auth/session', timeoutMs, parse: parseSessionBody })
         if (r.ok) return r
         if (r.kind === 'signed_out') return { ok: true, status: r.status ?? 401, data: { user: null } }
         if (r.kind !== 'not_found') return r
@@ -242,8 +334,12 @@ export function createApi(options: ApiOptions = {}): SyncApi {
           const seq = num(j.seq)
           const versions = parseVersions(j.versions)
           if (seq === null || !versions) return null
+          const out: PutWorkspaceResponse = { seq, versions }
           const historyId = str(j.historyId)
-          return historyId ? { historyId, seq, versions } : { seq, versions }
+          if (historyId) out.historyId = historyId
+          const workspaceId = str(j.workspaceId)
+          if (workspaceId) out.workspaceId = workspaceId
+          return out
         },
       }),
     getChanges: (since, historyId) =>
@@ -280,10 +376,12 @@ function errorFor(res: Response, json: unknown, login: boolean): ApiFailure {
   }
   if (status === 404 && error === 'empty') return failure('empty', status, error)
   if (status === 409 && error === 'resync') return failure('resync', status, error)
+  if (status === 409 && error === 'email_taken') return failure('email_taken', status, error)
   if (status === 409 || error === 'not_empty') return failure('not_empty', status, error)
   if (status === 413) return failure('too_large', status, error)
   if (status === 403) return failure('forbidden', status, error)
   if (status === 404) return failure('not_found', status, error)
+  if (status === 503 && error === 'demo_full') return failure('demo_full', status, error)
   if (status >= 500) return failure('server', status, error)
   if (status >= 400) return failure('bad_request', status, error)
   return failure('bad_response', status, error)
@@ -315,12 +413,81 @@ function parseUserBody(j: unknown): { user: SyncUser } | null {
   return user ? { user } : null
 }
 
+/** {user, workspace?} from POST /api/auth/login (workspace only from servers that hold companies). */
+function parseLogin(j: unknown): LoginResponse | null {
+  const body = parseUserBody(j)
+  if (!body || !isObj(j)) return null
+  const workspace = parseWorkspace(j.workspace)
+  return workspace ? { user: body.user, workspace } : body
+}
+
+function parseOpenInvite(j: unknown): OpenInvite[] {
+  if (!isObj(j) || typeof j.id !== 'string' || typeof j.expiresAt !== 'string') return []
+  return [{ id: j.id, createdAt: typeof j.createdAt === 'string' ? j.createdAt : '', expiresAt: j.expiresAt, createdBy: typeof j.createdBy === 'string' ? j.createdBy : null }]
+}
+
+/**
+ * An absolute http(s) address, or null. Addresses from the server end up in links (the careers page, an
+ * invite), so anything else (a javascript: URL, a relative path) is dropped rather than rendered.
+ */
+export function httpUrl(v: unknown): string | null {
+  if (typeof v !== 'string' || v.length > 2048) return null
+  try {
+    const u = new URL(v)
+    return u.protocol === 'https:' || u.protocol === 'http:' ? v : null
+  } catch {
+    return null
+  }
+}
+
+function parseWorkspace(w: unknown): ServerWorkspace | null {
+  if (!isObj(w) || typeof w.id !== 'string' || typeof w.name !== 'string') return null
+  return { id: w.id, name: w.name, slug: typeof w.slug === 'string' ? w.slug : '' }
+}
+
+/** GET /api/auth/me: the user, plus the company, careers page and sign-up mode when the server sends them. */
+function parseMe(j: unknown): MeResponse | null {
+  const body = parseUserBody(j)
+  if (!body || !isObj(j)) return null
+  const out: MeResponse = { user: body.user }
+  const workspace = parseWorkspace(j.workspace)
+  if (workspace) out.workspace = workspace
+  if ('careersUrl' in j) out.careersUrl = httpUrl(j.careersUrl)
+  if (typeof j.careersEnabled === 'boolean') out.careersEnabled = j.careersEnabled
+  if (j.signupMode === 'open' || j.signupMode === 'closed') out.signupMode = j.signupMode
+  return out
+}
+
+/** Anything but 'open' is closed: a demo server must say so plainly before anyone is offered to sign up. */
+function parseSignupMode(j: unknown): SignupModeResponse | null {
+  if (!isObj(j)) return null
+  const out: SignupModeResponse = { signupMode: j.signupMode === 'open' ? 'open' : 'closed' }
+  const days = num(j.demoExpireDays)
+  if (days !== null && days >= 0 && Number.isInteger(days)) out.demoExpireDays = days
+  return out
+}
+
+/** {user, workspace} from sign-up and accepting an invite (workspace null when the server leaves it out). */
+function parseAccount(j: unknown): AccountResponse | null {
+  const body = parseUserBody(j)
+  if (!body || !isObj(j)) return null
+  return { user: body.user, workspace: parseWorkspace(j.workspace) }
+}
+
+function parseInvite(j: unknown): InviteResponse | null {
+  if (!isObj(j)) return null
+  const url = httpUrl(j.url)
+  return url && typeof j.expiresAt === 'string' ? { url, expiresAt: j.expiresAt } : null
+}
+
 /** {user: SyncUser | null} from GET /api/auth/session. */
-function parseSessionBody(j: unknown): { user: SyncUser | null } | null {
+function parseSessionBody(j: unknown): SessionResponse | null {
   if (!isObj(j) || !('user' in j)) return null
   if (j.user === null) return { user: null }
   const user = parseUser(j.user)
-  return user ? { user } : null
+  if (!user) return null
+  const workspace = parseWorkspace(j.workspace)
+  return workspace ? { user, workspace } : { user }
 }
 
 function parseVersions(v: unknown): Record<string, number> | null {
@@ -416,7 +583,10 @@ export function describeFailure(f: Pick<ApiFailure, 'kind' | 'status' | 'error' 
       return 'That email and password do not match. Check both and try again.'
     case 'rate_limited': {
       const minutes = Math.max(1, Math.ceil((f.retryAfter ?? 900) / 60))
-      return `Too many sign-in attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`
+      const wait = `${minutes} minute${minutes === 1 ? '' : 's'}`
+      // A demo company writing faster than the demo server allows (server/src/writeBudget.ts).
+      if (f.error === 'write_limit') return `This demo company sent changes faster than the demo server allows. They wait in this browser and go out on their own, within ${wait}.`
+      return `Too many sign-in attempts. Try again in ${wait}.`
     }
     case 'empty':
       return 'The server has no workspace yet. Upload this browser\'s workspace to start.'
@@ -424,7 +594,13 @@ export function describeFailure(f: Pick<ApiFailure, 'kind' | 'status' | 'error' 
       return 'The server already has a workspace. Confirm to replace it, or use the server\'s copy.'
     case 'resync':
       return "Your server's workspace was replaced or restored since this browser last synced. This browser loads it again before sending changes."
+    case 'email_taken':
+      return 'That email already has a login on this server. Sign in with it instead, or use another email.'
+    case 'demo_full':
+      return 'This demo server holds as many demo companies as it can right now. Try again later.'
     case 'too_large':
+      // A demo company at its demo limits (records, bytes, or the demo server's room for all of them).
+      if (f.error === 'workspace_full') return 'This demo company is as full as the demo server allows. Remove old activity or large notes, then try again.'
       return 'The upload is larger than the server accepts. Remove large notes or old activity and try again.'
     case 'forbidden':
       return 'The server refused the request. Open the app from the server\'s own address and try again.'

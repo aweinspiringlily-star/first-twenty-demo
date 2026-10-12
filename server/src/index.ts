@@ -1,12 +1,12 @@
 // Starts the First Twenty server: load settings, open the database, migrate when MIGRATE_ON_START=true
 // (the default for PGlite in development), listen on HOST:PORT and shut down cleanly on SIGTERM/SIGINT.
 import { buildApp } from './app'
-import { purgeSessions } from './auth'
+import { registerCareers } from './careers/routes'
 import { type Config, loadConfig } from './config'
 import { openDb } from './db'
 import { ConfigError } from './errors'
+import { housekeeping } from './housekeeping'
 import { migrate, unappliedMigrations } from './migrate'
-import { pruneChangeLog } from './repo'
 
 const DAY_MS = 86_400_000
 
@@ -48,19 +48,20 @@ async function main(): Promise<void> {
     }
   }
 
-  const app = await buildApp({ db, config })
+  // The careers pages answer on CAREERS_HOSTS only (none set: no careers routes at all).
+  const app = await buildApp({ db, config, careers: registerCareers })
 
-  // Housekeeping once a day: expired sessions and change-log rows older than 120 days.
-  const housekeeping = async () => {
+  // Housekeeping at startup and once a day (housekeeping.ts): ended sessions, demo companies unused for
+  // DEMO_EXPIRE_DAYS, old change-log rows, long-expired invites.
+  const runHousekeeping = async () => {
     try {
-      await purgeSessions(db, config)
-      const pruned = await pruneChangeLog(db, 120)
-      if (pruned > 0) app.log.info({ pruned }, 'pruned old change-log rows')
+      const done = await housekeeping(db, config)
+      if (done.expiredWorkspaces > 0 || done.prunedChanges > 0) app.log.info(done, 'housekeeping removed old data')
     } catch (err) {
       app.log.error({ err }, 'housekeeping failed')
     }
   }
-  const timer = setInterval(housekeeping, DAY_MS)
+  const timer = setInterval(runHousekeeping, DAY_MS)
   timer.unref()
 
   let closing = false
@@ -85,10 +86,10 @@ async function main(): Promise<void> {
 
   await app.listen({ host: config.host, port: config.port })
   app.log.info(
-    { db: describeDb(config), serveApp: config.serveApp, env: config.nodeEnv },
+    { db: describeDb(config), serveApp: config.serveApp, env: config.nodeEnv, signupMode: config.signupMode, careersHosts: config.careersHosts },
     `First Twenty server listening on http://${config.host}:${config.port}`,
   )
-  void housekeeping()
+  void runHousekeeping()
 }
 
 main().catch((err) => {

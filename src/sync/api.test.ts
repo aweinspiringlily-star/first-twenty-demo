@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DB } from '@/domain/types'
-import { CSRF_HEADER, createApi, describeFailure, type FetchLike } from './api'
+import { CSRF_HEADER, createApi, describeFailure, type FetchLike, httpUrl } from './api'
 
 type Call = { url: string; init: RequestInit }
 
@@ -336,5 +336,179 @@ describe('createApi', () => {
     // No history id known: none sent.
     await api.getChanges(0, null)
     expect(calls.at(-1)?.url).toBe('/api/changes?since=0')
+  })
+})
+
+describe('demo server routes (sign-up, invites, the login\'s company)', () => {
+  const user = { id: 'u2', email: 'sam@example.test', role: 'admin' }
+  const workspace = { id: 'ws-1', name: 'Acme Robots', slug: 'acme-robots' }
+
+  it('signs up with POST /api/auth/signup: JSON with the CSRF header, remember false unless asked', async () => {
+    const { fn, calls } = fakeFetch(() => json(201, { user, workspace }))
+    const api = createApi({ fetch: fn })
+    expect(await api.signup({ email: 'sam@example.test', password: 'twelve chars!', companyName: 'Acme Robots' })).toEqual({
+      ok: true,
+      status: 201,
+      data: { user, workspace },
+    })
+    await api.signup({ email: 'sam@example.test', password: 'twelve chars!', companyName: 'Acme Robots', remember: true })
+    expect(calls[0].url).toBe('/api/auth/signup')
+    expect(calls[0].init.method).toBe('POST')
+    expect(header(calls[0], CSRF_HEADER)).toBe('1')
+    // No honeypot field: the app never fills it, so it never sends it.
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ email: 'sam@example.test', password: 'twelve chars!', companyName: 'Acme Robots', remember: false })
+    expect(JSON.parse(calls[1].init.body as string).remember).toBe(true)
+  })
+
+  it('maps the sign-up refusals: closed, email taken, demo full, rate limited', async () => {
+    const cases: Array<[Response, string]> = [
+      [json(404, { error: 'not_found' }), 'not_found'],
+      [json(409, { error: 'email_taken' }), 'email_taken'],
+      [json(503, { error: 'demo_full' }), 'demo_full'],
+      [json(503, { error: 'db_down' }), 'server'],
+      [json(429, { error: 'rate_limited', retryAfter: 600 }), 'rate_limited'],
+      [json(400, { error: 'invalid_company' }), 'bad_request'],
+      // A 409 that is not about the email is still the workspace's answer.
+      [json(409, { error: 'not_empty' }), 'not_empty'],
+    ]
+    for (const [res, kind] of cases) {
+      const api = createApi({ fetch: fakeFetch(() => res.clone()).fn })
+      const r = await api.signup({ email: 'a@example.test', password: 'x'.repeat(12), companyName: 'Acme' })
+      expect(r, kind).toMatchObject({ ok: false, kind })
+      if (!r.ok) expect(describeFailure(r)).not.toMatch(/—/)
+    }
+    expect(describeFailure({ kind: 'email_taken', status: 409, error: 'email_taken' })).toMatch(/already has a login/)
+    expect(describeFailure({ kind: 'demo_full', status: 503, error: 'demo_full' })).toMatch(/Try again later/)
+  })
+
+  it('reads the sign-up mode: open only when the server says so, closed on a server from before it', async () => {
+    const mode = (res: Response) => createApi({ fetch: fakeFetch(() => res).fn }).signupMode()
+    expect(await mode(json(200, { signupMode: 'open', demoExpireDays: 30 }))).toEqual({ ok: true, status: 200, data: { signupMode: 'open', demoExpireDays: 30 } })
+    expect(await mode(json(200, { signupMode: 'open' }))).toEqual({ ok: true, status: 200, data: { signupMode: 'open' } })
+    expect(await mode(json(200, { signupMode: 'closed' }))).toMatchObject({ ok: true, data: { signupMode: 'closed' } })
+    // Anything unclear is closed, and an expiry that is not a whole number of days is left out.
+    expect(await mode(json(200, { signupMode: 'OPEN', demoExpireDays: -3 }))).toEqual({ ok: true, status: 200, data: { signupMode: 'closed' } })
+    expect(await mode(json(200, { signupMode: 'open', demoExpireDays: 1.5 }))).toEqual({ ok: true, status: 200, data: { signupMode: 'open' } })
+    expect(await mode(json(404, { error: 'not_found' }))).toEqual({ ok: true, status: 404, data: { signupMode: 'closed' } })
+    expect(await mode(json(500, {}))).toMatchObject({ ok: false, kind: 'server' })
+    const { fn, calls } = fakeFetch(() => json(200, { signupMode: 'closed' }))
+    await createApi({ fetch: fn }).signupMode()
+    expect(calls.map((c) => [c.url, c.init.method, header(c, CSRF_HEADER)])).toEqual([['/api/auth/signup-mode', 'GET', undefined]])
+  })
+
+  it('reads the company, careers page and sign-up mode from /api/auth/me, and only http(s) careers links', async () => {
+    const me = (body: unknown) => createApi({ fetch: fakeFetch(() => json(200, body)).fn }).me()
+    expect(await me({ user, workspace, careersUrl: 'https://careers.example.test/acme-robots/', signupMode: 'open' })).toEqual({
+      ok: true,
+      status: 200,
+      data: { user, workspace, careersUrl: 'https://careers.example.test/acme-robots/', signupMode: 'open' },
+    })
+    expect(await me({ user, workspace, careersUrl: null })).toEqual({ ok: true, status: 200, data: { user, workspace, careersUrl: null } })
+    // A server from before companies sends the user only.
+    expect(await me({ user })).toEqual({ ok: true, status: 200, data: { user } })
+    // A careers link the app would put in an href must be http(s): anything else becomes "no careers page".
+    expect(await me({ user, workspace, careersUrl: 'javascript:alert(1)' })).toMatchObject({ ok: true, data: { careersUrl: null } })
+    expect(await me({ user, workspace, careersUrl: '/acme/' })).toMatchObject({ ok: true, data: { careersUrl: null } })
+    // A company without a slug still names itself; one without a name is ignored.
+    expect(await me({ user, workspace: { id: 'ws-1', name: 'Acme' } })).toMatchObject({ ok: true, data: { workspace: { id: 'ws-1', name: 'Acme', slug: '' } } })
+    expect(await me({ user, workspace: { id: 'ws-1' } })).toEqual({ ok: true, status: 200, data: { user } })
+  })
+
+  it('creates an invite with an empty POST and keeps only an http(s) link', async () => {
+    const { fn, calls } = fakeFetch(() => json(201, { url: 'https://hr.example.test/#invite.abcdefghijklmnopqrstuv', expiresAt: '2026-10-17T17:00:00.000Z' }))
+    const api = createApi({ fetch: fn })
+    expect(await api.createInvite()).toEqual({
+      ok: true,
+      status: 201,
+      data: { url: 'https://hr.example.test/#invite.abcdefghijklmnopqrstuv', expiresAt: '2026-10-17T17:00:00.000Z' },
+    })
+    expect(calls[0].url).toBe('/api/invites')
+    expect(calls[0].init.method).toBe('POST')
+    expect(header(calls[0], CSRF_HEADER)).toBe('1')
+    // No body and no JSON content type: Fastify refuses an empty JSON body.
+    expect(calls[0].init.body).toBeUndefined()
+    expect(header(calls[0], 'Content-Type')).toBeUndefined()
+    const odd = createApi({ fetch: fakeFetch(() => json(201, { url: 'javascript:alert(1)', expiresAt: 'soon' })).fn })
+    expect(await odd.createInvite()).toMatchObject({ ok: false, kind: 'bad_response' })
+    const notAdmin = createApi({ fetch: fakeFetch(() => json(403, { error: 'forbidden' })).fn })
+    expect(await notAdmin.createInvite()).toMatchObject({ ok: false, kind: 'forbidden' })
+  })
+
+  it('looks at an invite with its token in a body, never in the address (proxies log addresses), and accepts it with JSON', async () => {
+    const { fn, calls } = fakeFetch((url) => {
+      if (url === '/api/invites/lookup') return json(200, { companyName: 'Acme Robots' })
+      return json(201, { user, workspace })
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.inviteInfo('abc_DEF-123/x')).toEqual({ ok: true, status: 200, data: { companyName: 'Acme Robots' } })
+    expect(calls[0].url).toBe('/api/invites/lookup')
+    expect(calls[0].url).not.toContain('abc_DEF')
+    expect(calls[0].init.method).toBe('POST')
+    expect(header(calls[0], CSRF_HEADER)).toBe('1')
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ token: 'abc_DEF-123/x' })
+    expect(await api.acceptInvite({ token: 'tok', email: 'kim@example.test', password: 'twelve chars!' })).toEqual({ ok: true, status: 201, data: { user, workspace } })
+    expect(calls[1].url).toBe('/api/auth/accept-invite')
+    expect(header(calls[1], CSRF_HEADER)).toBe('1')
+    expect(JSON.parse(calls[1].init.body as string)).toEqual({ token: 'tok', email: 'kim@example.test', password: 'twelve chars!', remember: false })
+    // A server that leaves the company out of the answer still signs the login in.
+    const bare = createApi({ fetch: fakeFetch(() => json(201, { user })).fn })
+    expect(await bare.acceptInvite({ token: 'tok', email: 'kim@example.test', password: 'x' })).toEqual({ ok: true, status: 201, data: { user, workspace: null } })
+    const used = createApi({ fetch: fakeFetch(() => json(404, { error: 'not_found' })).fn })
+    expect(await used.inviteInfo('tok')).toMatchObject({ ok: false, kind: 'not_found' })
+    expect(await used.acceptInvite({ token: 'tok', email: 'kim@example.test', password: 'x' })).toMatchObject({ ok: false, kind: 'not_found' })
+    const taken = createApi({ fetch: fakeFetch(() => json(409, { error: 'email_taken' })).fn })
+    expect(await taken.acceptInvite({ token: 'tok', email: 'kim@example.test', password: 'x' })).toMatchObject({ ok: false, kind: 'email_taken' })
+  })
+
+  it('lists open invites, revokes one with DELETE, and switches the careers page', async () => {
+    const { fn, calls } = fakeFetch((url, init) => {
+      if (url === '/api/invites' && init.method === 'GET') {
+        return json(200, { invites: [{ id: 'i-1', createdAt: '2026-10-10T17:00:00.000Z', expiresAt: '2026-10-17T17:00:00.000Z', createdBy: 'sam@example.test' }, { nope: true }] })
+      }
+      if (url.startsWith('/api/invites/')) return new Response(null, { status: 204 })
+      return json(200, { careersUrl: 'https://careers.example.test/acme-k7m2qx/', careersEnabled: false })
+    })
+    const api = createApi({ fetch: fn })
+    expect(await api.listInvites()).toEqual({
+      ok: true,
+      status: 200,
+      data: [{ id: 'i-1', createdAt: '2026-10-10T17:00:00.000Z', expiresAt: '2026-10-17T17:00:00.000Z', createdBy: 'sam@example.test' }],
+    })
+    expect(await api.revokeInvite('i 1/x')).toEqual({ ok: true, status: 204, data: null })
+    expect([calls[1].url, calls[1].init.method, header(calls[1], CSRF_HEADER)]).toEqual(['/api/invites/i%201%2Fx', 'DELETE', '1'])
+    expect(await api.setCareers(false)).toEqual({ ok: true, status: 200, data: { careersUrl: 'https://careers.example.test/acme-k7m2qx/', careersEnabled: false } })
+    expect([calls[2].url, calls[2].init.method, JSON.parse(calls[2].init.body as string)]).toEqual(['/api/workspace/careers', 'PUT', { enabled: false }])
+    const gone = createApi({ fetch: fakeFetch(() => json(404, { error: 'not_found' })).fn })
+    expect(await gone.revokeInvite('i-1')).toMatchObject({ ok: false, kind: 'not_found' })
+  })
+
+  it('reads the company from a sign-in and a session check, and the workspace an upload went to', async () => {
+    const login = (body: unknown) => createApi({ fetch: fakeFetch(() => json(200, body)).fn }).login('a@b.c', 'pw')
+    expect(await login({ user, workspace })).toEqual({ ok: true, status: 200, data: { user, workspace } })
+    // A server from before companies sends the user only.
+    expect(await login({ user })).toEqual({ ok: true, status: 200, data: { user } })
+    const session = (body: unknown) => createApi({ fetch: fakeFetch(() => json(200, body)).fn }).session()
+    expect(await session({ user, workspace })).toEqual({ ok: true, status: 200, data: { user, workspace } })
+    expect(await session({ user: null })).toEqual({ ok: true, status: 200, data: { user: null } })
+    const put = (body: unknown) => createApi({ fetch: fakeFetch(() => json(200, body)).fn }).putWorkspace({} as never)
+    expect(await put({ workspaceId: 'w-1', historyId: 'h', seq: 3, versions: {} })).toEqual({ ok: true, status: 200, data: { workspaceId: 'w-1', historyId: 'h', seq: 3, versions: {} } })
+    expect(await put({ seq: 3, versions: {} })).toEqual({ ok: true, status: 200, data: { seq: 3, versions: {} } })
+  })
+
+  it('names the demo limits plainly: writing too fast, and a full demo company', () => {
+    expect(describeFailure({ kind: 'rate_limited', status: 429, error: 'write_limit', retryAfter: 90 })).toMatch(/faster than the demo server allows.*within 2 minutes/)
+    expect(describeFailure({ kind: 'rate_limited', status: 429, error: 'rate_limited', retryAfter: 90 })).toMatch(/sign-in attempts/)
+    expect(describeFailure({ kind: 'too_large', status: 413, error: 'workspace_full' })).toMatch(/as full as the demo server allows/)
+    expect(describeFailure({ kind: 'too_large', status: 413, error: 'too_large' })).toMatch(/larger than the server accepts/)
+  })
+
+  it('httpUrl keeps absolute http(s) addresses only', () => {
+    expect(httpUrl('https://careers.example.test/acme/')).toBe('https://careers.example.test/acme/')
+    expect(httpUrl('http://localhost:8826/#invite.x')).toBe('http://localhost:8826/#invite.x')
+    expect(httpUrl('javascript:alert(1)')).toBeNull()
+    expect(httpUrl('data:text/html,hi')).toBeNull()
+    expect(httpUrl('/relative')).toBeNull()
+    expect(httpUrl(42)).toBeNull()
+    expect(httpUrl(`https://example.test/${'a'.repeat(3000)}`)).toBeNull()
   })
 })

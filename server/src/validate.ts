@@ -16,6 +16,22 @@ export const LIMITS = {
   changesPerRequest: 2000,
   idLength: 200,
   changesPerPull: 5000,
+  /** A pull stops at the change that takes it past this many bytes of record JSON (`more: true`), so no page is huge. */
+  bytesPerPull: 8 * 1024 * 1024,
+  /** Records (all collections together, documents not counted) a demo workspace may hold: 413 workspace_full beyond. */
+  recordsPerDemoWorkspace: 20_000,
+  /**
+   * Bytes of record and document JSON a demo workspace may hold (workspaces.bytes_used): 413 workspace_full
+   * beyond. Room for a full 10 MB upload, and about twenty times the sample company.
+   */
+  bytesPerDemoWorkspace: 16 * 1024 * 1024,
+  /** One record in a demo workspace (documents keep recordBytes: settings alone is about 50 KB): 413 too_large beyond. */
+  demoRecordBytes: 64 * 1024,
+  /**
+   * Change-log rows a demo workspace keeps. A push that takes it past them prunes the oldest at once, and
+   * the daily housekeeping checks again (clients behind the pruned rows resync).
+   */
+  logRowsPerDemoWorkspace: 50_000,
 }
 
 export type ClientChange = {
@@ -32,8 +48,12 @@ export type ValidChange =
   | { collection: typeof DOC_COLLECTION; table: null; id: DocKey; op: 'upsert'; json: string; baseVersion: number | null }
 
 export type ValidWorkspace = {
-  /** Every record collection, in RECORD_COLLECTIONS order of appearance, as a JSON array string. */
-  collections: Array<{ collection: RecordCollection; table: string; ids: string[]; json: string }>
+  /**
+   * Every record collection, in RECORD_COLLECTIONS order of appearance, as a JSON array string. largest:
+   * the size of its largest record in bytes (in UTF-16 units when that is under LIMITS.demoRecordBytes / 4,
+   * which no limit is near).
+   */
+  collections: Array<{ collection: RecordCollection; table: string; ids: string[]; json: string; largest: number }>
   docs: Array<{ key: DocKey; json: string }>
   confirmReplace: boolean
 }
@@ -54,6 +74,14 @@ export function encode(value: unknown, where: string): string {
   }
   if (NUL_ESCAPE.test(json)) throw badRequest(`${where} contains a NUL character, which the database cannot store.`)
   return json
+}
+
+/**
+ * The UTF-8 size of a JSON string, counted exactly only when it could be over `limit` (a string of n
+ * UTF-16 units is at most 4n bytes); below that, its length.
+ */
+export function jsonBytes(json: string, limit: number): number {
+  return json.length > limit / 4 ? Buffer.byteLength(json, 'utf8') : json.length
 }
 
 function validId(id: unknown): id is string {
@@ -133,6 +161,7 @@ export function parseWorkspace(body: unknown): ValidWorkspace {
       if (!Array.isArray(value)) throw badRequest(`db.${key} must be a list.`)
       const ids: string[] = []
       const seen = new Set<string>()
+      let largest = 0
       const parts = value.map((record: unknown, i) => {
         const where = `db.${key}[${i}]`
         if (!isPlainObject(record)) throw badRequest(`${where} must be an object.`)
@@ -140,9 +169,11 @@ export function parseWorkspace(body: unknown): ValidWorkspace {
         if (seen.has(record.id)) throw badRequest(`${where}: id ${show(record.id)} appears more than once in ${key}.`)
         seen.add(record.id)
         ids.push(record.id)
-        return encode(record, where)
+        const json = encode(record, where)
+        largest = Math.max(largest, jsonBytes(json, LIMITS.demoRecordBytes))
+        return json
       })
-      out.collections.push({ collection: key, table: tableName(key), ids, json: `[${parts.join(',')}]` })
+      out.collections.push({ collection: key, table: tableName(key), ids, json: `[${parts.join(',')}]`, largest })
     } else {
       throw badRequest(`db.${show(key).slice(1, -1)} is not a known part of the workspace.`)
     }

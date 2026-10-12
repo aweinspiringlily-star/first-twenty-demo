@@ -119,7 +119,7 @@ describe('repo', () => {
     beforeEach(async () => {
       // Two logins, so the flags can tell who wrote what.
       const users = await db.query<{ id: string }>(
-        `INSERT INTO users (email, password_hash) VALUES ('one@example.test', 'x'), ('two@example.test', 'x') RETURNING id::text AS id`,
+        `INSERT INTO users (email, password_hash, workspace_id) VALUES ('one@example.test', 'x', 'default'), ('two@example.test', 'x', 'default') RETURNING id::text AS id`,
       )
       ;[deviceOne, deviceTwo] = users.rows.map((r) => r.id)
     })
@@ -167,7 +167,7 @@ describe('repo', () => {
     let deviceTwo: string
     beforeEach(async () => {
       const users = await db.query<{ id: string }>(
-        `INSERT INTO users (email, password_hash) VALUES ('one@example.test', 'x'), ('two@example.test', 'x') RETURNING id::text AS id`,
+        `INSERT INTO users (email, password_hash, workspace_id) VALUES ('one@example.test', 'x', 'default'), ('two@example.test', 'x', 'default') RETURNING id::text AS id`,
       )
       ;[deviceOne, deviceTwo] = users.rows.map((r) => r.id)
     })

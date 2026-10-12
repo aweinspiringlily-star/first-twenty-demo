@@ -1,7 +1,8 @@
 // The running server connects as a role that may only read and write rows (server/deploy/
 // postgres-setup.sql): SELECT, INSERT, UPDATE, DELETE on the tables and USAGE, SELECT on sequences, while
 // another role owns the schema and runs migrations and after-restore. Every request path must work with
-// those rights alone, including taking change-log seqs as versions.
+// those rights alone, including taking each workspace's next seq as a version (migration 005: a counter
+// in workspaces.last_seq, no sequence).
 import { PGlite } from '@electric-sql/pglite'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
@@ -53,8 +54,10 @@ describe('the server role (rows only, no schema rights)', () => {
     expect((await snapshot(db))?.db.company).toMatchObject({ name: 'Rightsco' })
   })
 
-  it('cannot run after-restore, which moves the sequence: that runs as the owner', async () => {
-    await expect(afterRestore(db)).rejects.toThrow(/permission denied/)
+  it('keeps working on the new numbering after-restore gives every workspace (run as the owner, as documented)', async () => {
+    // Seqs come from workspaces.last_seq since migration 005, so after-restore moves no sequence any more;
+    // it still runs as the owner, through with-env.sh (docs/SERVER.md).
+    expect(Number((await db.query<{ n: unknown }>(`SELECT count(*) AS n FROM pg_class WHERE relkind = 'S'`)).rows[0].n)).toBe(0)
     await pg.exec('RESET ROLE; SET ROLE ft_owner')
     try {
       const restored = await afterRestore(db)

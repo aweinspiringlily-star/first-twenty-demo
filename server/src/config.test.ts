@@ -116,3 +116,78 @@ describe('loadConfig', () => {
     expect(load({ DATABASE_URL: 'pglite:memory' }).pgliteDir).toBe('memory')
   })
 })
+
+describe('loadConfig: public demo and careers settings', () => {
+  const production = { NODE_ENV: 'production', DATABASE_URL: 'postgres://first_twenty:placeholder@127.0.0.1:5432/first_twenty' }
+
+  it('defaults to closed sign-up, 500 demo companies, a 30-day expiry and no careers hosts', () => {
+    const c = load({})
+    expect(c.signupMode).toBe('closed')
+    expect(c.demoMaxWorkspaces).toBe(500)
+    expect(c.demoExpireDays).toBe(30)
+    expect(c.careersHosts).toEqual([])
+    expect(c.careersOrigin).toBeUndefined()
+  })
+
+  it('reads SIGNUP_MODE, DEMO_MAX_WORKSPACES and DEMO_EXPIRE_DAYS (0: never)', () => {
+    const c = load({ SIGNUP_MODE: ' Open ', DEMO_MAX_WORKSPACES: '40', DEMO_EXPIRE_DAYS: '0' })
+    expect(c.signupMode).toBe('open')
+    expect(c.demoMaxWorkspaces).toBe(40)
+    expect(c.demoExpireDays).toBe(0)
+    expect(() => load({ SIGNUP_MODE: 'yes' })).toThrow(/SIGNUP_MODE must be closed or open/)
+    expect(() => load({ DEMO_MAX_WORKSPACES: '0' })).toThrow(/DEMO_MAX_WORKSPACES must be a whole number between 1/)
+    expect(() => load({ DEMO_EXPIRE_DAYS: '-1' })).toThrow(/DEMO_EXPIRE_DAYS must be a whole number between 0/)
+    expect(() => load({ DEMO_EXPIRE_DAYS: '1.5' })).toThrow(/DEMO_EXPIRE_DAYS/)
+  })
+
+  it('reads DEMO_MAX_TOTAL_MB, what the demo companies may hold together (2,048 MB by default)', () => {
+    expect(load({}).demoMaxTotalBytes).toBe(2048 * 1024 * 1024)
+    expect(load({ DEMO_MAX_TOTAL_MB: '512' }).demoMaxTotalBytes).toBe(512 * 1024 * 1024)
+    expect(() => load({ DEMO_MAX_TOTAL_MB: '0' })).toThrow(/DEMO_MAX_TOTAL_MB must be a whole number between 1/)
+    expect(() => load({ DEMO_MAX_TOTAL_MB: 'lots' })).toThrow(/DEMO_MAX_TOTAL_MB/)
+  })
+
+  it('warns when sign-up is open on a production server whose PUBLIC_ORIGIN is not https', () => {
+    const warnings: string[] = []
+    loadConfig({ ...production, PUBLIC_ORIGIN: 'http://localhost:8787', SIGNUP_MODE: 'open' }, { dotenv: false, rootDir: root, warn: (m) => warnings.push(m) })
+    expect(warnings).toContainEqual(expect.stringMatching(/^SIGNUP_MODE=open on a server whose PUBLIC_ORIGIN is not https/))
+    const quiet: string[] = []
+    loadConfig({ ...production, PUBLIC_ORIGIN: 'https://hr.example.com', SIGNUP_MODE: 'open' }, { dotenv: false, rootDir: root, warn: (m) => quiet.push(m) })
+    expect(quiet).toEqual([])
+  })
+
+  it('reads CAREERS_HOSTS as lowercase host names without repeats, and builds CAREERS_ORIGIN from the first', () => {
+    const c = load({
+      PUBLIC_ORIGIN: 'https://hr-77-112-161-54.sslip.io',
+      CAREERS_HOSTS: ' Careers-77-112-161-54.sslip.io, jobs-77-112-161-54.sslip.io,,careers-77-112-161-54.sslip.io ',
+    })
+    expect(c.careersHosts).toEqual(['careers-77-112-161-54.sslip.io', 'jobs-77-112-161-54.sslip.io'])
+    expect(c.careersOrigin).toBe('https://careers-77-112-161-54.sslip.io')
+    // Development: the app's scheme and port.
+    expect(load({ PUBLIC_ORIGIN: 'http://localhost:8787', CAREERS_HOSTS: 'careers.localhost' }).careersOrigin).toBe('http://careers.localhost:8787')
+    expect(load({ CAREERS_HOSTS: 'careers.example.com' }).careersOrigin).toBe('https://careers.example.com')
+  })
+
+  it('takes CAREERS_ORIGIN when it names one of the careers hosts', () => {
+    const c = load({ CAREERS_HOSTS: 'careers.example.com,jobs.example.com', CAREERS_ORIGIN: 'https://jobs.example.com/' })
+    expect(c.careersOrigin).toBe('https://jobs.example.com')
+    expect(() => load({ CAREERS_HOSTS: 'careers.example.com', CAREERS_ORIGIN: 'https://evil.example.net' })).toThrow(/CAREERS_ORIGIN must be on one of CAREERS_HOSTS/)
+    expect(() => load({ CAREERS_HOSTS: 'careers.example.com', CAREERS_ORIGIN: 'careers.example.com' })).toThrow(/CAREERS_ORIGIN/)
+  })
+
+  it('turns careers off, with a warning, when CAREERS_ORIGIN is set without CAREERS_HOSTS', () => {
+    const warnings: string[] = []
+    const c = loadConfig({ CAREERS_ORIGIN: 'https://careers.example.com' }, { dotenv: false, rootDir: root, warn: (m) => warnings.push(m) })
+    expect(c.careersOrigin).toBeUndefined()
+    expect(warnings).toEqual([expect.stringMatching(/CAREERS_HOSTS is empty/)])
+  })
+
+  it("refuses careers hosts that are not host names, or that are the app's own host", () => {
+    for (const bad of ['https://careers.example.com', 'careers.example.com:8443', 'careers example.com', 'careers.example.com/x', '-careers.example.com']) {
+      expect(() => load({ CAREERS_HOSTS: bad }), bad).toThrow(/CAREERS_HOSTS must list host names/)
+    }
+    expect(() => load({ PUBLIC_ORIGIN: 'https://hr.example.com', CAREERS_HOSTS: 'careers.example.com,HR.example.com' })).toThrow(
+      /CAREERS_HOSTS lists hr\.example\.com, the app's own host/,
+    )
+  })
+})

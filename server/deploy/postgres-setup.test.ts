@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest'
 import { blankDB } from '@/data/blank'
 import { purgeSessions } from '../src/auth'
 import { type Db, fromPGlite } from '../src/db'
+import { housekeeping } from '../src/housekeeping'
 import { migrate, migrationFiles } from '../src/migrate'
 import { afterRestore, changesSince, pruneChangeLog } from '../src/repo'
 import { createAdmin, CSRF, login, makeApp } from '../src/test/helpers'
@@ -176,6 +177,54 @@ describe('postgres-setup.sql', () => {
     }
   })
 
+  it('makes a read-only viewer that sees the records but not the credentials, and runs browse.sql', async () => {
+    const pg = await PGlite.create()
+    try {
+      await runSetup(pg)
+      await pg.exec('SET ROLE first_twenty_owner')
+      await migrate(asDb(pg), { dir: path.join(root, 'server', 'sql') })
+      await pg.exec('RESET ROLE')
+      const viewerSql = read('server/deploy/viewer-role.sql')
+      await runPsql(viewerSql, { first_twenty: pg }, pg)
+      await runPsql(viewerSql, { first_twenty: pg }, pg) // safe to re-run
+
+      const role = await pg.query<{ rolsuper: boolean; rolcreaterole: boolean; rolcreatedb: boolean; rolcanlogin: boolean }>(
+        `SELECT rolsuper, rolcreaterole, rolcreatedb, rolcanlogin FROM pg_roles WHERE rolname = 'first_twenty_viewer'`,
+      )
+      expect(role.rows[0]).toEqual({ rolsuper: false, rolcreaterole: false, rolcreatedb: false, rolcanlogin: true })
+
+      await pg.exec('SET ROLE first_twenty_viewer')
+      // Every statement in browse.sql runs (the tables are empty, so this checks names and types).
+      const statements = read('server/deploy/browse.sql')
+        .split('\n')
+        .filter((l) => !l.startsWith('--'))
+        .join('\n')
+        .split(';')
+        .map((s) => s.trim())
+        .filter(Boolean)
+      expect(statements.length).toBeGreaterThan(8)
+      for (const s of statements) await expect(pg.query(s), s.slice(0, 60)).resolves.toBeDefined()
+      for (const table of ['users', 'sessions', 'trusted_devices', 'invites']) {
+        await expect(pg.query(`SELECT * FROM public.${table}`), table).rejects.toThrow(/permission denied/)
+      }
+      // Every other table is readable, the companies (workspaces) included: only credentials are kept out.
+      const readable = await pg.query<{ tablename: string }>(
+        `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND has_table_privilege('first_twenty_viewer', format('%I.%I', schemaname, tablename), 'SELECT')`,
+      )
+      const all = await pg.query<{ tablename: string }>(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)
+      expect(readable.rows.map((r) => r.tablename).sort()).toEqual(
+        all.rows.map((r) => r.tablename).filter((t) => !['users', 'sessions', 'trusted_devices', 'invites'].includes(t)).sort(),
+      )
+      expect(readable.rows.map((r) => r.tablename)).toContain('workspaces')
+      await expect(pg.exec(`INSERT INTO people (workspace_id, id, data) VALUES ('w', 'p', '{}')`)).rejects.toThrow(/permission denied/)
+      await expect(pg.exec('DELETE FROM change_log')).rejects.toThrow(/permission denied/)
+      await expect(pg.exec('CREATE TABLE public.x (a int)')).rejects.toThrow(/permission denied/)
+      await pg.exec('RESET ROLE')
+    } finally {
+      await pg.close()
+    }
+  })
+
   it("lets the server's role do everything the server does, and nothing that changes the schema", async () => {
     const pg = await PGlite.create()
     try {
@@ -228,10 +277,44 @@ describe('postgres-setup.sql', () => {
       } finally {
         await app.close()
       }
-      // Daily housekeeping.
+      // A public demo server: sign-up (an advisory lock, new rows in workspaces and users), an invite
+      // and its use, all as the server's role.
+      const demo = await makeApp(db, { signupMode: 'open' })
+      try {
+        const signup = await demo.inject({
+          method: 'POST',
+          url: '/api/auth/signup',
+          headers: CSRF,
+          payload: { email: 'demo@example.com', password: 'demo-password-1234', companyName: 'Demo Roleco' },
+        })
+        expect(signup.statusCode, signup.body).toBe(201)
+        const demoCookie = `ft_session=${signup.cookies.find((c) => c.name === 'ft_session')!.value}`
+        const demoHeaders = { ...CSRF, cookie: demoCookie }
+        const company = blankDB({ companyName: 'Demo Roleco', founderFirstName: 'Di', founderLastName: 'Mo', foundedOn: '2026-01-05' })
+        expect((await demo.inject({ method: 'PUT', url: '/api/workspace', headers: demoHeaders, payload: { db: company } })).statusCode).toBe(200)
+        const invite = await demo.inject({ method: 'POST', url: '/api/invites', headers: demoHeaders })
+        expect(invite.statusCode, invite.body).toBe(201)
+        const token = String(invite.json().url).split('#invite.')[1]
+        const joined = await demo.inject({
+          method: 'POST',
+          url: '/api/auth/accept-invite',
+          headers: CSRF,
+          payload: { token, email: 'teammate@example.com', password: 'demo-password-1234' },
+        })
+        expect(joined.statusCode, joined.body).toBe(201)
+      } finally {
+        await demo.close()
+      }
+
+      // Daily housekeeping, including deleting a demo company nobody used for DEMO_EXPIRE_DAYS.
       await purgeSessions(db, { sessionIdleHours: 12 })
       await pruneChangeLog(db, 120)
       expect(await changesSince(db, 0)).toBeDefined()
+      await pg.exec(`RESET ROLE`)
+      await pg.exec(`UPDATE workspaces SET last_active_at = now() - interval '31 days' WHERE NOT keep`)
+      await pg.exec('SET ROLE first_twenty')
+      expect(await housekeeping(db, { sessionIdleHours: 12, demoExpireDays: 30 })).toMatchObject({ expiredWorkspaces: 1 })
+      expect((await pg.query(`SELECT email FROM users`)).rows).toEqual([{ email: 'admin@example.com' }])
 
       // Nothing that changes the schema...
       for (const statement of [
@@ -251,8 +334,10 @@ describe('postgres-setup.sql', () => {
       expect(member.rows[0].m).toBe(false)
       // So migrations (and MIGRATE_ON_START) cannot run as this role...
       await expect(migrate(db, { dir: path.join(root, 'server', 'sql') })).rejects.toThrow(/permission denied/)
-      // ...nor can after-restore, which moves the change-log sequence: it needs the owner (with-env.sh).
-      await expect(afterRestore(db)).rejects.toThrow(/permission denied/)
+      // There is no sequence for this role to use, or for after-restore to move: since migration 005 each
+      // workspace counts its own seqs (workspaces.last_seq). after-restore still runs as the owner below,
+      // through with-env.sh as docs/SERVER.md says.
+      expect(Number((await pg.query<{ n: unknown }>(`SELECT count(*) AS n FROM pg_class WHERE relkind = 'S'`)).rows[0].n)).toBe(0)
       await pg.exec('RESET ROLE')
 
       await pg.exec('SET ROLE first_twenty_owner')

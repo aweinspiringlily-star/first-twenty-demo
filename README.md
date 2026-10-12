@@ -38,7 +38,30 @@ A company that wants its data in its own Postgres database can run the First Twe
 Postgres on an EC2 instance: the browser syncs every change to it, keeps working offline and catches up
 later. One admin login protects the data. Step-by-step setup is in `docs/SERVER.md`; the protocol and
 data layout are in `docs/SYNC.md`. Locally, `npm run server:dev` runs the server against PGlite (real
-Postgres in WebAssembly, no install). The sign-in and sync screens in Settings, Data come next.
+Postgres in WebAssembly, no install). Sign in and choose what syncs in Settings, Server.
+
+## Public demo server
+
+The same server can run as a public demo (`SIGNUP_MODE=open`, see `docs/SERVER.md`): anyone who opens
+its address can make a demo company of their own, and many people use it at once, each company kept apart
+from the others.
+
+- **Create a demo company:** the sample banner's "Create your own demo company", or Settings, Server
+  (`#settings.server.signup`). It makes a login (an email and a password of at least 12 characters) and a
+  blank company named as typed (Start fresh's defaults), puts it on the server and syncs from then on. A
+  browser that already holds a company of its own may upload that one instead of starting blank.
+- **Invite a teammate:** Settings, Server (admins) makes a single-use invite link that works for 7 days,
+  lists the open ones and revokes any of them. Whoever opens one (`#invite.<token>`) makes their own login
+  in that company; the browser then downloads its workspace and syncs. One email belongs to one company,
+  and one browser syncs one company at a time (the invite page offers to disconnect first, and a sign-in
+  with another company's login on a browser that holds a company's copy is refused).
+- **Careers page:** when the server serves careers pages (`CAREERS_HOSTS`, `CAREERS_ORIGIN`), Settings,
+  Server and the Hiring page link to the company's page while it is on (demo companies start with it on,
+  your own workspace with it off; an admin switches it in Settings, Server). Open jobs marked posted show
+  there, and applications arrive in Hiring as candidates marked Inbound: Careers site.
+- **Demo rules:** anyone can sign up, so every sign-up says not to enter real employee or candidate data.
+  Demo companies are deleted after 30 days without activity (`DEMO_EXPIRE_DAYS`). There is no password
+  reset.
 
 ## What it does
 

@@ -27,6 +27,70 @@ export type Conflict = { collection: string; id: string; serverVersion: number |
 
 export type SyncUser = { id: string; email: string; role: string }
 
+/**
+ * The company a login belongs to on the server. A server holds many companies when it runs as a public
+ * demo (SIGNUP_MODE=open); each login belongs to exactly one. slug: the company's part of its careers
+ * page address (lowercase a-z, 0-9 and '-').
+ */
+export type ServerWorkspace = { id: string; name: string; slug: string }
+
+/** Whether anyone may create an account and a company on this server ('open': a public demo server). */
+export type SignupMode = 'open' | 'closed'
+
+/**
+ * GET /api/auth/me. workspace, careersUrl, careersEnabled and signupMode are absent from servers before
+ * companies; careersUrl is null when the server serves no careers pages, and careersEnabled says whether
+ * this company's careers page is public (demo companies start with it on, the owner's own with it off).
+ */
+export type MeResponse = {
+  user: SyncUser
+  workspace?: ServerWorkspace
+  careersUrl?: string | null
+  careersEnabled?: boolean
+  signupMode?: SignupMode
+}
+
+/**
+ * POST /api/auth/login and GET /api/auth/session: the login, and the company it belongs to (absent from
+ * servers before companies). A browser that syncs one company's copy compares it before carrying on.
+ */
+export type LoginResponse = { user: SyncUser; workspace?: ServerWorkspace }
+export type SessionResponse = { user: SyncUser | null; workspace?: ServerWorkspace }
+
+/** GET /api/invites: an open invite link, without its token (the server keeps only a hash). */
+export type OpenInvite = { id: string; createdAt: string; expiresAt: string; createdBy: string | null }
+
+/** PUT /api/workspace/careers: the company's careers page, now on or off. */
+export type CareersSwitchResponse = { careersUrl: string | null; careersEnabled: boolean }
+
+/**
+ * GET /api/auth/signup-mode (public). demoExpireDays: days without activity after which the server
+ * deletes a demo company (0: never); absent from servers that do not say, which use the default.
+ */
+export type SignupModeResponse = { signupMode: SignupMode; demoExpireDays?: number }
+
+/** Days without activity after which a demo company is deleted, when the server does not say (DEMO_EXPIRE_DAYS). */
+export const DEFAULT_DEMO_EXPIRE_DAYS = 30
+
+/** POST /api/auth/signup (201) and POST /api/auth/accept-invite: the new login, signed in, and its company. */
+export type AccountResponse = { user: SyncUser; workspace: ServerWorkspace | null }
+
+/** POST /api/invites: a single-use link to join the signed-in admin's company, and when it stops working (ISO). */
+export type InviteResponse = { url: string; expiresAt: string }
+
+/** GET /api/invites/:token (public): the company the invite joins. */
+export type InviteInfo = { companyName: string }
+
+/** The sign-up rules the server enforces (server/src/auth.ts passwordProblem; companyName 2-80 characters). */
+export const MIN_PASSWORD_LENGTH = 12
+export const MAX_PASSWORD_LENGTH = 1024
+export const MAX_EMAIL_LENGTH = 254
+export const MIN_COMPANY_NAME_LENGTH = 2
+export const MAX_COMPANY_NAME_LENGTH = 80
+
+/** The hash route an invite link opens: PUBLIC_ORIGIN + '/#invite.' + token. */
+export const INVITE_ROUTE = 'invite'
+
 export type HealthResponse = { ok: true; db: 'up'; version: string }
 
 export type WorkspaceSnapshot = {
@@ -45,7 +109,8 @@ export type WorkspaceSnapshot = {
  */
 export type WorkspaceStatus = { empty: true } | { empty: false; workspaceId: string; historyId?: string; seq: number }
 
-export type PutWorkspaceResponse = { historyId?: string; seq: number; versions: Record<string, number> }
+/** workspaceId: the server workspace that now holds the upload (absent from servers before companies). */
+export type PutWorkspaceResponse = { workspaceId?: string; historyId?: string; seq: number; versions: Record<string, number> }
 
 export type ChangesResponse = { resync: true } | { resync?: false; historyId?: string; seq: number; changes: Change[]; more?: boolean }
 

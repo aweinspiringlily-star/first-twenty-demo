@@ -10,6 +10,7 @@ import { usePrefs } from '@/store/prefs'
 import { connect, type FlowResult, type HoldReason, type InspectResult, SAMPLE_MESSAGE, signOut, type SyncUser, useSyncStatus } from '@/sync'
 import { Badge, Button, Callout, Checkbox, ConfirmButton, DescriptionList, Field, focusFirstInvalid, IconButton, Panel, TextInput, toast } from '@/ui'
 import { downloadBackup, setDemoClock } from './DataTab'
+import { revealElement } from './serverFocus'
 import { ButtonLink, Row, RowList } from './kit'
 import {
   compareWorkspaces,
@@ -66,10 +67,19 @@ export function rememberEmail(email: string): void {
   }
 }
 
-/** An error from a server step, announced as soon as it appears. `n` changes per attempt, so a repeat is announced too. */
+/**
+ * An error from a server step, announced as soon as it appears (role="alert") and scrolled into view,
+ * so a person who pressed Enter in a field far above it sees it too. `n` changes per attempt, so a repeat
+ * is announced and shown too. Focus stays where it was: the field to fix.
+ */
 export function FlowError({ error, title }: { error: { message: string; n: number } | null; title: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const n = error?.n
+  useEffect(() => {
+    if (n !== undefined) revealElement(ref.current)
+  }, [n])
   return (
-    <div role="alert" key={error?.n ?? 0} className={error ? undefined : 'sr-only'}>
+    <div ref={ref} role="alert" key={error?.n ?? 0} className={error ? undefined : 'sr-only'}>
       {error && (
         <Callout tone="bad" title={title}>
           {error.message}
@@ -102,6 +112,10 @@ const BUSY_TEXT: Record<string, string> = {
   disconnect: 'Disconnecting.',
   sync: 'Syncing now.',
   discard: 'Discarding the change and putting back what your server has.',
+  signup: 'Creating your login and company. Checking the password can take a few seconds.',
+  newcompany: 'Saving the new company on the server.',
+  join: 'Joining. Checking the password can take a few seconds.',
+  invite: 'Creating an invite link.',
 }
 export function busyText(busy: string | null): string | null {
   return busy ? (BUSY_TEXT[busy] ?? 'Working.') : null
@@ -124,6 +138,7 @@ export function SignInPanel({
   defaultEmail,
   onSignedIn,
   extra,
+  footnote,
 }: {
   id: string
   title: string
@@ -132,6 +147,8 @@ export function SignInPanel({
   onSignedIn: (user: SyncUser) => void
   /** Shown under the form (for example Disconnect while signed out). */
   extra?: ReactNode
+  /** Where the login comes from, under the button (default: the admin login made at setup). */
+  footnote?: ReactNode
 }) {
   const uid = useId().replace(/:/g, '')
   const emailId = `signin-email-${uid}`
@@ -237,7 +254,7 @@ export function SignInPanel({
           </Button>
         </div>
         <p className="text-[13px] text-ink-3">
-          Use the admin email and password created when the server was set up. Forgot it? Whoever runs the server can set a new one.
+          {footnote ?? 'Use the admin email and password created when the server was set up. Forgot it? Whoever runs the server can set a new one.'}
         </p>
       </form>
       {extra && <div className="mt-4 border-t border-line pt-4">{extra}</div>}

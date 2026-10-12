@@ -34,8 +34,13 @@ src/
   features/   one folder per section: home, hiring, people, timeoff (panels), comp, compliance, me, settings
   sync/       optional server sync engine (no UI): collections.ts (shared with the server), diff, outbox,
               API client, status store. Public API in index.ts. Contract: docs/SYNC.md
+  careers/    careers pages (no React): render.ts (the HTML for the static demo site, scripts/careers, and
+              the server's live pages), application.ts (the live apply form), careers.css
 server/       optional API server (Fastify + Postgres, PGlite in development and tests), SQL migrations,
               EC2 deploy kit (server/deploy). Built separately: npm run server:build. Guide: docs/SERVER.md
+              One login belongs to one company (workspace); SIGNUP_MODE=open makes it a public demo where
+              anyone can create a company (held to the demo limits), and CAREERS_HOSTS serves the careers
+              page of every company that has it on.
 ```
 
 The server is optional: with no server the app stays fully local. A feature never calls `/api` directly;
@@ -182,7 +187,7 @@ Pure logic in `src/domain/**` gets unit tests next to it (`*.test.ts`). Use fixe
 | Route | Page | Owner |
 |---|---|---|
 | `#home` | Home (Tonight header, inbox, threshold card, growth chart, this week, hiring pulse, checklists in flight, people cost; First hire kit at headcount 1). Employees land on Me instead. | features/home (+ `src/domain/inbox.ts`) |
-| `#hiring[.jobs\|.candidates\|.offers\|.kits]` | Hiring tabs. `#hiring.add[.<jobId>]` opens quick add; `#hiring.new-job[.<planSlotId>]` opens the new job sheet. | features/hiring |
+| `#hiring[.jobs\|.candidates\|.offers\|.kits]` | Hiring tabs. `#hiring.add[.<jobId>]` opens quick add; `#hiring.new-job[.<planSlotId>]` opens the new job sheet. Synced with a server that serves careers pages, the header links to the company's page (`useServerAccount` from `@/sync`). | features/hiring |
 | `#job.<id>[.board\|.list\|.sweep\|.edit\|.posting]` | Job pipeline (list default under 768px), Sweep mode, edit, posting text (`.edit.posting` edits, then returns to the posting) | features/hiring |
 | `#candidate.<id>[.offer.<applicationId>]` | Candidate profile; `.offer.<applicationId>` (`links.candidateOffer`) puts focus on that application's offer next action | features/hiring |
 | `#people[.directory\|.org\|.wall\|.checklists\|.timeoff\|.contractors]` | People tabs. `#people.new` adds a person; `#people.contractors.new` adds a contractor or advisor. The Time off tab renders `TimeOffTab` from features/timeoff. | features/people |
@@ -192,7 +197,8 @@ Pure logic in `src/domain/**` gets unit tests next to it (`*.test.ts`). Use fixe
 | `#comp[.plan\|.bands\|.table\|.equity\|.cost]` | Comp and plan (admin) | features/comp |
 | `#compliance[.milestones[.<ruleId>]\|.calendar\|.training\|.notices\|.soc2\|.records]` | Compliance (admin) | features/compliance |
 | `#me[.summary\|.job\|.equity\|.timeoff\|.tasks\|.profile\|.roles]` | Me; `#me.timeoff.request` opens the request sheet | features/me |
-| `#settings[.company\|.org\|.hiring\|.templates\|.timeoff\|.rules\|.links\|.data\|.server]` | Settings (admin). `#settings.data.fresh` and `#settings.server.fresh` open Start fresh; `#settings.data.import` focuses Import; `#settings.server` connects to the optional server (docs/SYNC.md). | features/settings |
+| `#settings[.company\|.org\|.hiring\|.templates\|.timeoff\|.rules\|.links\|.data\|.server]` | Settings (admin). `#settings.data.fresh` and `#settings.server.fresh` open Start fresh; `#settings.data.import` focuses Import; `#settings.server` connects to the optional server (docs/SYNC.md); on a demo server (anyone may sign up) it also offers Create a demo company, and `#settings.server.signup` puts focus there. Signed in, it shows the company on the server, invite links and its careers page. | features/settings |
+| `#invite.<token>` | Join a company with an invite link from Settings, Server: a new login in that company, then its workspace into this browser. Any role (no section); the token is the record id, never the tab title. | features/settings (`InvitePage`) |
 
 Aliases: `#timeoff` -> `#people.timeoff`, `#plan` -> `#comp.plan`. Always build links with `links.*`
 from `src/app/router.ts`. The App shell checks section access (`canSeeSection`) before rendering a page.

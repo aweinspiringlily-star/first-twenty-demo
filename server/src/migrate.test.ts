@@ -79,7 +79,7 @@ describe('migrations', () => {
       `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'trusted_devices' ORDER BY column_name`,
     )
     expect(r.rows.map((row) => row.column_name)).toEqual(['created_at', 'expires_at', 'token_hash', 'user_id'])
-    const user = await db.query<{ id: string }>(`INSERT INTO users (email, password_hash) VALUES ('device-test@example.com', 'x') RETURNING id`)
+    const user = await db.query<{ id: string }>(`INSERT INTO users (email, password_hash, workspace_id) VALUES ('device-test@example.com', 'x', 'default') RETURNING id`)
     await db.query(`INSERT INTO trusted_devices (token_hash, user_id, expires_at) VALUES ('h', $1, now() + interval '1 day')`, [user.rows[0].id])
     await db.query('DELETE FROM users WHERE id = $1', [user.rows[0].id])
     expect((await db.query('SELECT 1 FROM trusted_devices')).rows).toEqual([])
@@ -94,7 +94,7 @@ describe('migrations', () => {
     expect(await pendingMigrations(db)).toEqual([])
     const again = await migrate(db)
     expect(again.applied).toEqual([])
-    expect(again.alreadyApplied).toEqual(['001_init.sql', '002_history_and_seq_versions.sql', '003_trusted_devices.sql'])
+    expect(again.alreadyApplied).toEqual(['001_init.sql', '002_history_and_seq_versions.sql', '003_trusted_devices.sql', '004_multitenant.sql', '005_demo_hardening.sql'])
     const ws = await db.query<{ id: string }>('SELECT id FROM workspaces')
     expect(ws.rows).toEqual([{ id: 'default' }])
   })
