@@ -28,6 +28,7 @@ src/
               charts, Tally, Toast). Import from '@/ui'. Add new shared primitives here, not in features.
   lib/        dates (today(), business days, formatting), format (money, pct, plural), id (newId)
   domain/     types.ts (THE data contract) + pure logic, one file or folder per area, each with tests
+              (payrun/: pay calendar, schedule checks, pay run prep, CSV exports and Mark submitted, imported from '@/domain/payrun')
   store/      db.ts (the one store: useDB, mutate, undo, persistence), prefs.ts (per-device prefs)
   themes/     looks (visual skins): registry.ts, one <id>.css per look, optional <id>/decor.tsx, fonts.ts
   data/       law.ts (verified 2026 constants), defaults.ts, blank.ts (solo-founder start), seed/ (sample)
@@ -196,7 +197,7 @@ Pure logic in `src/domain/**` gets unit tests next to it (`*.test.ts`). Use fixe
 | `#person.<id>[.overview\|.job\|.equity\|.timeoff\|.checklists\|.emergency\|.activity\|.offboard\|.change]` | Person profile; `.offboard` and `.change` open those sheets | features/people |
 | `#checklist.<id>` | One checklist | features/people |
 | `#contractor.<id>` | Contractor or advisor | features/people |
-| `#comp[.plan\|.bands\|.table\|.equity\|.cost]` | Comp and plan (admin) | features/comp |
+| `#comp[.plan\|.bands\|.table\|.equity\|.cost\|.payruns[.<period start>]]` | Comp and plan (admin). `#comp.payruns.<YYYY-MM-DD>` (`links.payRun`) opens Pay runs on the pay period starting that day (default: the next payroll to run, `nextPayRunDue`): pay run prep for the payroll provider or PEO (docs/SPEC.md PAY RUN PREP; logic in `src/domain/payrun`). Its marks and provider totals (`company.payRuns`) and settings (`company.payroll`, edited in Settings > Link-outs) are fields of the company document, which syncs by field: no record collection or SQL migration. | features/comp |
 | `#compliance[.milestones[.<ruleId>]\|.calendar\|.training\|.notices\|.soc2\|.records]` | Compliance (admin) | features/compliance |
 | `#me[.summary\|.job\|.equity\|.timeoff\|.tasks\|.profile\|.roles]` | Me; `#me.timeoff.request` opens the request sheet | features/me |
 | `#settings[.company\|.org\|.hiring\|.templates\|.timeoff\|.rules\|.links\|.data\|.server]` | Settings (admin). `#settings.data.fresh` and `#settings.server.fresh` open Start fresh; `#settings.data.import` focuses Import; `#settings.server` connects to the optional server (docs/SYNC.md); on a demo server (anyone may sign up) it also offers Create a demo company, and `#settings.server.signup` puts focus there. Signed in, it shows the company on the server, invite links and its careers page. | features/settings |

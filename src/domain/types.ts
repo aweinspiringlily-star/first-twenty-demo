@@ -66,8 +66,18 @@ export type Company = {
   /** Regular payday in plain words, e.g. 'the 15th and the last day of each month' (Labor Code 2810.5 notice). */
   regularPayday?: string
   eddAccountNumber?: string
-  /** Date of the first W-2 payroll (starts the EDD DE 1 clock). When missing, the earliest start date stands in. */
+  /**
+   * Date of the first W-2 payroll (starts the EDD DE 1 clock). When missing, the earliest start date stands in.
+   * The first pay run marked submitted in Comp and plan > Pay runs fills it with that payday when it is empty.
+   */
   firstPayrollOn?: ISODate
+  /** Pay run prep settings (Settings > Company and Link-outs). Unset fields use the defaults in src/domain/payrun. */
+  payroll?: PayrollPrepSettings
+  /**
+   * Pay periods marked submitted to the provider, and the totals entered from it (Comp and plan > Pay runs).
+   * Its own top-level field so a Mark submitted never collides with a Settings edit (documents merge by field).
+   */
+  payRuns?: PayRunRecord[]
   /** Cash and non-payroll spend, for runway. */
   cashOnHand?: number
   cashAsOf?: ISODate
@@ -103,6 +113,36 @@ export type Company = {
    * blank: '<company name> Bot' (assistantDisplayName in src/domain/assistant.ts). The sample calls it Lark.
    */
   assistantName?: string
+}
+
+/**
+ * Pay run prep settings (docs/SPEC.md PAY RUN PREP; docs/LAW.md w-pay-frequency, w-payday-holiday). The app
+ * prepares each pay period and exports it; the provider or PEO calculates taxes and net pay and moves the money.
+ */
+export type PayrollPrepSettings = {
+  /** 'Run payroll by' this many business days before payday (the provider's cutoff; default 2). */
+  cutoffBusinessDays?: number
+  /** A scheduled payday on a weekend or holiday moves to the business day before (default) or after. */
+  paydayShift?: 'before' | 'after'
+  /**
+   * Semi-monthly paydays: `first` is the day of the month that pays the 1st to the 15th (15 to 26, same month);
+   * `second` pays the 16th to month end (0 = the last day of that month, 1 to 10 = that day of the next month).
+   * Default 15 and 0 (the 15th and the last day).
+   */
+  semiMonthlyPaydays?: { first: number; second: number }
+  /** ADP RUN time sheet import: the company code (IID) and the company's own earnings codes. */
+  adp?: { companyCode?: string; bonusCode?: string; vacationCode?: string; sickCode?: string }
+}
+
+/** One pay period marked submitted to the payroll provider, and the totals entered from its register afterwards. */
+export type PayRunRecord = {
+  periodStart: ISODate
+  periodEnd: ISODate
+  payday: ISODate
+  submittedOn?: ISODate
+  submittedById?: ID | null
+  /** Copied from the provider after payroll ran: gross wages and employer taxes (actuals for Cost and runway). */
+  totals?: { gross: number; employerTaxes: number; enteredOn: ISODate }
 }
 
 /** Employer tax rates and wage bases that Settings may override (fractions, e.g. 0.034 = 3.4%; bases in USD). */
@@ -240,6 +280,8 @@ export type Person = {
   endDate?: ISODate | null
   /** Employee number in order of hire, 1 = founder. */
   hireNumber: number
+  /** The provider's own employee ID (ADP Employee ID or time clock ID), for pay run exports. Optional. */
+  payrollId?: string
   isFounder?: boolean
   /** Candidate and application this person was hired from (ATS link). */
   fromCandidateId?: ID
@@ -877,6 +919,11 @@ export type TimeOffRequest = {
   approverId?: ID
   decidedOn?: ISODate
   decisionNote?: string
+  /**
+   * The policy the request was made on when Admin recorded it as unpaid instead (sick leave before the 90-day
+   * wait). Pay run prep flags those days for exempt staff rather than docking pay (docs/LAW.md w-exempt-deductions-ca).
+   */
+  recordedUnpaidFrom?: ID
 }
 
 export type TimeOffAdjustment = {

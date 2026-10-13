@@ -493,6 +493,16 @@ describe('vacation payout', () => {
     expect(vacationPayout(db, 'p-going', '2026-10-30').asOf).toBe('2026-10-30')
   })
 
+  it('pays accrued vacation even when the policy says it is not paid out (Labor Code 227.3)', () => {
+    const db = baseDB()
+    db.people.push(mkPerson('p-pay', 'Pat', '2026-01-01'))
+    db.comp.push(salary('p-pay', '2026-01-01', 156_000))
+    db.timeOffPolicies = db.timeOffPolicies.map((p) => (p.kind === 'vacation' ? { ...p, paidOutOnExit: false } : p))
+    const out = vacationPayout(db, 'p-pay', '2026-08-31')
+    expect(out).toMatchObject({ hours: 80, rate: 75, amount: 6_000 })
+    expect(out.rows.map((r) => r.policyId)).toEqual(['pol-vacation'])
+  })
+
   it('pays an hourly employee at the hourly rate', () => {
     const db = baseDB()
     db.people.push(mkPerson('p-pt', 'Luis', '2026-07-20', { employmentType: 'part_time', hoursPerWeek: 24, flsa: 'non_exempt' }))
@@ -587,6 +597,8 @@ describe('sick leave before the 90-day wait', () => {
       hours: 8,
       approverId: 'p-founder',
       decisionNote: 'Recorded as unpaid: before the 90-day wait ends on Dec 6, 2026',
+      // The sick policy it was asked on, so pay run prep flags the day instead of docking an exempt salary.
+      recordedUnpaidFrom: 'pol-sick',
     })
     expect(unpaid.activity.at(-1)?.text).toBe("Recorded Aisha Test's time off as unpaid, Mon, Oct 12")
     expect(balances(unpaid, 'p-aisha', '2026-12-07').find((r) => r.policy.id === 'pol-sick')?.used).toBe(0)
@@ -599,6 +611,7 @@ describe('sick leave before the 90-day wait', () => {
       approveAsUnpaid(d, 'tr-early', { date: D })
     })
     expect(kept.timeOffRequests[0]).toMatchObject({ status: 'approved', policyId: 'pol-sick', hours: 0 })
+    expect(kept.timeOffRequests[0].recordedUnpaidFrom).toBeUndefined()
     expect(balances(kept, 'p-aisha', '2026-12-07').find((r) => r.policy.id === 'pol-sick')).toMatchObject({ used: 0, available: 40 })
   })
 })

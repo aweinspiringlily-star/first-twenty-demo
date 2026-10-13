@@ -4,6 +4,8 @@
 #
 # Run it on the instance, in an interactive terminal (ssh -t):
 #   sudo bash server/deploy/set-anthropic-key.sh            asks for the key and turns the assistant on
+#   sudo bash server/deploy/set-anthropic-key.sh --stdin    reads the key from standard input instead (for a
+#                                                           helper that pipes it from the clipboard over ssh)
 #   sudo bash server/deploy/set-anthropic-key.sh --remove   deletes the key and turns the assistant off
 #
 # The key is read without echo, written only to the settings file (root, mode 600, through a temporary file
@@ -51,13 +53,17 @@ if [ "${1:-}" = "--remove" ]; then
   echo "Removed the key. The server restarted and reports $(assistant_state)."
   exit 0
 fi
-[ $# -eq 0 ] || die "Unknown argument: $1 (use --remove to turn the assistant off)."
-[ -t 0 ] || die "Run this in an interactive terminal (ssh -t) so the key can be typed without showing it."
-
 umask 077
-printf 'Paste your Anthropic API key (it will not show), then press Enter: '
-IFS= read -rs key
-echo
+if [ "${1:-}" = "--stdin" ]; then
+  IFS= read -r key || true
+elif [ $# -eq 0 ]; then
+  [ -t 0 ] || die "Run this in an interactive terminal (ssh -t) so the key can be typed without showing it, or pipe it in with --stdin."
+  printf 'Paste your Anthropic API key (it will not show), then press Enter: '
+  IFS= read -rs key
+  echo
+else
+  die "Unknown argument: $1 (use --stdin to pipe the key in, or --remove to turn the assistant off)."
+fi
 key=${key//[[:space:]]/}
 [[ $key =~ ^sk-ant-[A-Za-z0-9_-]{20,}$ ]] || die "That does not look like an Anthropic API key (they start with sk-ant-). Nothing was changed."
 

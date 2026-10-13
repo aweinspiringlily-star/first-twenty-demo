@@ -19,6 +19,7 @@
 import { format } from 'date-fns'
 import type { Draft } from 'immer'
 import { href, links } from '@/app/router'
+import { LAW_SOURCES } from '@/data/law'
 import { canApproveTimeOff, canSeeTimeOffDetail, hiringManagerModeAvailable, isInReportingLine } from '@/domain/access'
 import { ACK_TASK_POLICY, closeAckTasks, setTaskStatus } from '@/domain/checklists/actions'
 import { dueLabel, fileBy, holidayDates, taskFileBy } from '@/domain/checklists/generate'
@@ -64,6 +65,18 @@ import {
   type AttentionReason,
 } from '@/domain/hiring'
 import { markDesignationSent } from '@/domain/lifecycle'
+import {
+  cutoffWords,
+  markPayRunSubmitted,
+  nextPayRunDue,
+  payrollProviderName,
+  payrollSettings,
+  periodHeadline,
+  periodLabel,
+  periodStarting,
+  providerPhrase,
+  unmarkedPayRuns,
+} from '@/domain/payrun'
 import { employedOn, firstName, fullName, getPerson, headcountSeries, incomingOn, isEmployedOn, welcomeEmail } from '@/domain/people'
 import { approveAsUnpaid, approveRequest, hoursLabel, isConfidentialKind, pendingApprovals, serviceWait } from '@/domain/timeoff'
 import { trainingRequirements, TRAINING_LABELS, CRD_COURSE_URL } from '@/domain/trainings'
@@ -119,6 +132,8 @@ export type InboxKind =
   | 'graduation'
   | 'unlock'
   | 'bands'
+  | 'payrun'
+  | 'payrun_unmarked'
 
 /** A mutation the inbox can run, as plain data (applied by applyInboxOp inside mutate). */
 export type InboxOp =
@@ -141,6 +156,8 @@ export type InboxOp =
   | { type: 'acknowledge'; policyId: ID; personId: ID }
   | { type: 'backup_downloaded' }
   | { type: 'add_holidays'; year: number }
+  /** Pay run prep: the period starting on this date was entered in the provider. */
+  | { type: 'payrun_submitted'; periodStart: ISODate }
 
 export type InboxAction =
   /** `toast` names the change; it is also the mutate label (the Undo toast text). */
@@ -165,6 +182,13 @@ export type InboxItem = {
   group: InboxGroup
   /** Legal deadline: red when overdue, cannot be snoozed past dueOn or dismissed. */
   statutory: boolean
+  /**
+   * A deadline that is not legal but still cannot wait (the provider's payroll cutoff): snoozes stop at this date,
+   * the item comes back on it, and it cannot be dismissed. It is never red.
+   */
+  snoozeLimit?: ISODate
+  /** What the snoozeLimit is, for the 'cannot snooze' words ('The payroll cutoff'). */
+  snoozeLimitLabel?: string
   waitingOn: 'you' | 'them'
   /** Who it waits on when waitingOn is 'them' (first name or a role), for the badge. */
   waitingOnName?: string
@@ -254,19 +278,21 @@ const SNOOZE_STEPS: Array<{ label: string; days: number }> = [
 
 /**
  * Snooze choices for an item: 1 day, 3 days, 1 week. Statutory items with a due date are capped at the
- * due date (duplicates collapse), and cannot be snoozed at all once due.
+ * due date (duplicates collapse), and cannot be snoozed at all once due. An item with a snoozeLimit (the
+ * payroll cutoff) is capped the same way at that date.
  */
-export function snoozeOptions(item: Pick<InboxItem, 'statutory' | 'dueOn' | 'group'>, date: ISODate): SnoozeOption[] {
+export function snoozeOptions(item: Pick<InboxItem, 'statutory' | 'dueOn' | 'group' | 'snoozeLimit'>, date: ISODate): SnoozeOption[] {
   const out: SnoozeOption[] = []
   // An overdue legal item with no date (a rule that already applies) cannot wait either.
   if (item.statutory && item.group === 'overdue') return []
+  const limit = item.snoozeLimit ?? (item.statutory ? item.dueOn : undefined)
   for (const s of SNOOZE_STEPS) {
     let until = addDays(date, s.days)
     let capped = false
-    if (item.statutory && item.dueOn) {
-      if (item.dueOn <= date) return []
-      if (until > item.dueOn) {
-        until = item.dueOn
+    if (limit) {
+      if (limit <= date) return []
+      if (until > limit) {
+        until = limit
         capped = true
       }
     }
@@ -276,9 +302,36 @@ export function snoozeOptions(item: Pick<InboxItem, 'statutory' | 'dueOn' | 'gro
   return out
 }
 
-/** Statutory items cannot be dismissed (only done, or not applicable with a note). */
-export function canDismiss(item: Pick<InboxItem, 'statutory'>): boolean {
-  return !item.statutory
+/** Statutory items cannot be dismissed (only done, or not applicable with a note), nor can items with a snoozeLimit. */
+export function canDismiss(item: Pick<InboxItem, 'statutory' | 'snoozeLimit'>): boolean {
+  return !item.statutory && !item.snoozeLimit
+}
+
+/**
+ * Why an item offers no snooze (snoozeOptions is empty), for the row's lock: a legal deadline once due, or the
+ * item's own limit ('The payroll cutoff is today: it cannot be snoozed'), which is not a legal deadline.
+ */
+export function noSnoozeReason(item: Pick<InboxItem, 'statutory' | 'snoozeLimit' | 'snoozeLimitLabel'>, date: ISODate): string {
+  if (!item.statutory && item.snoozeLimit) {
+    const what = item.snoozeLimitLabel ?? 'The deadline'
+    return item.snoozeLimit === date ? `${what} is today: it cannot be snoozed` : `${what} has passed: it cannot be snoozed`
+  }
+  return 'A legal deadline cannot be snoozed once due'
+}
+
+/**
+ * The sentence an expanded row shows when it offers no snooze. A legal deadline says what it does offer instead
+ * (done, or not applicable with a note); an item with its own limit (the payroll cutoff) is not a legal deadline and
+ * has neither action, so it says only why (noSnoozeReason).
+ */
+export function noSnoozeDetail(item: Pick<InboxItem, 'statutory' | 'snoozeLimit' | 'snoozeLimitLabel'>, date: ISODate): string {
+  if (!item.statutory && item.snoozeLimit) return `${noSnoozeReason(item, date)}.`
+  return 'A legal deadline cannot be snoozed once due. Mark it done, or not applicable with a note.'
+}
+
+/** The first letter in capitals, for a phrase that opens a sentence ('time off for 2 people' -> 'Time off ...'). */
+function sentenceCase(text: string): string {
+  return text ? text[0].toUpperCase() + text.slice(1) : text
 }
 
 /** Hides an item until a date. Statutory items are capped at their due date when shown (see isHidden). */
@@ -298,12 +351,16 @@ export function restoreItem(draft: Draft<DB> | DB, key: string): void {
   delete draft.inboxState[key]
 }
 
-/** True while a snooze or dismissal hides the item on the date. Statutory items reappear on their due date. */
-export function isHidden(state: InboxState | undefined, item: Pick<InboxItem, 'statutory' | 'dueOn' | 'group'>, date: ISODate): boolean {
+/**
+ * True while a snooze or dismissal hides the item on the date. Statutory items reappear on their due date, and
+ * items with a snoozeLimit on that date.
+ */
+export function isHidden(state: InboxState | undefined, item: Pick<InboxItem, 'statutory' | 'dueOn' | 'group' | 'snoozeLimit'>, date: ISODate): boolean {
   if (!state) return false
-  if (state.dismissedOn && !item.statutory) return true
+  if (state.dismissedOn && canDismiss(item)) return true
   if (state.snoozedUntil && state.snoozedUntil > date) {
     if (item.statutory && ((item.dueOn && item.dueOn <= date) || item.group === 'overdue')) return false
+    if (item.snoozeLimit && item.snoozeLimit <= date) return false
     return true
   }
   return false
@@ -1806,6 +1863,88 @@ function holidayItems(ctx: Ctx): InboxItem[] {
   ]
 }
 
+// ---------------------------------------------------------------------------------------------
+// Source: pay run prep (docs/SPEC.md PAY RUN PREP)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Admin: 'Run payroll by <cutoff>' for the next pay period not marked submitted. The cutoff is the provider's
+ * deadline (Settings), not a legal one, so the item is never red; it cannot be snoozed past the cutoff or
+ * dismissed. The payday is the legal date (Labor Code 204, docs/LAW.md w-pay-frequency, w-late-pay-penalty):
+ * once the cutoff has passed the item leads Overdue, ahead of the legal rows, until payday (leadsOverdue).
+ */
+function payRunItems(ctx: Ctx): InboxItem[] {
+  const { db, date } = ctx
+  if (ctx.scope !== 'admin') return []
+  const period = nextPayRunDue(db, date)
+  if (!period || period.cutoff > addDays(date, HORIZON_DAYS)) return []
+  const provider = providerPhrase(db.company)
+  const label = periodLabel(period)
+  const settings = payrollSettings(db.company)
+  const late = period.cutoff < date
+  const moved = period.payday !== period.scheduledPayday ? ` (moved from ${dayText(period.scheduledPayday)}, not a business day)` : ''
+  return [
+    {
+      key: `payrun:${period.start}`,
+      kind: 'payrun',
+      title: late
+        ? `Run the ${label} payroll now: the cutoff was ${dayText(period.cutoff)}, payday is ${dayText(period.payday)}`
+        : `Run the ${label} payroll in ${provider} by ${dayText(period.cutoff)}`,
+      detail: `Payday ${dayText(period.payday)}${moved}. ${sentenceCase(periodHeadline(db, period))}. Export the prep, enter it in ${provider}, then mark it submitted.`,
+      dueOn: period.cutoff,
+      dueNote: `${payrollProviderName(db.company) ? `${provider}'s cutoff` : 'The provider cutoff'}, ${cutoffWords(settings.cutoffBusinessDays)} (Settings, Link-outs). The payday is the legal deadline: a missed payday can cost $100 per employee, more if it happens again (Labor Code 210).`,
+      group: groupFor(period.cutoff, date),
+      statutory: false,
+      snoozeLimit: period.cutoff,
+      snoozeLimitLabel: 'The payroll cutoff',
+      waitingOn: 'you',
+      href: links.payRun(period.start),
+      primary: { kind: 'navigate', label: 'Open pay run prep', href: links.payRun(period.start) },
+      more: [
+        {
+          kind: 'mutate',
+          label: `Mark submitted to ${provider}`,
+          op: { type: 'payrun_submitted', periodStart: period.start },
+          toast: `Marked the ${label} payroll submitted`,
+        },
+      ],
+      minutes: 15,
+      citation: { label: LAW_SOURCES.lc204.label, url: LAW_SOURCES.lc204.url },
+      refs: {},
+    },
+  ]
+}
+
+/**
+ * Admin: a payday passed in the last UNMARKED_REMINDER_DAYS days and nobody marked its payroll submitted. Quiet
+ * (amber, snoozable, dismissable): most often the payroll ran and only the mark is missing, and the mark also
+ * records the first payroll date for the EDD clock (docs/LAW.md a-edd-register-1).
+ */
+function payRunUnmarkedItems(ctx: Ctx): InboxItem[] {
+  const { db, date } = ctx
+  if (ctx.scope !== 'admin') return []
+  const provider = providerPhrase(db.company)
+  return unmarkedPayRuns(db, date).map((period): InboxItem => {
+    const label = periodLabel(period)
+    return {
+      key: `payrun-unmarked:${period.start}`,
+      kind: 'payrun_unmarked',
+      title: `Did the ${label} payroll run? Payday was ${dayText(period.payday)}`,
+      detail: `Nothing is marked for it here. If it ran in ${provider}, mark it submitted. If it did not, run it now: a late payday can cost $100 per employee (Labor Code 210).`,
+      dueOn: period.payday,
+      group: groupFor(period.payday, date),
+      statutory: false,
+      waitingOn: 'you',
+      href: links.payRun(period.start),
+      primary: { kind: 'mutate', label: 'Mark submitted', op: { type: 'payrun_submitted', periodStart: period.start }, toast: `Marked the ${label} payroll submitted` },
+      more: [{ kind: 'navigate', label: 'Open pay run prep', href: links.payRun(period.start) }],
+      minutes: 2,
+      citation: { label: LAW_SOURCES.lc210.label, url: LAW_SOURCES.lc210.url },
+      refs: {},
+    }
+  })
+}
+
 /** Shown once (dismiss hides it for good) when employees plus accepted offers reach 20. */
 function graduationItems(ctx: Ctx): InboxItem[] {
   const { db, date } = ctx
@@ -1848,9 +1987,19 @@ export function firstHireKitShown(db: DB, date: ISODate): boolean {
 
 const GROUP_ORDER: Record<InboxGroup, number> = { overdue: 0, this_week: 1, coming_up: 2 }
 
+/**
+ * An overdue row with a snoozeLimit that has passed (a payroll past its cutoff, still before payday) leads Overdue,
+ * ahead of the legal rows: its legal date (the payday) is today or still ahead and can still be met, while the legal
+ * rows are already late. Home shows the first rows of a group before 'Show more', so it must be on top to be seen.
+ */
+function leadsOverdue(i: InboxItem): boolean {
+  return i.group === 'overdue' && !i.statutory && !!i.snoozeLimit
+}
+
 function compareItems(a: InboxItem, b: InboxItem): number {
   return (
     GROUP_ORDER[a.group] - GROUP_ORDER[b.group] ||
+    Number(leadsOverdue(b)) - Number(leadsOverdue(a)) ||
     Number(b.statutory && b.group === 'overdue') - Number(a.statutory && a.group === 'overdue') ||
     (a.dueOn ?? '9999').localeCompare(b.dueOn ?? '9999') ||
     Number(a.waitingOn === 'them') - Number(b.waitingOn === 'them') ||
@@ -1888,6 +2037,8 @@ export function inboxItems(db: DB, viewer: Viewer, date: ISODate, opts: InboxOpt
     ...backupItems(ctx),
     ...holidayItems(ctx),
     ...graduationItems(ctx),
+    ...payRunItems(ctx),
+    ...payRunUnmarkedItems(ctx),
   ]
   const seen = new Set<string>()
   const out = all.filter((i) => {
@@ -2035,6 +2186,12 @@ export function applyInboxOp(draft: Draft<DB>, op: InboxOp, ctx: { date: ISODate
     case 'backup_downloaded':
       draft.meta.lastExportedOn = nowISO()
       return { ok: true }
+    case 'payrun_submitted': {
+      const period = periodStarting(draft as DB, op.periodStart)
+      if (!period) return { ok: false, reason: 'That pay period is no longer on the pay schedule.' }
+      const done = markPayRunSubmitted(draft, period, { date, actorId })
+      return done.ok ? { ok: true } : done
+    }
     case 'add_holidays': {
       const roll = rolloverHolidays(draft.holidays, op.year)
       if (roll.add.length === 0) return { ok: false, reason: `The ${op.year} holidays are already listed.` }

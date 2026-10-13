@@ -240,7 +240,7 @@ export function applyCompany(db: Draft<DB>): void {
   c.phone = '(408) 555-0110'
   // The in-app assistant (src/domain/assistant.ts); a new company leaves it unset and gets '<name> Bot'.
   c.assistantName = 'Lark'
-  c.regularPayday = 'the 15th and the last day of each month'
+  // No typed regular payday: the wage notice prints the pay calendar's words (paydayWords), so it follows Settings.
   c.eddAccountNumber = '000-0000-0 (placeholder)'
   c.firstPayrollOn = '2025-05-15'
   c.cashOnHand = 13_400_000

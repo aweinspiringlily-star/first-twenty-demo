@@ -11,7 +11,7 @@
 //                      Both need 30 days of service and allow 5 days per event; reproductive loss is capped at
 //                      20 days in 12 months (Gov Code 12945.6, 12945.7). checkRequest warns on each.
 import type { Draft } from 'immer'
-import { compOrFirst, hourlyRateOf } from '@/domain/pay'
+import { compOrFirst, hourlyRateOf, payPeriodsPerYear } from '@/domain/pay'
 import { fullName, headcountOn, priorStint } from '@/domain/people'
 import type { DB, ID, Person, TimeOffKind, TimeOffPolicy, TimeOffRequest } from '@/domain/types'
 import { addDays, addMonths, daysBetween, fmtDate, fmtDay, type ISODate, isWeekday, nowISO } from '@/lib/dates'
@@ -353,7 +353,7 @@ export function payPeriods(schedule: DB['company']['paySchedule'], from: ISODate
 }
 
 function periodsPerYear(schedule: DB['company']['paySchedule']): number {
-  return schedule === 'monthly' ? 12 : schedule === 'biweekly' ? 26 : 24
+  return payPeriodsPerYear(schedule)
 }
 
 type AccrualResult = { earned: number; used: number; adjustments: number; balance: number; capReached: boolean; perPeriod: number }
@@ -870,6 +870,8 @@ export function approveAsUnpaid(draft: Draft<DB>, requestId: ID, opts: DecisionO
   if (!req || !person || req.status !== 'pending') return false
   const wait = pendingWait(db, requestId)
   const unpaid = unpaidPolicyFor(db, person, req.startDate)
+  // Keep the policy it was asked on: pay run prep never docks an exempt salary for unpaid sick days.
+  if (unpaid && unpaid.id !== req.policyId) req.recordedUnpaidFrom = req.policyId
   if (unpaid) req.policyId = unpaid.id
   else req.hours = 0
   req.status = 'approved'
@@ -928,7 +930,10 @@ export function vacationPayout(db: DB, personId: ID, askedFor: ISODate): Vacatio
   const asOfLast: Person = { ...person, endDate: lastDay }
   const rows: VacationPayout['rows'] = []
   for (const policy of policiesFor(db, person, lastDay)) {
-    if (!policy.paidOutOnExit) continue
+    // Accrued vacation is paid whatever the policy says (Labor Code 227.3, as payoutRules says); anything else only
+    // when the policy pays it out.
+    const accruedVacation = policy.kind === 'vacation' && (policy.method === 'accrual' || policy.method === 'frontload')
+    if (!policy.paidOutOnExit && !accruedVacation) continue
     let hours = 0
     if (policy.method === 'accrual') hours = simulateAccrual(db, policy, asOfLast, lastDay, true).balance
     else if (policy.method === 'frontload') hours = frontloadRow(db, policy, asOfLast, lastDay).balance ?? 0

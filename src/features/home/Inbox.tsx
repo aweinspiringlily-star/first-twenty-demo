@@ -16,6 +16,8 @@ import {
   type InboxGroup,
   type InboxItem,
   inboxItems,
+  noSnoozeDetail,
+  noSnoozeReason,
   snoozeItem,
   snoozeOptions,
   visibleForFilter,
@@ -361,7 +363,7 @@ function InboxRow({
               <ItemText text={item.detail} />
             </p>
           )}
-          {snoozeItems.length === 0 && <p className="text-[13px] text-ink-3">A legal deadline cannot be snoozed once due. Mark it done, or not applicable with a note.</p>}
+          {snoozeItems.length === 0 && <p className="text-[13px] text-ink-3">{noSnoozeDetail(item, date)}</p>}
           {(item.citation || item.externalLink || dueNote) && (
             <div className="flex flex-wrap items-center gap-1.5">
               {item.citation && <CitationChip label={item.citation.label} url={item.citation.url} />}
@@ -423,11 +425,11 @@ function InboxRow({
               )}
             />
           ) : (
-            // A legal deadline that is due cannot wait: say so instead of offering an empty menu.
-            <span className="inline-flex h-11 items-center gap-1.5 px-2 text-[13px] font-semibold text-ink-3" title="A legal deadline cannot be snoozed once due">
+            // A legal deadline that is due (or the payroll cutoff) cannot wait: say so instead of offering an empty menu.
+            <span className="inline-flex h-11 items-center gap-1.5 px-2 text-[13px] font-semibold text-ink-3" title={noSnoozeReason(item, date)}>
               <Icon name="lock" size={15} />
               <span className="hidden @[860px]:inline">Cannot snooze</span>
-              <span className="sr-only">A legal deadline cannot be snoozed once due</span>
+              <span className="sr-only">{noSnoozeReason(item, date)}</span>
             </span>
           )}
           {moreItems.length > 0 && (

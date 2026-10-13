@@ -97,6 +97,8 @@ export type HireOffer = {
   salary?: number
   hourlyRate?: number
   variablePct?: number
+  /** A sign-on bonus, paid with the first check (only on hires that go through the real Hire flow). */
+  signOnBonus?: number
   equity: number
   hoursPerWeek?: number
   draftedById: ID
@@ -870,7 +872,7 @@ export function historicalHires(): HireSpec[] {
       accepted: '2026-09-30',
       start: '2026-10-19',
       cand: { source: 'outbound', sourceDetail: 'LinkedIn Recruiter', place: ['Mountain View, CA', 'America/Los_Angeles'], currentTitle: 'Senior data engineer', currentCompany: 'BILL', summary: 'Built NetSuite and QuickBooks Online sync services with safe reruns and per-record lineage. Sourced for the backfill.', desiredPay: 195_000, sponsorship: 'no', phone: '(650) 555-0143' },
-      offer: { title: 'Senior data engineer', salary: 195_000, equity: 30_000, draftedById: 'p-tomas', draftedByRole: 'manager', approverId: 'p-founder', managerId: 'p-tomas' },
+      offer: { title: 'Senior data engineer', salary: 195_000, signOnBonus: 10_000, equity: 30_000, draftedById: 'p-tomas', draftedByRole: 'manager', approverId: 'p-founder', managerId: 'p-tomas' },
       funnel: { applied: 228, intro: 19, technical: 8, onsite: 4, offers: 1 },
       others: [
         { reached: 'onsite', status: 'rejected', reason: 'position_filled', keepWarm: true, note: 'Solid ERP experience; keep warm for the platform team.' },

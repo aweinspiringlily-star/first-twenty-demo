@@ -679,7 +679,7 @@ describe('companies on one server', () => {
       await db.query(`UPDATE workspaces SET last_active_at = now() - interval '31 days' WHERE id = $1`, [idle.workspace.id])
       await db.query(`INSERT INTO sessions (token_hash, user_id, expires_at) SELECT 'old', id, now() - interval '1 minute' FROM users WHERE email = 'idle@example.com'`)
       const done = await housekeeping(db, { sessionIdleHours: 12, demoExpireDays: 30 })
-      expect(done).toEqual({ sessions: 1, expiredWorkspaces: 1, prunedChanges: 0, invites: 0 })
+      expect(done).toEqual({ sessions: 1, expiredWorkspaces: 1, prunedChanges: 0, invites: 0, assistantUsage: 0 })
       // A failing step does not stop the others; the error comes out at the end.
       const other = await filledDemo('other@example.com', 'Other')
       await db.query(`UPDATE workspaces SET last_active_at = now() - interval '31 days' WHERE id = $1`, [other.workspace.id])

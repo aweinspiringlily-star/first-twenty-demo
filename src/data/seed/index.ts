@@ -1,7 +1,7 @@
 // The Ledgerlark sample (fictional), anchored to Friday 2026-10-09. See docs/SAMPLE.md.
 // Order matters: company and org first, then people (with comp, checklists, trainings), equity,
-// time off and leave, contractors and advisors, compliance state, and finally hiring, which hires
-// the two incoming people through the real Hire flow (src/domain/lifecycle.ts).
+// time off and leave, contractors and advisors, compliance state, hiring, which hires the two incoming
+// people through the real Hire flow (src/domain/lifecycle.ts), and last the pay run situations (./payroll).
 import { produce } from 'immer'
 import { blankDB } from '@/data/blank'
 import type { DB } from '@/domain/types'
@@ -11,6 +11,7 @@ import { applyCompliance } from './compliance'
 import { applyContractors } from './contractors'
 import { applyEquity } from './equity'
 import { applyHiring } from './hiring'
+import { applyPayroll } from './payroll'
 import { applyPeople } from './people'
 import { applyTimeoff } from './timeoff'
 
@@ -44,6 +45,7 @@ function build(): DB {
     applyContractors(d)
     applyCompliance(d)
     applyHiring(d)
+    applyPayroll(d)
     d.meta = { createdOn: SAMPLE_ANCHOR, sample: true, sampleAnchor: SAMPLE_ANCHOR }
   })
   return db

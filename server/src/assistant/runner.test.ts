@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest'
 import type { AssistantClient, AssistantMessageStream, AssistantRunner, AssistantRunnerParams } from './client'
 import { fakeMessage, FakeStream } from './fake'
 import { contextText, systemPrompt } from './prompt'
+import { billedInput } from './quota'
 import type { WorkspaceReader } from './reader'
 import { type ChatOutcome, fallbackEcho, MAX_ITERATIONS, runChat, runnerParams, turnTokens } from './runner'
 import { assistantTools, TOOL_NAMES } from './tools'
@@ -468,6 +469,11 @@ describe('turnTokens', () => {
     expect(
       turnTokens(
         u({
+          // The top-level fields are the attempt that served the turn, as the API reports them.
+          input_tokens: 950,
+          output_tokens: 40,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
           iterations: [
             { type: 'message', input_tokens: 10, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 900, model: 'claude-opus-5-5', cache_creation: null },
             { type: 'fallback_message', input_tokens: 950, output_tokens: 40, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, model: 'claude-opus-4-8', cache_creation: null },
@@ -476,5 +482,57 @@ describe('turnTokens', () => {
       ),
     ).toEqual({ input: 960, cacheWrite: 0, cacheRead: 900, output: 40 })
     expect(turnTokens(null)).toEqual({ input: 0, cacheWrite: 0, cacheRead: 0, output: 0 })
+  })
+
+  const entry = (type: 'message' | 'fallback_message', input: number, cacheWrite: number, cacheRead: number, output: number, model = 'claude-opus-5-5') => ({
+    type,
+    input_tokens: input,
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cacheRead,
+    output_tokens: output,
+    model,
+    cache_creation: null,
+  })
+  const usage = (input: number, cacheWrite: number, cacheRead: number, output: number, iterations: ReturnType<typeof entry>[] | null = null) =>
+    ({ input_tokens: input, cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead, output_tokens: output, iterations }) as BetaUsage
+
+  it('keeps the whole billed input of a cached turn: the uncached tail, the cache write and the cache read', () => {
+    // A turn with the conversation cached: 6 tokens at full price, the prompt written to and read from the cache.
+    const t = turnTokens(usage(6, 650, 14_200, 380))
+    expect(t).toEqual({ input: 6, cacheWrite: 650, cacheRead: 14_200, output: 380 })
+    expect(billedInput(t)).toBe(14_856)
+    // The same with usage.iterations: one `message` entry, the same numbers.
+    expect(turnTokens(usage(6, 650, 14_200, 380, [entry('message', 6, 650, 14_200, 380)]))).toEqual(t)
+  })
+
+  it("sums every kind over each attempt of a fallback turn, the declined model's cache reads and writes included", () => {
+    // The requested model read the cached prompt and declined part way; the fallback model (no cache of its own) served the turn.
+    const declined = entry('message', 4, 300, 14_200, 25)
+    const served = entry('fallback_message', 14_504, 0, 0, 420, 'claude-opus-5')
+    const t = turnTokens(usage(14_504, 0, 0, 420, [declined, served]))
+    expect(t).toEqual({ input: 14_508, cacheWrite: 300, cacheRead: 14_200, output: 445 })
+    expect(billedInput(t)).toBe(29_008)
+  })
+
+  it('never counts a kind below the top-level count when usage.iterations is a stale copy from message_start', () => {
+    // The final message_delta did not repeat iterations: the copy from message_start has no output yet, and
+    // this one also carried no cache counts. The top-level fields, which the SDK updates, stand for those kinds.
+    expect(turnTokens(usage(6, 650, 14_200, 380, [entry('message', 6, 0, 0, 1)]))).toEqual({ input: 6, cacheWrite: 650, cacheRead: 14_200, output: 380 })
+  })
+})
+
+describe('the tokens of a message', () => {
+  it('adds up the billed input of every turn, by kind: the live case of 12 input tokens over two requests', async () => {
+    const cached = (msg: BetaMessage, input: number, cacheWrite: number, cacheRead: number) => {
+      msg.usage = { ...msg.usage, input_tokens: input, cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead }
+      return msg
+    }
+    const { client } = scripted([
+      cached(fakeMessage([thinking(), toolUse('t1')], 'tool_use', 0), 6, 14_200, 0),
+      cached(fakeMessage([thinking(), text('Nobody starts next week.')], 'end_turn', 0), 6, 650, 14_200),
+    ])
+    const o = done(await base(client).run())
+    expect(o.usage).toMatchObject({ input: 12, cacheWrite: 14_850, cacheRead: 14_200 })
+    expect(billedInput(o.usage)).toBe(29_062)
   })
 })

@@ -240,6 +240,47 @@ describe('the real SDK tool runner', () => {
     expect(outcome).toMatchObject({ kind: 'aborted', charged: true })
   })
 
+  it("counts the whole billed input the SDK's stream reports, cache writes and reads apart, over every attempt", async () => {
+    /** A message whose usage is `usage` (message_start carries all of it, iterations included). */
+    const withUsage = (msg: BetaMessage, usage: Partial<BetaMessage['usage']>) => {
+      msg.usage = { ...msg.usage, ...usage }
+      return msg
+    }
+    const iteration = (type: string, input: number, cacheWrite: number, cacheRead: number, output: number) => ({
+      type,
+      input_tokens: input,
+      cache_creation_input_tokens: cacheWrite,
+      cache_read_input_tokens: cacheRead,
+      output_tokens: output,
+      model: 'claude-opus-5-5',
+      cache_creation: null,
+    })
+    const reply = (t: string) => [{ type: 'text', text: t, citations: null } as BetaContentBlock]
+    const { fetch } = apiLike([
+      // A cached question: 6 tokens at full price. The final message_delta does not repeat iterations, so the
+      // copy from message_start (no output yet) stays in the message the SDK hands back.
+      withUsage(fakeMessage(reply('Nobody starts next week.'), 'end_turn', 0), {
+        input_tokens: 6,
+        cache_creation_input_tokens: 650,
+        cache_read_input_tokens: 14_200,
+        output_tokens: 380,
+        iterations: [iteration('message', 6, 650, 14_200, 0)] as BetaMessage['usage']['iterations'],
+      }),
+      // A turn a refusal fallback served: the declined attempt read the cache, the fallback model did not.
+      withUsage(fakeMessage(reply('Here is the policy.'), 'end_turn', 0), {
+        input_tokens: 14_504,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 420,
+        iterations: [iteration('message', 4, 300, 14_200, 25), iteration('fallback_message', 14_504, 0, 0, 420)] as BetaMessage['usage']['iterations'],
+      }),
+    ])
+    const first = await chatWith(fetch, new AbortController().signal)
+    expect(first).toMatchObject({ kind: 'done', usage: { input: 6, cacheWrite: 650, cacheRead: 14_200, output: 380 } })
+    const second = await chatWith(fetch, new AbortController().signal)
+    expect(second).toMatchObject({ kind: 'done', usage: { input: 14_508, cacheWrite: 300, cacheRead: 14_200, output: 445 } })
+  })
+
   it('does not count a request the API refused with an HTTP error, and counts one whose stream broke with an error event', async () => {
     const refusing = (async () =>
       new Response(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Number of request tokens has exceeded your per-minute rate limit' } }), {

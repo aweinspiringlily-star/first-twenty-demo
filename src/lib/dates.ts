@@ -279,6 +279,36 @@ export function federalHolidays(year: number): ISODate[] {
   ].sort()
 }
 
+/**
+ * The days the Federal Reserve Banks close in a year (docs/LAW.md w-bank-holidays), when direct deposits do
+ * not settle: the same 11 holidays as federalHolidays, but only a Sunday holiday moves (to the Monday after).
+ * For a Saturday holiday the Reserve Banks stay open the Friday before, so it has no weekday closure at all
+ * (Jul 4, 2026; Jun 19 and Dec 25, 2027). Pay calendars use this list, never federalHolidays.
+ */
+export function bankHolidays(year: number): ISODate[] {
+  const iso = (m0: number, d: number) => `${year}-${String(m0 + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  const fixed = (m0: number, d: number): ISODate | null => {
+    const wd = new Date(Date.UTC(year, m0, d)).getUTCDay()
+    if (wd === 6) return null
+    if (wd === 0) return toISODate(new Date(year, m0, d + 1))
+    return iso(m0, d)
+  }
+  const days: Array<ISODate | null> = [
+    fixed(0, 1), // New Year's Day
+    iso(0, nthWeekdayOfMonth(year, 0, 1, 3)), // Martin Luther King Jr. Day
+    iso(1, nthWeekdayOfMonth(year, 1, 1, 3)), // Washington's Birthday
+    iso(4, lastWeekdayOfMonth(year, 4, 1)), // Memorial Day
+    fixed(5, 19), // Juneteenth
+    fixed(6, 4), // Independence Day
+    iso(8, nthWeekdayOfMonth(year, 8, 1, 1)), // Labor Day
+    iso(9, nthWeekdayOfMonth(year, 9, 1, 2)), // Columbus Day
+    fixed(10, 11), // Veterans Day
+    iso(10, nthWeekdayOfMonth(year, 10, 4, 4)), // Thanksgiving
+    fixed(11, 25), // Christmas Day
+  ]
+  return days.filter((d): d is ISODate => d !== null).sort()
+}
+
 /** Federal holidays from the year before to the year after a date (enough for any short deadline). */
 export function federalHolidaysAround(d: ISODate): ISODate[] {
   const y = Number(d.slice(0, 4))

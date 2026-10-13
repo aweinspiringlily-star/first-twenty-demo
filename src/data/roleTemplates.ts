@@ -664,3 +664,32 @@ export const SAMPLE_ROLE_TEMPLATES: RoleTemplate[] = [
     emailTemplateIds: EMAILS,
   },
 ]
+
+/**
+ * Names these templates had before posting qualifiers moved out of the name into `hint` (October 2026).
+ * Workspaces saved before then (the sample, and a fresh start, which got this set until the starter set
+ * existed) still carry them in settings.roleTemplates; src/store/db.ts migrate renames them on load with
+ * upgradeRoleTemplateNames.
+ */
+export const RENAMED_ROLE_TEMPLATES: ReadonlyArray<{ from: string; name: string; hint: string }> = [
+  { from: 'Customer success manager (CPA preferred)', name: 'Customer success manager', hint: 'CPA preferred' },
+  { from: 'Accounting lead (CPA)', name: 'Accounting lead', hint: 'CPA' },
+]
+
+/**
+ * Gives each template that still has an old default name, exactly, the current name and the qualifier as
+ * its hint. A name the user changed, by as much as a space, stays as it is. So does a template that has a
+ * hint: hints came with the rename (nothing in the app edits them), so a saved template with an old name
+ * has none and a renamed one has one, which makes this happen once per template: one renamed back to the
+ * old name by hand keeps it. Returns `templates` itself when nothing changes, so running it again is free.
+ */
+export function upgradeRoleTemplateNames(templates: RoleTemplate[]): RoleTemplate[] {
+  let out: RoleTemplate[] | null = null
+  templates.forEach((t, i) => {
+    const rename = t && !t.hint ? RENAMED_ROLE_TEMPLATES.find((r) => r.from === t.name) : undefined
+    if (!rename) return
+    out ??= templates.slice()
+    out[i] = { ...t, name: rename.name, hint: rename.hint }
+  })
+  return out ?? templates
+}

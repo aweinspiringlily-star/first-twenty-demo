@@ -1307,6 +1307,29 @@ html[data-look="comic"] {
     padding-inline: 12px;
   }
 
+  /*
+    A long column head wraps to two lines instead of widening its column (as Sleek's do): the lettered
+    caps run wide, and a half-width register (the 409A table in Comp and plan, Equity) was 14px wider
+    than its panel at 1280 and 64px at 1180 with every head on one line. Heads sit on the bottom rule.
+  */
+  :scope[data-look="comic"] .ft-table__th {
+    white-space: normal;
+    line-height: 1.2;
+    vertical-align: bottom;
+  }
+
+  /* A sort head stays a 40px target and grows for a second line; its words keep to the column's edge. */
+  :scope[data-look="comic"] .ft-table__sort {
+    min-height: 40px;
+    height: auto;
+    padding-block: 4px;
+    text-align: inherit;
+  }
+
+  :scope[data-look="comic"] .ft-table__th.text-right > .ft-table__sort {
+    justify-content: flex-end;
+  }
+
   :scope[data-look="comic"] .ft-table--dense .ft-table__th,
   :scope[data-look="comic"] .ft-table--dense .ft-table__cell {
     padding-inline: 9px;

@@ -29,6 +29,10 @@
 // conversation, a fixed tool list). Should a deploy change them anyway, the API refuses a later question of
 // an older conversation (400), which comes out as bad_conversation: the app starts a new one.
 //
+// Tokens (ChatOutcome `usage`, recorded by quota.ts recordTokens): the whole billed input of every request
+// the message made, failed ones included, each kind apart (turnTokens): input_tokens is only the uncached
+// tail after the last cache breakpoint, so most of a prompt shows as cache writes and cache reads.
+//
 // Counting (ChatOutcome `charged`): a message counts against the day once a request went out for it (the
 // SDK sends the request as the runner yields its turn), whether or not the browser stays to read the
 // answer. It does not count when nothing was sent, or when the API turned the request away with an HTTP
@@ -116,7 +120,17 @@ const addTokens = (a: ChatUsage, b: ChatUsage): ChatUsage => ({
 
 type UsageLike = { input_tokens?: number | null; cache_creation_input_tokens?: number | null; cache_read_input_tokens?: number | null; output_tokens?: number | null }
 
-/** Every token a turn used, by kind: each attempt in usage.iterations when present (a fallback adds one), else the totals. */
+/**
+ * Every token a turn used, by kind: the billed input as input_tokens (the uncached tail),
+ * cache_creation_input_tokens and cache_read_input_tokens, and the output. Summed over each attempt in
+ * usage.iterations when present (a refusal fallback adds one: the declined attempt's `message` entry, then
+ * the `fallback_message` that served the turn), else the totals.
+ *
+ * The top-level fields cover the attempt that produced the message, so the sum over every attempt is never
+ * below them, kind by kind. Each kind is at least its top-level count all the same: a stream whose final
+ * message_delta does not repeat `iterations` leaves the copy from message_start in place (the SDK only
+ * overwrites what the event carries), and that copy's output is from before the turn wrote anything.
+ */
 export function turnTokens(usage: BetaUsage | null | undefined): ChatUsage {
   if (!usage) return { ...NO_TOKENS }
   const one = (u: UsageLike): ChatUsage => ({
@@ -125,9 +139,16 @@ export function turnTokens(usage: BetaUsage | null | undefined): ChatUsage {
     cacheRead: u.cache_read_input_tokens ?? 0,
     output: u.output_tokens ?? 0,
   })
+  const top = one(usage)
   const attempts = (usage.iterations ?? []).filter((i): i is Extract<typeof i, { input_tokens: number; output_tokens: number }> => 'input_tokens' in i && 'output_tokens' in i)
-  if (attempts.length > 0) return attempts.map(one).reduce(addTokens, { ...NO_TOKENS })
-  return one(usage)
+  if (attempts.length === 0) return top
+  const all = attempts.map(one).reduce(addTokens, { ...NO_TOKENS })
+  return {
+    input: Math.max(all.input, top.input),
+    cacheWrite: Math.max(all.cacheWrite, top.cacheWrite),
+    cacheRead: Math.max(all.cacheRead, top.cacheRead),
+    output: Math.max(all.output, top.output),
+  }
 }
 
 /** Blocks of the declined model's partial output that echo back (the rest before the last `fallback` block does not). */

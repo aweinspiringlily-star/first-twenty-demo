@@ -1,13 +1,14 @@
 // The daily limits: per company and for the whole server, per UTC day, counted under a lock so parallel chats
 // cannot pass a limit together, the server's last quarter kept for companies that have asked little, with
-// tokens added afterwards by kind and a message given back when no request went out for it. Also:
-// migration 006's table and what deleting a company does to its rows.
+// tokens added afterwards by kind (the whole billed input: full price, cache writes, cache reads) and a
+// message given back when no request went out for it. Also: migration 006's table, what deleting a company
+// does to its rows, and the old days the daily housekeeping prunes.
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { Db } from '../db'
 import { HttpError } from '../errors'
 import { makeTestDb, resetDb } from '../test/helpers'
 import { deleteDemoWorkspace } from '../workspaces'
-import { globalReserve, LIGHT_USE, recordTokens, releaseMessage, remainingToday, reserveMessage, usageDay } from './quota'
+import { billedInput, globalReserve, LIGHT_USE, pruneUsage, recordTokens, releaseMessage, remainingToday, reserveMessage, usageDay } from './quota'
 
 let db: Db
 const NOON = new Date('2026-10-11T12:00:00Z')
@@ -81,6 +82,22 @@ describe('daily limits', () => {
     expect(await remainingToday(db, 'w-a', limits, NOON)).toBe(3)
   })
 
+  it('keep the whole billed input of a cached answer: a handful of tokens at full price, the rest as cache writes and reads', async () => {
+    // Two answers as the live server saw them: 12 input tokens in all, the prompt itself in the cache columns.
+    const r = await reserveMessage(db, 'w-a', limits, NOON)
+    if (!r.ok) throw new Error('expected a reservation')
+    const first = { input: 6, cacheWrite: 14_200, cacheRead: 0, output: 410 }
+    const second = { input: 6, cacheWrite: 650, cacheRead: 14_200, output: 380 }
+    await recordTokens(db, 'w-a', r.day, first)
+    await recordTokens(db, 'w-a', r.day, second)
+    const t = await row('w-a')
+    const stored = { input: Number(t.input_tokens), cacheWrite: Number(t.cache_creation_input_tokens), cacheRead: Number(t.cache_read_input_tokens), output: Number(t.output_tokens) }
+    expect(stored).toEqual({ input: 12, cacheWrite: 14_850, cacheRead: 14_200, output: 790 })
+    expect(billedInput(stored)).toBe(29_062)
+    expect(billedInput(stored)).toBe(billedInput(first) + billedInput(second))
+    expect(billedInput({ input: 0, cacheWrite: 0, cacheRead: 0, output: 99 })).toBe(0)
+  })
+
   it("keep the server's last quarter for companies that have asked little today", async () => {
     const big = { perWorkspace: 40, global: 20 }
     expect(globalReserve(big)).toBe(5)
@@ -119,5 +136,23 @@ describe('assistant_usage (migration 006)', () => {
 
   it('refuses negative counts', async () => {
     await expect(db.query(`INSERT INTO assistant_usage (workspace_id, day, messages) VALUES ('w-a', '2026-10-11', -1)`)).rejects.toThrow()
+  })
+
+  it('loses the days more than the given number before today (UTC), every company, and keeps the rest', async () => {
+    // 400 days before 2026-10-11 is 2025-09-06: that day stays, the day before goes.
+    const days: Array<[string, string]> = [
+      ['w-a', '2025-09-05'],
+      ['w-a', '2025-09-06'],
+      ['w-a', '2026-10-11'],
+      ['w-b', '2024-01-01'],
+      ['w-c', '2026-01-01'],
+    ]
+    for (const [id, day] of days) await db.query(`INSERT INTO assistant_usage (workspace_id, day, messages, input_tokens) VALUES ($1, $2, 3, 100)`, [id, day])
+    expect(await pruneUsage(db, 400, NOON)).toBe(2)
+    const left = await db.query<{ workspace_id: string; day: string }>(`SELECT workspace_id, to_char(day, 'YYYY-MM-DD') AS day FROM assistant_usage ORDER BY workspace_id, day`)
+    expect(left.rows.map((x) => `${x.workspace_id} ${x.day}`)).toEqual(['w-a 2025-09-06', 'w-a 2026-10-11', 'w-c 2026-01-01'])
+    // Just after midnight UTC the cutoff moves a day; late in the California evening it already has.
+    expect(await pruneUsage(db, 400, new Date('2026-10-12T06:30:00Z'))).toBe(1)
+    expect(await pruneUsage(db, 400, new Date('2026-10-12T06:30:00Z'))).toBe(0)
   })
 })

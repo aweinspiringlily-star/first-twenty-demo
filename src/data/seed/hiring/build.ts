@@ -1160,6 +1160,7 @@ function hireFlowOffer(ctx: Ctx, b: HireBuild): Omit<Offer, 'id'> & { id: ID } {
     hoursPerWeek: 40,
     payType: 'salary',
     salary: h.offer.salary ?? 0,
+    ...(h.offer.signOnBonus ? { signOnBonus: h.offer.signOnBonus } : {}),
     equityType: 'ISO',
     equityShares: h.offer.equity,
     vestingMonths: 48,

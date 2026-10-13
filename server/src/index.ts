@@ -57,11 +57,11 @@ async function main(): Promise<void> {
   const app = await buildApp({ db, config, careers: registerCareers, assistantClient })
 
   // Housekeeping at startup and once a day (housekeeping.ts): ended sessions, demo companies unused for
-  // DEMO_EXPIRE_DAYS, old change-log rows, long-expired invites.
+  // DEMO_EXPIRE_DAYS, old change-log rows, long-expired invites, assistant usage rows past ASSISTANT_USAGE_DAYS.
   const runHousekeeping = async () => {
     try {
       const done = await housekeeping(db, config)
-      if (done.expiredWorkspaces > 0 || done.prunedChanges > 0) app.log.info(done, 'housekeeping removed old data')
+      if (done.expiredWorkspaces > 0 || done.prunedChanges > 0 || done.assistantUsage > 0) app.log.info(done, 'housekeeping removed old data')
     } catch (err) {
       app.log.error({ err }, 'housekeeping failed')
     }

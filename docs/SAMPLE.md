@@ -21,8 +21,9 @@ the store shifts every date so "today" in the story is always today.
   seed 2,400,000; option pool 1,700,000 (1,200,000 created 2025-04-20, +500,000 at the seed 2026-02-24).
 - 409A history: **$0.25** effective 2025-05-01 (provider: fictional "Meridian Valuation Group"),
   **$1.15** effective 2026-03-20 after the seed, expires 2027-03-20. (Grants before 2026-03-20 used $0.25.)
-- Payroll and benefits through a PEO (generic name "Your PEO" with a placeholder URL): semi-monthly
-  payroll, medical covered 90% for employees and 50% for dependents, 401(k) through the PEO since
+- Payroll and benefits through a PEO (generic name "Your PEO" with a placeholder URL; the app reads that name as
+  a placeholder, so sentences say "your PEO"): semi-monthly payroll on the 15th and the last day (the business
+  day before when either is a weekend or holiday; run payroll 2 business days ahead), medical covered 90% for employees and 50% for dependents, 401(k) through the PEO since
   2026-01-01 with no match (CalSavers exemption filed). Benefits cost about $1,150 per head per month;
   other per-head costs (software, equipment, stipend) about $375 per month.
 - SOC 2 Type I report completed 2026-07-15; Type II observation window 2026-08-01 to 2027-01-31 (soc2Enabled true).
@@ -71,7 +72,8 @@ Ids are fixed so docs, tests and links stay stable. "Market adj." = post-seed ma
 8. `p-hannah` Hannah Kim, Applied AI engineer (evals), L3 Senior (Machine learning), 2026-03-16. $205,000.
    40,000 ISOs at $1.15. Lives in Santa Clara. Referral from Priya ($5,000 referral bonus, paid 2026-06-14).
 9. `p-nikhil` Nikhil Rao, Security and compliance engineer, L3 Senior (Software engineering), 2026-04-13. $200,000.
-   35,000 ISOs at $1.15. Lives in Fremont. Sourced. Owns SOC 2.
+   35,000 ISOs at $1.15. Lives in Fremont. Sourced. Owns SOC 2. **Merit raise to $214,000 effective Wed
+   2026-10-21** (recorded Oct 2, payroll updated Oct 7), so his Oct 16-31 check splits at the change.
 10. `p-omar` Omar Haddad, Data engineer, L3 Senior (Software engineering), 2026-05-04. $188,000. 30,000 ISOs at $1.15.
     **Resigned**: notice given 2026-08-14, last day 2026-08-28 (voluntary, gave 72+ hours notice, reason
     "Joined a later-stage company", rehire eligible). Left before the cliff, so all 30,000 options returned to
@@ -83,7 +85,9 @@ Ids are fixed so docs, tests and links stay stable. "Market adj." = post-seed ma
 13. `p-luis` Luis Ortega, Office and events coordinator, L1 Associate (People and operations), 2026-07-20.
     **Part time, 24 hours a week, non-exempt, $30.00/hour** (above San Jose's $18.45). No equity.
     Onsite in San Jose. Shows the non-exempt rules: wage notice (Labor Code 2810.5), meal and rest breaks,
-    sick leave accrual.
+    sick leave accrual. **Resigned with notice**: gave notice Thu 2026-10-08, last day Tue 2026-11-10 (going back to
+    school full time, rehire eligible). Final pay is due on his last day (Labor Code 202), before the Fri Nov 13
+    payday, and his accrued vacation is paid out (227.3). Offboarding checklist `ck-off-luis`.
 14. `p-ravi` Ravi Subramanian, Staff software engineer, L4 Staff (Software engineering), 2026-08-10. $235,000.
     45,000 ISOs at $1.15 (approved 2026-08-27). Lives in Cupertino. Sourced.
 15. `p-aisha` Aisha Bello, Customer success manager (CPA), L2 Mid-level (Sales and customer success), 2026-09-08.
@@ -92,7 +96,7 @@ Ids are fixed so docs, tests and links stay stable. "Market adj." = post-seed ma
 Employed on 2026-10-09: **14** (all except Omar). Incoming:
 
 16. `p-lucas` Lucas Ferreira, Senior data engineer (backfill for Omar), L3 Senior (Software engineering),
-    starts **Monday 2026-10-19**. $195,000. 30,000 ISOs promised. Offer accepted 2026-09-30; background check
+    starts **Monday 2026-10-19**. $195,000 and a **$10,000 sign-on bonus** with his first check. 30,000 ISOs promised. Offer accepted 2026-09-30; background check
     clear 2026-10-06. Onboarding checklist created; pre-start tasks partly done. **His start takes Ledgerlark to 15**,
     which turns on pay scales in every job posting (SB 1162 / SB 642) and federal Title VII/ADA counting.
 17. `p-mei` Mei Tanaka, Senior ML engineer (agents), L3 Senior (Machine learning), starts **Monday 2026-11-02**.
@@ -157,6 +161,13 @@ and a large share of hires; one agency hire (Caleb, 20% fee).
 ## Seeded situations (what the demo should show on day one)
 
 - Lucas starts Monday Oct 19; his pre-start tasks (accounts, laptop) are due; his start crosses 15.
+- Pay run prep (Comp and plan > Pay runs): the payrolls from Jul 1 to Sep 30 are marked submitted on their cutoff days,
+  with the PEO's totals for September (before the Oct 1 cash date, so runway is unchanged). The Oct 1-15 payroll is
+  due in the PEO by Tue Oct 13 (payday Thu Oct 15; Elena's vacation in it). Oct 16-31 (payday Fri Oct 30, Sat Oct 31
+  moved back) has Lucas's prorated first check (10 of 11 weekdays) with his sign-on bonus, Nikhil's raise on Oct 21
+  and Kofi's pending day off. Nov 1-15 (payday Fri Nov 13) has Mei's first check and Luis's last day, whose final
+  pay is due before the payday (an off-cycle check). Pay periods follow the calendar, so the store rebuilds the
+  submitted payrolls for today when it shifts the sample (`samplePayRuns` in src/data/seed/payroll.ts).
 - Mei's offer accepted Oct 7; she starts Nov 2.
 - Daniel Reyes's offer for Staff ML engineer is waiting for Maya's approval.
 - 3 scorecards owed for interviews held Oct 7-8 (one by Ravi, two by Hannah).

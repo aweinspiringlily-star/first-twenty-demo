@@ -23,6 +23,25 @@ FROM people p
 WHERE p.workspace_id = 'default'
 ORDER BY p.data->>'startDate';
 
+-- Hires: everyone who joined through the app's Hire step, with the job, application and accepted offer it
+-- came from. A hire is not a table of its own: Hire writes the person (people), the first pay record
+-- (comp), the equity grant (grants), the onboarding checklist (checklists), marks the application hired
+-- and the job filled. people.data->>'fromApplicationId' is the link back. People added by hand (the
+-- founder, imports) show with empty hiring columns.
+SELECT (p.data->>'hireNumber')::int AS employee_no,
+       concat_ws(' ', p.data->>'firstName', p.data->>'lastName') AS person, p.data->>'title' AS title,
+       p.data->>'startDate' AS start_date, j.data->>'title' AS hired_for_job, c.data->>'source' AS source,
+       a.data->>'appliedOn' AS applied_on, a.data->>'closedOn' AS hired_on, o.data->>'payType' AS pay_type,
+       (o.data->>'salary')::numeric AS offer_salary, (o.data->>'hourlyRate')::numeric AS offer_hourly_rate,
+       (o.data->>'equityShares')::numeric AS offer_shares, o.data->>'sentOn' AS offer_sent
+FROM people p
+LEFT JOIN applications a ON a.workspace_id = p.workspace_id AND a.id = p.data->>'fromApplicationId'
+LEFT JOIN candidates c ON c.workspace_id = a.workspace_id AND c.id = a.data->>'candidateId'
+LEFT JOIN jobs j ON j.workspace_id = a.workspace_id AND j.id = a.data->>'jobId'
+LEFT JOIN offers o ON o.workspace_id = a.workspace_id AND o.data->>'applicationId' = a.id AND o.data->>'status' = 'accepted'
+WHERE p.workspace_id = 'default'
+ORDER BY employee_no;
+
 -- Jobs, with their status and posted pay range.
 SELECT j.data->>'title' AS title, j.data->>'status' AS status, (j.data->>'payMin')::numeric AS pay_min,
        (j.data->>'payMax')::numeric AS pay_max, j.data->>'workMode' AS work_mode,
@@ -99,9 +118,12 @@ LIMIT 50;
 
 -- The assistant's use per company and day (UTC), every company: messages, and the tokens Claude read and
 -- wrote for them (docs/SERVER.md, "Lark, the assistant"): input at full price, written to the prompt cache,
--- read from it (cache_read high and input low means the cache works), and output. Nothing of what was asked
--- is stored.
-SELECT u.day, w.slug, u.messages, u.input_tokens, u.cache_creation_input_tokens AS cache_write_tokens,
+-- read from it (cache_read high and input low means the cache works), and output. billed_input_tokens adds
+-- the three input counts up: everything Claude read, each part billed at its own rate (input_tokens alone is
+-- only the uncached part after the last cache point, so it looks small). Nothing of what was asked is stored.
+SELECT u.day, w.slug, u.messages,
+       u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens AS billed_input_tokens,
+       u.input_tokens, u.cache_creation_input_tokens AS cache_write_tokens,
        u.cache_read_input_tokens AS cache_read_tokens, u.output_tokens
 FROM assistant_usage u
 JOIN workspaces w ON w.id = u.workspace_id

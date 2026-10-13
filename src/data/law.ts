@@ -48,6 +48,29 @@ export const LAW_SOURCES: Record<string, LawSource> = {
     label: 'Labor Code 204',
     url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=204',
   },
+  // Pay run prep (docs/LAW.md, Pay run prep section, 2026-10-12).
+  salaryBasis: {
+    label: '29 CFR 541.602 (salary basis)',
+    url: 'https://www.ecfr.gov/current/title-29/subtitle-B/chapter-V/subchapter-A/part-541/subpart-G/section-541.602',
+  },
+  dlseManual: { label: 'DLSE Enforcement Manual', url: 'https://www.dir.ca.gov/dlse/DLSEManual/dlse_enfcmanual.pdf' },
+  bankHolidays: { label: 'Federal Reserve holidays', url: 'https://www.federalreserve.gov/aboutthefed/k8.htm' },
+  lc207: {
+    label: 'Labor Code 207',
+    url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=207.',
+  },
+  lc210: {
+    label: 'Labor Code 210',
+    url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=210.',
+  },
+  lc219: {
+    label: 'Labor Code 219',
+    url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=219.',
+  },
+  lc515: {
+    label: 'Labor Code 515',
+    url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=515.',
+  },
   lc226: {
     label: 'Labor Code 226',
     url: 'https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=LAB&sectionNum=226',

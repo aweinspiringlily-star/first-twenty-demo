@@ -4,7 +4,9 @@
 import { type Draft, produce } from 'immer'
 import { create } from 'zustand'
 import { blankDB } from '@/data/blank'
+import { upgradeRoleTemplateNames } from '@/data/roleTemplates'
 import { buildSampleDB } from '@/data/seed'
+import { samplePayRuns } from '@/data/seed/payroll'
 import { applyDueHandoffs } from '@/domain/handoff'
 import { expireOffers } from '@/domain/hiring/offers'
 import { applyScheduledChanges } from '@/domain/lifecycle'
@@ -58,8 +60,10 @@ export function loadSample(): DB {
   if (!anchor) return db
   const shift = sampleShiftOn(anchor, today())
   if (shift === 0) return db
-  // Law, holiday and settings dates stay put; only the company's story moves.
-  const shifted = shiftDatesDeep(db, shift, new Set(['settings', 'lastReviewedOn', 'holidays', 'timeOffPolicies', 'checklistTemplates']))
+  // Law, holiday and settings dates stay put; only the company's story moves. Pay periods follow the calendar
+  // (the 15th and the last day), so the submitted payrolls are rebuilt for today rather than shifted.
+  const shifted = shiftDatesDeep(db, shift, new Set(['settings', 'lastReviewedOn', 'holidays', 'timeOffPolicies', 'checklistTemplates', 'payRuns']))
+  shifted.company = { ...shifted.company, payRuns: samplePayRuns(shifted, today()) }
   shifted.meta = { ...shifted.meta, sampleAnchor: anchor, sampleShiftDays: shift }
   return shifted
 }
@@ -73,14 +77,34 @@ export function sampleIsCurrent(db: Pick<DB, 'meta'>): boolean {
   return !!sample && !!sampleAnchor && (sampleShiftDays ?? 0) === sampleShiftOn(sampleAnchor, today())
 }
 
-/** Fills collections added after a workspace was saved, so older saves keep loading. */
+/**
+ * Fills collections added after a workspace was saved, so older saves keep loading, then upgrades what an
+ * older version saved differently (upgradeSaved). Runs on every saved or server copy before it enters the
+ * store, and on an imported backup.
+ */
 export function migrate(db: DB): DB {
   const base = blankDB({ companyName: 'Company', founderFirstName: 'A', founderLastName: 'B' })
   const out = { ...db } as Record<string, unknown>
   for (const [k, v] of Object.entries(base)) {
     if (out[k] === undefined) out[k] = Array.isArray(v) ? [] : v
   }
-  return out as DB
+  return upgradeSaved(out as DB)
+}
+
+/**
+ * Data upgrades for workspaces an older version saved. Each one is idempotent and the same on every
+ * device, so a copy can go through it any number of times, and the server's copy, upgraded the same way as
+ * it arrives (the sync engine's prepareSnapshot), never differs from this browser's because of it. Nothing
+ * is queued for it: the upgraded record reaches the server with its next edit (for role templates, the
+ * next change to settings, which syncs as one document).
+ * - Role templates still named as the defaults were before posting qualifiers moved to `hint`
+ *   ('Accounting lead (CPA)'): renamed, never a name the user changed (upgradeRoleTemplateNames).
+ */
+function upgradeSaved(db: DB): DB {
+  const templates = db.settings?.roleTemplates
+  if (!Array.isArray(templates)) return db
+  const renamed = upgradeRoleTemplateNames(templates)
+  return renamed === templates ? db : { ...db, settings: { ...db.settings, roleTemplates: renamed } }
 }
 
 function readStored(): { db: DB | null; ok: boolean } {

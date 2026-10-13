@@ -1,14 +1,29 @@
 // Cost and runway (docs/SPEC.md, COST AND RUNWAY): fully loaded run-rate now, with incoming hires, with
 // offers out and at plan, monthly and annual, with a cost breakdown, contractors shown separately, runway
-// from cash on hand, the assumptions (edited in Settings > Company) and spend by department.
+// from cash on hand, the assumptions (edited in Settings > Company) and spend by department. Totals entered from
+// the payroll provider (Pay runs) show as actuals against the estimate; those paid since the cash-as-of date are
+// spent from cash now (payrollActualsHistory in src/domain/pay.ts).
 import { useMemo, useState } from 'react'
 import { links, navigate } from '@/app/router'
 import { LAW_SOURCES } from '@/data/law'
-import { benefitsBasis, latestOffers, offerMonthlyImpact, runRate, type RunRate, type RunRateInclude, type RunRateLine, runway, runwayMonthsLabel } from '@/domain/pay'
-import { fmtDate, today } from '@/lib/dates'
-import { money, moneyShort, pct, plural } from '@/lib/format'
+import {
+  benefitsBasis,
+  latestOffers,
+  offerMonthlyImpact,
+  type PayrollActualRow,
+  payrollActualsHistory,
+  runRate,
+  type RunRate,
+  type RunRateInclude,
+  type RunRateLine,
+  runway,
+  runwayMonthsLabel,
+} from '@/domain/pay'
+import { periodLabel, providerPhrase } from '@/domain/payrun'
+import { fmtDate, fmtDay, today } from '@/lib/dates'
+import { money, money2, moneyShort, pct, plural } from '@/lib/format'
 import { useDB } from '@/store/db'
-import { Badge, BarList, Button, Callout, CitationChip, cx, DataTable, Money, Panel, Private, type Column } from '@/ui'
+import { Badge, BarList, Button, Callout, CitationChip, cx, DataTable, Money, Panel, Private, TextLink, type Column } from '@/ui'
 import { scenarioDelta, scenarioDeltaParts } from './helpers'
 
 const SCENARIOS: Array<{ key: RunRateInclude; label: string; hint: string }> = [
@@ -39,6 +54,8 @@ export function CostTab() {
   const rwNow = useMemo(() => runway(db, date, 'now'), [db, date])
   const rwSel = useMemo(() => runway(db, date, scenario), [db, date, scenario])
   const rwPlan = useMemo(() => runway(db, date, 'at_plan'), [db, date])
+  const actualRows = useMemo(() => payrollActualsHistory(db, date, rates.now), [db, date, rates])
+  const provider = providerPhrase(db.company)
   const model = db.company.costModel
   const futa = model.taxOverrides?.futaScenario ?? 'waiver'
   const altFuta = useMemo(() => runRate(db, date, { include: scenario, futa: futa === 'waiver' ? 'no_waiver' : 'waiver' }), [db, date, scenario, futa])
@@ -263,10 +280,24 @@ export function CostTab() {
                 </div>
                 <p className="text-[13.5px] text-ink-2">{rwSel.text}</p>
                 <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[13.5px]">
-                  <dt className="text-ink-3">Cash now (estimated)</dt>
+                  <dt className="text-ink-3">{rwSel.actuals ? 'Cash now (estimated, with payroll actuals)' : 'Cash now (estimated)'}</dt>
                   <dd className="text-right">
                     <Money value={rwSel.cashNow} />
                   </dd>
+                  {rwSel.actuals && (
+                    <>
+                      <dt className="text-ink-3">
+                        Payroll since {fmtDate(rwSel.cashAsOf)}: {plural(rwSel.actuals.paydays, 'payday')} from {provider}
+                      </dt>
+                      <dd className="text-right">
+                        <Private>
+                          {rwSel.actuals.difference >= 0 ? '+' : '-'}
+                          {money(Math.abs(rwSel.actuals.difference))}
+                        </Private>{' '}
+                        vs estimate
+                      </dd>
+                    </>
+                  )}
                   <dt className="text-ink-3">Payroll, loaded</dt>
                   <dd className="text-right">
                     <Money value={rwSel.payrollMonthly} suffix="/mo" />
@@ -322,6 +353,8 @@ export function CostTab() {
           </Panel>
         </div>
       </div>
+
+      {actualRows.length > 0 && <ActualsPanel rows={actualRows} cashAsOf={db.company.cashAsOf} provider={provider} />}
 
       <div className="grid grid-cols-1 gap-5 @[640px]:grid-cols-2">
         <Panel title="By department" icon="chart" subtitle={`${SCENARIOS.find((s) => s.key === scenario)?.label}, fully loaded a month`}>
@@ -407,5 +440,73 @@ export function CostTab() {
         )}
       </Panel>
     </div>
+  )
+}
+
+const USE_TEXT: Record<PayrollActualRow['use'], string> = {
+  runway: 'Spent from cash now',
+  in_cash: 'Already in cash on hand',
+  upcoming: 'Payday ahead',
+}
+
+/**
+ * The totals entered from the provider (Comp and plan > Pay runs) against the run-rate's estimate for one pay period
+ * (wages and employer taxes, as runway's burn assumes), and how each one counts: paydays after the cash-as-of date
+ * are spent from cash now, earlier ones are already in the cash figure, so they only show how close the estimate is.
+ */
+function ActualsPanel({ rows, cashAsOf, provider }: { rows: PayrollActualRow[]; cashAsOf?: string; provider: string }) {
+  const columns: Array<Column<PayrollActualRow>> = [
+    {
+      key: 'period',
+      header: 'Pay period',
+      cell: (r) => (
+        <a href={links.payRun(r.periodStart)} className="ft-link font-semibold whitespace-nowrap text-ink underline decoration-line-strong underline-offset-2 hover:decoration-ink">
+          {periodLabel({ start: r.periodStart, end: r.periodEnd })}
+        </a>
+      ),
+    },
+    { key: 'payday', header: 'Payday', hideBelow: 'sm', cell: (r) => <span className="whitespace-nowrap">{fmtDay(r.payday)}</span> },
+    {
+      key: 'actual',
+      header: `From ${provider}`,
+      align: 'right',
+      cell: (r) => (
+        <span className="whitespace-nowrap">
+          <Private>{money2(r.actual)}</Private>
+          <span className="block text-[12px] text-ink-3">
+            <Private>{money(r.gross)}</Private> gross + <Private>{money(r.employerTaxes)}</Private> taxes
+          </span>
+        </span>
+      ),
+    },
+    { key: 'estimated', header: 'Estimate', align: 'right', hideBelow: 'md', cell: (r) => <Private>{money2(r.estimated)}</Private> },
+    {
+      key: 'difference',
+      header: 'Difference',
+      align: 'right',
+      cell: (r) => (
+        <Private className="whitespace-nowrap">
+          {r.difference >= 0 ? '+' : '-'}
+          {money2(Math.abs(r.difference))}
+        </Private>
+      ),
+    },
+    { key: 'use', header: 'In runway', cell: (r) => <span className="text-[13.5px]">{USE_TEXT[r.use]}</span> },
+  ]
+  return (
+    <Panel
+      title="Payroll actuals"
+      icon="coins"
+      padded={false}
+      subtitle={`Gross pay and employer taxes from ${provider}, against the run-rate's estimate for one pay period.`}
+    >
+      <DataTable rows={rows} columns={columns} rowKey={(r) => r.periodStart} dense caption="Payroll totals from the provider against the estimate" />
+      <p className="border-t border-line px-5 py-3 text-[13px] text-ink-2">
+        {cashAsOf
+          ? `Paydays after ${fmtDate(cashAsOf)}, the date of your cash on hand, are spent from cash now at what payroll really cost. Earlier paydays are already in that cash figure, so they only show how close the estimate runs. Future months stay estimates.`
+          : 'Cash on hand has no as-of date, so it counts as today and already includes every payday shown. Add the date in Settings, Company to spend newer paydays from it.'}{' '}
+        <TextLink href={links.comp('payruns')}>Enter totals in Pay runs</TextLink>
+      </p>
+    </Panel>
   )
 }

@@ -5,8 +5,10 @@
 import { useMemo, useState } from 'react'
 import { links } from '@/app/router'
 import { assistantDisplayName, assistantNameError, defaultAssistantName, normalizeAssistantName } from '@/domain/assistant'
+import { LAW_SOURCES } from '@/data/law'
 import { CCPA_REVENUE_THRESHOLD } from '@/domain/compliance'
 import { runway, STALE_CASH_DAYS } from '@/domain/pay'
+import { dropStaleRegularPayday, monthlyScheduleProblem, paydayChangeNotice, paydayWords } from '@/domain/payrun'
 import type { Company, FundingRound } from '@/domain/types'
 import { daysBetween, fmtDate, today } from '@/lib/dates'
 import { money, money2, moneyShort, pct } from '@/lib/format'
@@ -16,6 +18,7 @@ import {
   Badge,
   Button,
   ChipGroup,
+  CitationChip,
   DescriptionList,
   Field,
   FormGrid,
@@ -266,6 +269,8 @@ const HQ_LABELS: FieldLabels<Hq> = {
 }
 
 function HqPanel({ company }: { company: Company }) {
+  const db = useDB((s) => s.db)
+  const date = today()
   const value: Hq = {
     street: company.hq.street,
     suite: company.hq.suite ?? '',
@@ -294,7 +299,10 @@ function HqPanel({ company }: { company: Company }) {
             ? 'Use the two-letter state code, like CA.'
             : !/^\d{5}(-\d{4})?$/.test(d.zip.trim())
               ? 'Use a 5-digit ZIP code.'
-              : null
+              : // Labor Code 204(a): monthly pay only when everyone on it is exempt (docs/LAW.md w-pay-frequency).
+                d.paySchedule === 'monthly' && company.paySchedule !== 'monthly'
+                ? monthlyScheduleProblem(db, date)
+                : null
       }
       fieldLabels={HQ_LABELS}
       fieldValues={{ paySchedule: scheduleLabel }}
@@ -313,7 +321,12 @@ function HqPanel({ company }: { company: Company }) {
             if (has('state')) c.hq.state = d.state.trim().toUpperCase()
             if (has('zip')) c.hq.zip = d.zip.trim()
             if (has('workweek')) c.workweek = d.workweek.trim()
-            if (has('paySchedule')) c.paySchedule = d.paySchedule
+            if (has('paySchedule')) {
+              const before = { paySchedule: c.paySchedule, payroll: c.payroll }
+              c.paySchedule = d.paySchedule
+              // A 'Regular payday' that only repeated the old schedule's words would print stale on the wage notice.
+              if (!has('regularPayday')) dropStaleRegularPayday(draft, before)
+            }
             if (has('regularPayday')) {
               if (d.regularPayday.trim()) c.regularPayday = d.regularPayday.trim()
               else delete c.regularPayday
@@ -332,7 +345,7 @@ function HqPanel({ company }: { company: Company }) {
             { label: 'HQ address', value: address },
             { label: 'Workweek', value: company.workweek },
             { label: 'Pay schedule', value: scheduleLabel(company.paySchedule) },
-            { label: 'Regular payday', value: company.regularPayday },
+            { label: 'Regular payday', value: company.regularPayday || `${paydayWords(company)} (from the pay calendar)` },
             { label: 'Main phone', value: company.phone },
           ]}
         />
@@ -364,14 +377,19 @@ function HqPanel({ company }: { company: Company }) {
           <div className="flex flex-col gap-1.5">
             <span className="text-[13.5px] font-semibold text-ink-2">Pay schedule</span>
             <Segmented label="Pay schedule" value={d.paySchedule} onChange={(v) => set({ paySchedule: v })} options={PAY_SCHEDULES} />
+            {d.paySchedule !== company.paySchedule && paydayChangeNotice(db, date) && <p className="text-[13px] text-ink-2">{paydayChangeNotice(db, date)}</p>}
+            <span className="flex flex-wrap items-center gap-2 text-[12.5px] text-ink-3">
+              <CitationChip label={LAW_SOURCES.lc204.label} url={LAW_SOURCES.lc204.url} />
+              <span>Monthly pay is only for exempt staff. Not legal advice.</span>
+            </span>
           </div>
           <FormGrid>
-            <Field label="Regular payday" hint="In plain words. Printed on the Labor Code 2810.5 wage notice.">
+            <Field label="Regular payday" hint="In plain words, for the Labor Code 2810.5 wage notice. Leave it blank to print the pay calendar's own words (Pay runs), shown here.">
               {(id, hint) => (
                 <TextInput
                   id={id}
                   aria-describedby={hint}
-                  placeholder="the 15th and the last day of each month"
+                  placeholder={paydayWords({ paySchedule: d.paySchedule, payroll: company.payroll })}
                   value={d.regularPayday}
                   onChange={(e) => set({ regularPayday: e.target.value })}
                 />

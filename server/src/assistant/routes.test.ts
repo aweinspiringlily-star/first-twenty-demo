@@ -231,6 +231,37 @@ describe('POST /api/assistant/chat', () => {
     expect(Number(row.output_tokens)).toBeGreaterThan(0)
   })
 
+  it("records a cached answer's whole billed input: the uncached tail, cache writes and cache reads, each in its column", async () => {
+    const cachedTurn = (text: string, input: number, cacheWrite: number, cacheRead: number) => {
+      const msg = fakeMessage([{ type: 'text', text, citations: null } as BetaContentBlock], 'end_turn', input)
+      msg.usage = { ...msg.usage, cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead }
+      return msg
+    }
+    const turns = [cachedTurn('Nobody starts next week.', 6, 14_200, 0), cachedTurn('You are welcome.', 6, 650, 14_200)]
+    const cached: AssistantClient = {
+      beta: {
+        messages: {
+          toolRunner: (params, options) => ({
+            params,
+            pushMessages: () => {},
+            async *[Symbol.asyncIterator]() {
+              yield new FakeStream(turns.shift()!, 0, options?.signal ?? undefined)
+            },
+          }),
+        },
+      },
+    }
+    const app = await open({}, cached)
+    const cookie = await owner(app)
+    for (const message of ['Who starts next week?', 'Thanks.']) expect(events((await chat(app, cookie, { history: [], message })).body).at(-1)?.event).toBe('done')
+    const row = (
+      await db.query<Record<string, unknown>>('SELECT messages, input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens FROM assistant_usage')
+    ).rows[0]
+    // Two answers, 12 input tokens at full price, as the live server showed; the rest of each prompt is in the cache columns.
+    expect([row.messages, row.input_tokens, row.cache_creation_input_tokens, row.cache_read_input_tokens].map(Number)).toEqual([2, 12, 14_850, 14_200])
+    expect(Number(row.output_tokens)).toBeGreaterThan(0)
+  })
+
   it('refuses before streaming when the assistant is off, without a session, or without the CSRF header', async () => {
     const off = await open(null)
     const cookie = await owner(off)

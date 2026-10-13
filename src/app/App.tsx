@@ -142,6 +142,7 @@ const TAB_TITLES: Record<string, string> = {
   bands: 'Levels and bands',
   table: 'Comp table',
   cost: 'Cost and runway',
+  payruns: 'Pay runs',
   templates: 'Checklist templates',
   rules: 'Rules and rates',
   links: 'Link-outs',

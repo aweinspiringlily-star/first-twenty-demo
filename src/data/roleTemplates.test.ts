@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_BANDS, DEFAULT_DEPARTMENTS, DEFAULT_FAMILIES, DEFAULT_LEVELS, DEFAULT_STAGES } from '@/data/defaults'
 import { postingLint, salaryHistoryLint } from '@/domain/hiring/postings'
-import { SAMPLE_ROLE_TEMPLATES } from './roleTemplates'
+import { RENAMED_ROLE_TEMPLATES, SAMPLE_ROLE_TEMPLATES, upgradeRoleTemplateNames } from './roleTemplates'
 
 const T = SAMPLE_ROLE_TEMPLATES
 
@@ -88,5 +88,36 @@ describe('SAMPLE_ROLE_TEMPLATES (Ledgerlark)', () => {
     expect(csm).toMatchObject({ name: 'Customer success manager', hint: 'CPA preferred' })
     expect(csm?.jdOutline).toContain('CPA license')
     expect(T.find((t) => t.id === 'rt-accounting-lead')).toMatchObject({ name: 'Accounting lead', hint: 'CPA' })
+  })
+})
+
+describe('upgradeRoleTemplateNames (workspaces saved before the qualifiers moved to the hint)', () => {
+  it('maps each old name to a template the sample has now, by its current name and hint', () => {
+    expect(RENAMED_ROLE_TEMPLATES.map((r) => r.from)).toEqual(['Customer success manager (CPA preferred)', 'Accounting lead (CPA)'])
+    for (const r of RENAMED_ROLE_TEMPLATES) {
+      expect(T.find((t) => t.name === r.name)).toMatchObject({ name: r.name, hint: r.hint })
+      expect(T.some((t) => t.name === r.from)).toBe(false)
+    }
+  })
+
+  it('renames exact old names that have no hint, and leaves everything else (the same array when nothing changes)', () => {
+    const csm = T.find((t) => t.id === 'rt-csm')!
+    const old = [
+      { ...csm, name: 'Customer success manager (CPA preferred)', hint: undefined },
+      { ...csm, id: 'rt-2', name: 'Customer success manager (CPA preferred), East', hint: undefined },
+      { ...csm, id: 'rt-3', name: 'Accounting lead (CPA)', hint: 'Mine' },
+      { ...csm, id: 'rt-4', name: 'Accounting lead (CPA)', hint: '' },
+    ]
+    const out = upgradeRoleTemplateNames(old)
+    expect(out.map((t) => [t.name, t.hint])).toEqual([
+      ['Customer success manager', 'CPA preferred'],
+      ['Customer success manager (CPA preferred), East', undefined],
+      ['Accounting lead (CPA)', 'Mine'],
+      ['Accounting lead', 'CPA'],
+    ])
+    expect(out[1]).toBe(old[1])
+    expect(old[0].name).toBe('Customer success manager (CPA preferred)')
+    expect(upgradeRoleTemplateNames(out)).toBe(out)
+    expect(upgradeRoleTemplateNames(T)).toBe(T)
   })
 })

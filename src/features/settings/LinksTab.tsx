@@ -1,8 +1,27 @@
 // Settings > Link-outs: where the real records live. The app stores status, dates and a link; payroll,
-// background checks, signatures and the cap table stay in their own systems.
+// background checks, signatures and the cap table stay in their own systems. Next to the provider, the pay run
+// settings: how long before payday the provider needs the payroll, where a weekend or holiday payday moves, and the
+// semi-monthly paydays (docs/SPEC.md PAY RUN PREP; checked against Labor Code 204, docs/LAW.md w-pay-frequency).
+import { links } from '@/app/router'
+import { LAW_SOURCES } from '@/data/law'
+import {
+  cutoffWords,
+  latePaydaysText,
+  latePaydaysWith,
+  MAX_CUTOFF_BUSINESS_DAYS,
+  paydayChangeNotice,
+  paydayShiftWords,
+  paydayWords,
+  type PayrollSettings,
+  payrollSettings,
+  payrollSettingsProblem,
+  semiMonthlyPaydayChoices,
+  setPayrollSettings,
+} from '@/domain/payrun'
 import type { Company, LinkOuts } from '@/domain/types'
+import { today } from '@/lib/dates'
 import { useDB } from '@/store/db'
-import { Badge, Field, FormGrid, Icon, Segmented, TextInput } from '@/ui'
+import { Badge, Callout, CitationChip, Field, FormGrid, Icon, Segmented, Select, TextInput, TextLink } from '@/ui'
 import { commit, EditablePanel, RowList, Row } from './kit'
 import { hostLabel, linkProblem, normalizeWebsite, payrollProviderName } from './logic'
 
@@ -49,6 +68,15 @@ function ExternalLink({ url, label }: { url: string | undefined; label: string }
 }
 
 export function LinksTab() {
+  return (
+    <div className="flex flex-col gap-5">
+      <LinkOutsPanel />
+      <PayRunSettingsPanel />
+    </div>
+  )
+}
+
+function LinkOutsPanel() {
   const company = useDB((s) => s.db.company)
   const providerName = payrollProviderName(company)
   // What the provider is called while it has no name.
@@ -144,6 +172,121 @@ export function LinksTab() {
           </FormGrid>
         </>
       )}
+    />
+  )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pay run settings
+// ---------------------------------------------------------------------------------------------
+
+type PayDraft = { cutoffBusinessDays: string; paydayShift: PayrollSettings['paydayShift']; first: string; second: string }
+
+function toSettings(d: PayDraft): PayrollSettings {
+  return { cutoffBusinessDays: Number(d.cutoffBusinessDays), paydayShift: d.paydayShift, semiMonthlyPaydays: { first: Number(d.first), second: Number(d.second) } }
+}
+
+const CUTOFF_OPTIONS = Array.from({ length: MAX_CUTOFF_BUSINESS_DAYS + 1 }, (_, n) => ({ value: String(n), label: cutoffWords(n).replace(/^./, (c) => c.toUpperCase()) }))
+
+function PayRunSettingsPanel() {
+  const db = useDB((s) => s.db)
+  const company = db.company
+  const s = payrollSettings(company)
+  const value: PayDraft = {
+    cutoffBusinessDays: String(s.cutoffBusinessDays),
+    paydayShift: s.paydayShift,
+    first: String(s.semiMonthlyPaydays.first),
+    second: String(s.semiMonthlyPaydays.second),
+  }
+  const semi = company.paySchedule === 'semi_monthly'
+  const choices = semiMonthlyPaydayChoices()
+  const date = today()
+  // A new payday is a change the Labor Code 2810.5 notice covers for non-exempt staff (written notice within 7 days).
+  const changeNotice = paydayChangeNotice(db, date)
+  return (
+    <EditablePanel<PayDraft>
+      id="pay-run-settings"
+      title="Pay run settings"
+      icon="calendar"
+      subtitle="The pay calendar behind Comp and plan, Pay runs, and the inbox's Run payroll by reminder. Your provider still runs the payroll."
+      value={value}
+      editLabel="Edit pay run settings"
+      saveLabel="Save pay run settings"
+      fieldLabels={{ cutoffBusinessDays: 'Run payroll by', paydayShift: 'Weekend or holiday payday', first: 'Payday for the 1st to the 15th', second: 'Payday for the 16th to month end' }}
+      validate={(d) => payrollSettingsProblem(toSettings(d), company.paySchedule)}
+      onSave={(d) =>
+        commit('Updated the pay run settings', (draft) => {
+          setPayrollSettings(draft, toSettings(d))
+        })
+      }
+      view={
+        <RowList label="Pay run settings">
+          <Row title={`Paydays: ${paydayWords(company)}`} meta="The pay schedule and the payday words on the wage notice are in Settings, Company." />
+          <Row title={`Run payroll by: ${cutoffWords(s.cutoffBusinessDays)}`} meta="Your provider's deadline, not a legal one. Business days skip weekends, bank holidays and company holidays." />
+          <Row
+            title={`Weekend or holiday payday: ${paydayShiftWords(s.paydayShift)}`}
+            meta={s.paydayShift === 'before' ? 'Paying early is always lawful, and payroll providers move paydays this way.' : "The Labor Commissioner's next-business-day position."}
+            actions={<TextLink href={links.comp('payruns')}>Open Pay runs</TextLink>}
+          />
+        </RowList>
+      }
+      form={(d, set) => {
+        const problem = payrollSettingsProblem(toSettings(d), company.paySchedule)
+        // The next paydays these choices would put after the Labor Code 204 date, said before saving, not after.
+        const late = problem ? null : latePaydaysText(latePaydaysWith(db, toSettings(d), company.paySchedule, date), date)
+        return (
+          <>
+            <FormGrid>
+              <Field label="Run payroll by" hint="How long before payday your provider needs the payroll. The inbox reminds you by then.">
+                {(id, hint) => <Select id={id} aria-describedby={hint} value={d.cutoffBusinessDays} onChange={(v) => set({ cutoffBusinessDays: v })} options={CUTOFF_OPTIONS} />}
+              </Field>
+            </FormGrid>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[13.5px] font-semibold text-ink-2">Weekend or holiday payday</span>
+              <Segmented
+                label="Weekend or holiday payday"
+                value={d.paydayShift}
+                onChange={(v) => set({ paydayShift: v })}
+                options={[
+                  { value: 'before', label: 'Business day before' },
+                  { value: 'after', label: 'Next business day' },
+                ]}
+              />
+              <p className="text-[12.5px] text-ink-3">
+                Before is always lawful: wages may be paid early (Labor Code 219), and payroll providers move paydays this way. After is the Labor
+                Commissioner&apos;s position for a payday on a weekend or holiday (DLSE Manual 7.6.2); a payday set on the last day Labor Code 204 allows then lands
+                after it.
+              </p>
+            </div>
+            {semi && (
+              <FormGrid>
+                <Field label="Payday for the 1st to the 15th" error={problem?.includes('26th') ? problem : undefined} hint="Labor Code 204: by the 26th of the same month.">
+                  {(id, hint) => (
+                    <Select id={id} aria-describedby={hint} value={d.first} onChange={(v) => set({ first: v })} options={choices.first.map((c) => ({ value: String(c.value), label: c.label }))} />
+                  )}
+                </Field>
+                <Field label="Payday for the 16th to month end" error={problem?.includes('10th') ? problem : undefined} hint="Labor Code 204: by the 10th of the next month.">
+                  {(id, hint) => (
+                    <Select id={id} aria-describedby={hint} value={d.second} onChange={(v) => set({ second: v })} options={choices.second.map((c) => ({ value: String(c.value), label: c.label }))} />
+                  )}
+                </Field>
+              </FormGrid>
+            )}
+            {late && (
+              <Callout tone="warn" icon="calendar" title={late.title}>
+                <p>{late.text}</p>
+              </Callout>
+            )}
+            {changeNotice && <p className="text-[13px] text-ink-2">{changeNotice}</p>}
+            <div className="flex flex-wrap items-center gap-2 text-[12.5px] text-ink-3">
+              <CitationChip label={LAW_SOURCES.lc204.label} url={LAW_SOURCES.lc204.url} />
+              <CitationChip label={LAW_SOURCES.lc219.label} url={LAW_SOURCES.lc219.url} />
+              <CitationChip label={LAW_SOURCES.dlseManual.label} url={LAW_SOURCES.dlseManual.url} />
+              <span>Not legal advice.</span>
+            </div>
+          </>
+        )
+      }}
     />
   )
 }

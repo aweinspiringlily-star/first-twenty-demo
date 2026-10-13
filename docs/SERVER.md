@@ -1321,8 +1321,10 @@ typical question (one or two lookups, a short answer) reads 10,000 to 30,000 tok
 cache, and writes 500 to 2,000: a few cents. The `browse.sql` query "The assistant's use per company and
 day" shows the real numbers (`assistant_usage`), each kind of token apart as Anthropic bills it: input at
 full price ($4 per million), written to the prompt cache ($5) and read from it ($0.20), and output with the
-thinking in it ($20). Most input should show as cache reads; if it does not, the cache is not working. A
-turn that failed part way (the browser left, Claude broke off) is counted too, with what it had used.
+thinking in it ($20), plus `billed_input_tokens`, the three input counts added up (everything Claude read;
+`input_tokens` alone is only the uncached part after the last cache point, so it looks small). Most input
+should show as cache reads; if it does not, the cache is not working. A turn that failed part way (the
+browser left, Claude broke off) is counted too, with what it had used.
 
 What caps it:
 

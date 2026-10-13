@@ -22,6 +22,9 @@ import {
   offerMonthlyImpact,
   outOfBand,
   outstandingOffers,
+  payPeriodsPerYear,
+  payrollActualsBetween,
+  payrollActualsHistory,
   peopleCostSummary,
   planSlotStatus,
   runRate,
@@ -527,6 +530,61 @@ describe('runway', () => {
     expect(now.netBurnMonthly).toBe(now.payrollMonthly + 50_000 + now.contractorsMonthly)
     expect(atPlan.months ?? 0).toBeLessThan(now.months ?? 0)
     expect(atPlan.text).toContain('if the plan hires on schedule')
+  })
+
+  it('spends the provider totals for paydays since the cash date instead of the estimate (pay run prep)', () => {
+    const db = baseDB()
+    db.company.cashOnHand = 1_000_000
+    db.company.cashAsOf = '2026-09-01'
+    db.company.otherMonthlySpend = 40_000
+    const plain = runway(db, D)
+    expect(plain.actuals).toBeUndefined()
+    const totals = (gross: number, employerTaxes: number) => ({ gross, employerTaxes, enteredOn: '2026-10-02' })
+    db.company.payRuns = [
+      // Before the window (cash on hand already counts it), on the cash date itself, and after today: left out.
+      { periodStart: '2026-08-16', periodEnd: '2026-08-31', payday: '2026-08-31', submittedOn: '2026-08-27', totals: totals(9_000, 900) },
+      { periodStart: '2026-08-17', periodEnd: '2026-08-31', payday: '2026-09-01', submittedOn: '2026-08-28', totals: totals(9_000, 900) },
+      { periodStart: '2026-09-01', periodEnd: '2026-09-15', payday: '2026-09-15', submittedOn: '2026-09-11', totals: totals(6_250, 600) },
+      { periodStart: '2026-09-16', periodEnd: '2026-09-30', payday: '2026-09-30', submittedOn: '2026-09-28', totals: totals(6_250, 480) },
+      // Submitted without totals: still an estimate.
+      { periodStart: '2026-10-01', periodEnd: '2026-10-15', payday: '2026-10-08', submittedOn: '2026-10-06' },
+      { periodStart: '2026-10-16', periodEnd: '2026-10-31', payday: '2026-10-30', submittedOn: '2026-10-09', totals: totals(9_000, 900) },
+    ]
+    const r = runway(db, D)
+    // The founder's $150,000 plus $11,867 of employer taxes is $6,744.46 a semi-monthly period.
+    expect(r.actuals).toEqual({ paydays: 2, actual: 13_580, estimated: 13_488.92, difference: 91.08 })
+    expect((plain.cashNow ?? 0) - (r.cashNow ?? 0)).toBeGreaterThanOrEqual(91)
+    expect((plain.cashNow ?? 0) - (r.cashNow ?? 0)).toBeLessThanOrEqual(92)
+    // Future months stay estimates: the burn is the same.
+    expect(r.netBurnMonthly).toBe(plain.netBurnMonthly)
+    expect(payrollActualsBetween(db, '2026-09-30', D, runRate(db, D))).toBeNull()
+    expect(payPeriodsPerYear('biweekly')).toBe(26)
+    expect(payPeriodsPerYear('monthly')).toBe(12)
+  })
+
+  it('lists every payday with provider totals against the estimate, and how each counts in runway', () => {
+    const db = baseDB()
+    db.company.cashOnHand = 1_000_000
+    db.company.cashAsOf = '2026-09-20'
+    const totals = (gross: number, employerTaxes: number) => ({ gross, employerTaxes, enteredOn: '2026-10-02' })
+    db.company.payRuns = [
+      { periodStart: '2026-09-01', periodEnd: '2026-09-15', payday: '2026-09-15', submittedOn: '2026-09-11', totals: totals(6_250, 600) },
+      { periodStart: '2026-09-16', periodEnd: '2026-09-30', payday: '2026-09-30', submittedOn: '2026-09-28', totals: totals(6_250, 480) },
+      { periodStart: '2026-10-01', periodEnd: '2026-10-15', payday: '2026-10-15', submittedOn: '2026-10-09' },
+      { periodStart: '2026-10-16', periodEnd: '2026-10-31', payday: '2026-10-30', submittedOn: '2026-10-09', totals: totals(6_300, 500) },
+    ]
+    const rows = payrollActualsHistory(db, D, runRate(db, D))
+    // Newest payday first; the one without totals is left out. $6,744.46 a period is the founder's wages and taxes.
+    expect(rows.map((r) => [r.periodStart, r.actual, r.estimated, r.difference, r.use])).toEqual([
+      ['2026-10-16', 6800, 6744.46, 55.54, 'upcoming'],
+      ['2026-09-16', 6730, 6744.46, -14.46, 'runway'],
+      ['2026-09-01', 6850, 6744.46, 105.54, 'in_cash'],
+    ])
+    // The rows runway spends are exactly the ones payrollActualsBetween finds.
+    expect(runway(db, D).actuals).toMatchObject({ paydays: 1, actual: 6730, difference: -14.46 })
+    // With no cash-as-of date, cash counts as today's: every past payday is already in it.
+    delete db.company.cashAsOf
+    expect(payrollActualsHistory(db, D, runRate(db, D)).map((r) => r.use)).toEqual(['upcoming', 'in_cash', 'in_cash'])
   })
 
   it('handles unknown cash and revenue that covers spend', () => {

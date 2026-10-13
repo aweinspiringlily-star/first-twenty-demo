@@ -10,6 +10,7 @@ import { generateChecklist } from '@/domain/checklists/generate'
 import {
   ab5Result,
   applyInboxOp,
+  canDismiss,
   candidatesTitle,
   dayText,
   dismissItem,
@@ -22,6 +23,8 @@ import {
   isSoloWorkspace,
   KIT_RULE_IDS,
   minutesText,
+  noSnoozeDetail,
+  noSnoozeReason,
   rangeText,
   snoozeItem,
   snoozeOptions,
@@ -858,5 +861,196 @@ describe('SB 553 workplace violence prevention plan row', () => {
     db.complianceStatus.wvpp = { actionsDone: { 'write-plan': '2026-10-01' } }
     expect(row()).toMatchObject({ key: 'rule:wvpp:train', title: 'Workplace violence prevention plan (SB 553): train everyone, then every year' })
     expect(row()?.detail).toMatch(/^1 more step after this\. /)
+  })
+})
+
+describe('pay run prep row (Run payroll by)', () => {
+  function payDB(): DB {
+    const db = blankDB({ companyName: 'Testco', founderFirstName: 'Maya', founderLastName: 'Raman', foundedOn: '2025-02-03' })
+    db.company.payrollProvider = { name: 'Gusto', kind: 'Payroll', url: '' }
+    db.comp.push({ id: 'cr-f', personId: 'p-founder', effectiveOn: '2025-02-03', payType: 'salary', salary: 150_000, title: 'Founder and CEO', levelId: 'lv-x1', reason: 'hire' })
+    return db
+  }
+  const payRow = (db: DB, date: string) => inboxItems(db, admin(db), date, { now: `${date}T19:00:00.000Z` }).find((i) => i.kind === 'payrun')
+
+  it('asks Admin to run the next payroll by the cutoff, never in red, with Mark submitted under More', () => {
+    const db = payDB()
+    const row = payRow(db, FRI)
+    expect(row).toMatchObject({
+      key: 'payrun:2026-10-01',
+      title: 'Run the Oct 1-15 payroll in Gusto by Tue Oct 13',
+      dueOn: '2026-10-13',
+      snoozeLimit: '2026-10-13',
+      statutory: false,
+      group: 'this_week',
+      waitingOn: 'you',
+      href: '#comp.payruns.2026-10-01',
+      primary: { kind: 'navigate', label: 'Open pay run prep', href: '#comp.payruns.2026-10-01' },
+      citation: { label: 'Labor Code 204' },
+    })
+    expect(row?.detail).toBe('Payday Thu Oct 15. No starts, last days, pay changes or time off. Export the prep, enter it in Gusto, then mark it submitted.')
+    expect(row?.dueNote).toContain("Gusto's cutoff, 2 business days before payday")
+    expect(row?.dueNote).toContain('Labor Code 210')
+    expect(row?.more?.[0]).toMatchObject({ kind: 'mutate', label: 'Mark submitted to Gusto', op: { type: 'payrun_submitted', periodStart: '2026-10-01' } })
+  })
+
+  it('names what changed and a payday moved off a weekend', () => {
+    const db = payDB()
+    addPerson(db, { id: 'p-lee', firstName: 'Lee', lastName: 'Park', startDate: '2026-10-19' })
+    db.comp.push({ id: 'cr-lee', personId: 'p-lee', effectiveOn: '2026-10-19', payType: 'salary', salary: 180_000, title: 'Engineer', levelId: 'lv-l3', reason: 'hire' })
+    db.timeOffRequests.push({ id: 'tr-1', personId: 'p-founder', policyId: 'pol-vacation', startDate: '2026-10-22', endDate: '2026-10-23', hours: 16, status: 'approved', requestedOn: '2026-10-01' })
+    const db2 = produce(db, (d) => {
+      applyInboxOp(d, { type: 'payrun_submitted', periodStart: '2026-10-01' }, { date: FRI, actorId: 'p-founder' })
+    })
+    // The next cutoff (Wed Oct 28) is more than two weeks after Fri Oct 9: nothing to show yet.
+    expect(payRow(db2, FRI)).toBeUndefined()
+    const row = payRow(db2, '2026-10-14')
+    expect(row).toMatchObject({ key: 'payrun:2026-10-16', title: 'Run the Oct 16-31 payroll in Gusto by Wed Oct 28', group: 'coming_up' })
+    expect(row?.detail).toBe('Payday Fri Oct 30 (moved from Sat Oct 31, not a business day). Lee Park starts; time off for 1 person. Export the prep, enter it in Gusto, then mark it submitted.')
+  })
+
+  it('caps snoozes at the cutoff, brings the row back on it and offers no dismiss', () => {
+    const db = payDB()
+    const row = payRow(db, FRI) as InboxItem
+    expect(snoozeOptions(row, FRI).map((o) => o.until)).toEqual(['2026-10-10', '2026-10-12', '2026-10-13'])
+    expect(snoozeOptions(row, '2026-10-13')).toEqual([])
+    expect(canDismiss(row)).toBe(false)
+    expect(isHidden({ snoozedUntil: '2026-10-16' }, row, '2026-10-12')).toBe(true)
+    expect(isHidden({ snoozedUntil: '2026-10-16' }, row, '2026-10-13')).toBe(false)
+    expect(isHidden({ dismissedOn: FRI }, row, FRI)).toBe(false)
+  })
+
+  it('says the cutoff passed until payday, then moves to the next period', () => {
+    const db = payDB()
+    expect(payRow(db, '2026-10-14')).toMatchObject({
+      title: 'Run the Oct 1-15 payroll now: the cutoff was Tue Oct 13, payday is Thu Oct 15',
+      group: 'overdue',
+      statutory: false,
+    })
+    expect(payRow(db, '2026-10-16')?.key).toBe('payrun:2026-10-16')
+  })
+
+  it('marks the period submitted from the row (Undo-able like any op) and refuses twice', () => {
+    const db = payDB()
+    const next = produce(db, (d) => {
+      expect(applyInboxOp(d, { type: 'payrun_submitted', periodStart: '2026-10-01' }, { date: FRI, actorId: 'p-founder' })).toEqual({ ok: true })
+      expect(applyInboxOp(d, { type: 'payrun_submitted', periodStart: '2026-10-01' }, { date: FRI, actorId: 'p-founder' })).toEqual({
+        ok: false,
+        reason: 'This pay run is already marked submitted.',
+      })
+      expect(applyInboxOp(d, { type: 'payrun_submitted', periodStart: '2026-10-02' }, { date: FRI, actorId: 'p-founder' }).ok).toBe(false)
+    })
+    expect(next.company.payRuns?.[0]).toMatchObject({ periodStart: '2026-10-01', submittedOn: FRI, submittedById: 'p-founder' })
+    // The founder has been paid since Feb 2025, so Oct 15, 2026 is not the first payroll: the EDD date stays empty.
+    expect(next.company.firstPayrollOn).toBeUndefined()
+  })
+
+  it("fills the first payroll date from the row's mark when this is the first payroll", () => {
+    const db = payDB()
+    // The founder's pay starts Oct 1, 2026: Oct 1-15 is the first payroll.
+    db.comp = [{ ...db.comp[0], effectiveOn: '2026-10-01' }]
+    const next = produce(db, (d) => {
+      expect(applyInboxOp(d, { type: 'payrun_submitted', periodStart: '2026-10-01' }, { date: FRI, actorId: 'p-founder' })).toEqual({ ok: true })
+    })
+    expect(next.company.firstPayrollOn).toBe('2026-10-15')
+  })
+
+  it('ranks a payroll past its cutoff with the overdue legal deadlines, ahead of stale reminders', () => {
+    const db = payDB()
+    db.checklists.push({
+      id: 'ck-old',
+      personId: 'p-founder',
+      kind: 'onboarding',
+      templateId: 'tpl-onboarding',
+      anchorDate: '2026-08-03',
+      createdOn: '2026-08-01',
+      tasks: [task('t-laptop', { title: 'Laptop returned', dueOn: '2026-09-01', category: 'it' }), task('t-badge', { title: 'Badge returned', dueOn: '2026-09-02', category: 'it' })],
+    })
+    // Wed Oct 14: the Oct 13 cutoff has passed, payday is Thu Oct 15.
+    const overdue = inboxItems(db, admin(db), '2026-10-14', { now: '2026-10-14T19:00:00.000Z' }).filter((i) => i.group === 'overdue')
+    expect(overdue.map((i) => i.kind)).toEqual(['payrun', 'task', 'task'])
+    expect(overdue[0].title).toBe('Run the Oct 1-15 payroll now: the cutoff was Tue Oct 13, payday is Thu Oct 15')
+    // Still amber, never red: the payday is the legal date, not the cutoff.
+    expect(overdue[0].statutory).toBe(false)
+  })
+
+  it('leads Overdue ahead of more than 5 overdue legal rows, so Home shows it before Show more', () => {
+    const db = payDB()
+    // Eight overdue legal deadlines on separate days (Home shows 5 Overdue rows before Show more).
+    db.checklists.push({
+      id: 'ck-legal',
+      personId: 'p-founder',
+      kind: 'onboarding',
+      templateId: 'tpl-onboarding',
+      anchorDate: '2026-08-31',
+      createdOn: '2026-08-28',
+      tasks: Array.from({ length: 8 }, (_, n) => task(`t-legal-${n}`, { title: `Legal filing ${n + 1}`, dueOn: `2026-09-0${n + 1}`, statutory: true })),
+    })
+    // Thu Oct 15 is payday (the cutoff passed on Tue Oct 13), and Wed Oct 14 the day before.
+    for (const date of ['2026-10-14', '2026-10-15']) {
+      const overdue = inboxItems(db, admin(db), date, { now: `${date}T19:00:00.000Z` }).filter((i) => i.group === 'overdue')
+      expect(overdue.filter((i) => i.statutory)).toHaveLength(8)
+      expect(overdue[0]).toMatchObject({ kind: 'payrun', statutory: false })
+      expect(overdue.slice(1).every((i) => i.statutory)).toBe(true)
+    }
+  })
+
+  it('says why the row cannot be snoozed on and after the cutoff, without calling it a legal deadline', () => {
+    const db = payDB()
+    const onCutoff = payRow(db, '2026-10-13') as InboxItem
+    expect(snoozeOptions(onCutoff, '2026-10-13')).toEqual([])
+    expect(noSnoozeReason(onCutoff, '2026-10-13')).toBe('The payroll cutoff is today: it cannot be snoozed')
+    const late = payRow(db, '2026-10-14') as InboxItem
+    expect(noSnoozeReason(late, '2026-10-14')).toBe('The payroll cutoff has passed: it cannot be snoozed')
+    expect(noSnoozeReason({ statutory: true, snoozeLimit: undefined }, FRI)).toBe('A legal deadline cannot be snoozed once due')
+    // The expanded row says only why: it is not a legal deadline and has no done or not applicable action.
+    expect(noSnoozeDetail(onCutoff, '2026-10-13')).toBe('The payroll cutoff is today: it cannot be snoozed.')
+    expect(noSnoozeDetail(late, '2026-10-14')).toBe('The payroll cutoff has passed: it cannot be snoozed.')
+    expect(noSnoozeDetail({ statutory: true, snoozeLimit: undefined }, FRI)).toBe('A legal deadline cannot be snoozed once due. Mark it done, or not applicable with a note.')
+  })
+
+  it('starts the detail sentence in capitals when the period has only time off', () => {
+    const db = payDB()
+    db.timeOffRequests.push({ id: 'tr-1', personId: 'p-founder', policyId: 'pol-vacation', startDate: '2026-10-07', endDate: '2026-10-08', hours: 16, status: 'approved', requestedOn: '2026-10-01' })
+    expect(payRow(db, FRI)?.detail).toBe('Payday Thu Oct 15. Time off for 1 person. Export the prep, enter it in Gusto, then mark it submitted.')
+  })
+
+  it('asks for a week after a payday that passed with no mark whether the payroll ran', () => {
+    const db = payDB()
+    const ask = (date: string) => inboxItems(db, admin(db), date, { now: `${date}T19:00:00.000Z` }).filter((i) => i.kind === 'payrun_unmarked')
+    expect(ask('2026-10-15')).toEqual([])
+    const [row] = ask('2026-10-16')
+    expect(row).toMatchObject({
+      key: 'payrun-unmarked:2026-10-01',
+      title: 'Did the Oct 1-15 payroll run? Payday was Thu Oct 15',
+      dueOn: '2026-10-15',
+      group: 'overdue',
+      statutory: false,
+      href: '#comp.payruns.2026-10-01',
+      primary: { kind: 'mutate', label: 'Mark submitted', op: { type: 'payrun_submitted', periodStart: '2026-10-01' } },
+      citation: { label: 'Labor Code 210' },
+    })
+    expect(row.detail).toBe('Nothing is marked for it here. If it ran in Gusto, mark it submitted. If it did not, run it now: a late payday can cost $100 per employee (Labor Code 210).')
+    // Quiet: it can be snoozed and dismissed.
+    expect(canDismiss(row)).toBe(true)
+    expect(snoozeOptions(row, '2026-10-16').length).toBe(3)
+    expect(ask('2026-10-22')).toHaveLength(1)
+    expect(ask('2026-10-23')).toEqual([])
+    // Marking it submitted from the row clears it (and records the first payroll date).
+    const marked = produce(db, (d) => {
+      expect(applyInboxOp(d, row.primary.kind === 'mutate' ? row.primary.op : { type: 'backup_downloaded' }, { date: '2026-10-16', actorId: 'p-founder' })).toEqual({ ok: true })
+    })
+    expect(inboxItems(marked, admin(marked), '2026-10-16', { now: '2026-10-16T19:00:00.000Z' }).some((i) => i.kind === 'payrun_unmarked')).toBe(false)
+    // People were paid before Oct 1-15 (the founder since Feb 2025): the first payroll date is not guessed from it.
+    expect(marked.company.firstPayrollOn).toBeUndefined()
+  })
+
+  it('shows only to Admin, and not while nobody on payroll is paid', () => {
+    const db = payDB()
+    const manager: Viewer = { role: 'manager', person: db.people[0], personId: 'p-founder' }
+    expect(inboxItems(db, manager, FRI, { now: NOW }).some((i) => i.kind === 'payrun')).toBe(false)
+    expect(inboxItems(db, admin(db), FRI, { now: NOW, scope: 'personal' }).some((i) => i.kind === 'payrun')).toBe(false)
+    db.comp = []
+    expect(payRow(db, FRI)).toBeUndefined()
   })
 })

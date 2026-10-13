@@ -6,6 +6,11 @@
 //
 // A message is counted when it starts (reserveMessage), under one advisory lock, so parallel chats from a
 // company's logins cannot slip past the limit together; the tokens are added when it ends (recordTokens).
+// The whole billed input goes in, each kind in its own column: input_tokens holds only the input read at
+// full price, the uncached remainder after the last cache breakpoint, which with the conversation cached is
+// a handful of tokens a request (two answers on the live server showed 12 in all). The rest of the prompt
+// is in cache_creation_input_tokens and cache_read_input_tokens, so the billed input of a row is the three
+// together (billedInput). Migration 006 already keeps the cached tokens apart; no migration was needed.
 // A message is given back (releaseMessage) only when no request went to the Claude API for it, or when the
 // API turned every request away with an HTTP error before answering (runner.ts decides: ChatOutcome
 // `charged`). Once a request is out, hanging up does not give the message back.
@@ -29,6 +34,14 @@ export type DailyLimits = { perWorkspace: number; global: number }
 export type TokenCounts = { input: number; cacheWrite: number; cacheRead: number; output: number }
 
 export const NO_TOKENS: Readonly<TokenCounts> = Object.freeze({ input: 0, cacheWrite: 0, cacheRead: 0, output: 0 })
+
+/**
+ * Every input token billed, cached or not: input_tokens + cache_creation_input_tokens +
+ * cache_read_input_tokens, the prompt's whole size (`input` alone is only its uncached tail).
+ */
+export function billedInput(t: TokenCounts): number {
+  return t.input + t.cacheWrite + t.cacheRead
+}
 
 /**
  * workspace: the company's own limit; global: the server's; reserve: the server is down to its reserve and
@@ -101,7 +114,10 @@ export async function reserveMessage(db: Db, workspaceId: string, limits: DailyL
   }
 }
 
-/** Adds the tokens a message used to its day's row (the day it was reserved under), each kind in its column. */
+/**
+ * Adds the tokens a message used to its day's row (the day it was reserved under), each kind in its column:
+ * the billed input as three (full price, cache writes, cache reads) and the output.
+ */
 export async function recordTokens(db: Queryable, workspaceId: string, day: string, tokens: TokenCounts): Promise<void> {
   const n = (v: number) => (Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0)
   const t = { input: n(tokens.input), cacheWrite: n(tokens.cacheWrite), cacheRead: n(tokens.cacheRead), output: n(tokens.output) }
@@ -112,6 +128,16 @@ export async function recordTokens(db: Queryable, workspaceId: string, day: stri
       WHERE workspace_id = $1 AND day = $2`,
     [workspaceId, day, t.input, t.cacheWrite, t.cacheRead, t.output],
   )
+}
+
+/**
+ * Deletes the rows of days more than `olderThanDays` before today (UTC, the day rows count under), every
+ * company's: the daily housekeeping (housekeeping.ts ASSISTANT_USAGE_DAYS). Returns how many went.
+ */
+export async function pruneUsage(db: Queryable, olderThanDays: number, now: Date = new Date()): Promise<number> {
+  const oldest = usageDay(new Date(now.getTime() - olderThanDays * 86_400_000))
+  const r = await db.query('DELETE FROM assistant_usage WHERE day < $1::date', [oldest])
+  return r.rowCount
 }
 
 /** Gives back a message no request was made for (or one the API turned away before answering). */

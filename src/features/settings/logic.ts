@@ -4,6 +4,7 @@
 import { blankDB } from '@/data/blank'
 import { LOCAL_MIN_WAGES } from '@/data/law'
 import { compOrFirst } from '@/domain/pay'
+import { payrollProviderName } from '@/domain/payrun/calendar'
 import { employedOn, fullName, incomingOn, isEmployedOn } from '@/domain/people'
 import type { Company, DB, ID, LawSettings, Person, TaskCondition, TimeOffPolicy } from '@/domain/types'
 import { fmtDate, type ISODate, today } from '@/lib/dates'
@@ -445,14 +446,8 @@ export function linkProblem(value: string | undefined): string | null {
   return urlProblem(normalizeWebsite(value))
 }
 
-/**
- * The payroll or PEO provider's name, or '' when there is none yet. Workspaces started before 2026-10-11
- * stored the old placeholder 'Your payroll or PEO provider' as the name: that counts as none.
- */
-export function payrollProviderName(company: Pick<Company, 'payrollProvider'>): string {
-  const name = company.payrollProvider?.name?.trim() ?? ''
-  return name === 'Your payroll or PEO provider' ? '' : name
-}
+// The payroll or PEO provider's name ('' while there is none); it lives with pay run prep, which names it most.
+export { payrollProviderName }
 
 /** 'example.com' from a URL, for naming vendors in plain text. */
 export function hostLabel(url: string | undefined): string | null {

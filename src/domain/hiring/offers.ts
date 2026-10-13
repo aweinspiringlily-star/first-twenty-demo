@@ -9,6 +9,7 @@
 import type { Draft } from 'immer'
 import { LAW_SOURCES } from '@/data/law'
 import { capTableIsPlaceholder, current409A, pctOfFullyDiluted } from '@/domain/equity'
+import { paydayWords } from '@/domain/payrun/calendar'
 import { founder, getPerson, isEmployedOn, personNameById } from '@/domain/people'
 import type {
   Band,
@@ -1187,17 +1188,13 @@ function payScheduleText(db: Pick<DB, 'company'>): string {
   }
 }
 
-/** The regular payday in words: Settings value, or a default for the pay schedule. */
+/**
+ * The regular payday in words: the Settings value, or the pay calendar's own words (paydayWords, the same paydays
+ * Comp and plan > Pay runs counts), so the wage notice cannot drift from the calendar.
+ */
 export function regularPaydayText(db: Pick<DB, 'company'>): string {
   if (db.company.regularPayday?.trim()) return db.company.regularPayday.trim()
-  switch (db.company.paySchedule) {
-    case 'biweekly':
-      return 'every other Friday'
-    case 'monthly':
-      return 'the last business day of each month'
-    default:
-      return 'the 15th and the last day of each month (the business day before when either falls on a weekend or holiday)'
-  }
+  return paydayWords(db.company)
 }
 
 /**
@@ -1472,7 +1469,7 @@ export function wageNotice2810_5(
   if (!carrier?.phone) missing.push("Workers' comp carrier phone (Settings > Company)")
   if (!company.phone) missing.push('Company phone number (Settings > Company)')
   if (!company.hq.street) missing.push('Company street address (Settings > Company)')
-  if (!company.regularPayday) missing.push('Regular payday (Settings > Company); a default for your pay schedule is shown')
+  // A blank regular payday is not missing: regularPaydayText prints the pay calendar's own words.
   const sick = db.timeOffPolicies.find((p) => p.kind === 'sick')
   const sickPlan =
     sick?.method === 'frontload'

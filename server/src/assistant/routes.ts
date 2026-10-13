@@ -37,7 +37,7 @@ import type { AssistantClient } from './client'
 import { FAKE_MODEL } from './fake'
 import { MESSAGE_MAX, parseHistory } from './history'
 import { contextNote, systemPrompt } from './prompt'
-import { type DailyLimits, LIGHT_USE, type QuotaScope, recordTokens, releaseMessage, remainingToday, reserveMessage } from './quota'
+import { billedInput, type DailyLimits, LIGHT_USE, type QuotaScope, recordTokens, releaseMessage, remainingToday, reserveMessage } from './quota'
 import { WorkspaceReader } from './reader'
 import { runChat } from './runner'
 import { assistantTools, TOOL_NAME_SET } from './tools'
@@ -217,6 +217,8 @@ export async function registerAssistantRoutes(api: FastifyInstance, deps: Assist
               userId: user.id,
               workspaceId: user.workspaceId,
               outcome: outcome.kind === 'error' ? outcome.error : outcome.kind,
+              // The whole prompt as billed; `input` is only its uncached tail.
+              billedInput: billedInput(u),
               input: u.input,
               cacheWrite: u.cacheWrite,
               cacheRead: u.cacheRead,

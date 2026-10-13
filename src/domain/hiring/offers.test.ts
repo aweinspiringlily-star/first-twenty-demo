@@ -40,6 +40,7 @@ import {
   startHasPassed,
   submitForApproval,
   updateOffer,
+  regularPaydayText,
   wageNotice2810_5,
   waitingOnApproval,
 } from './offers'
@@ -405,7 +406,26 @@ describe('generated documents', () => {
     expect(n.text).toContain('Policy number: WC-2026-118')
     expect(n.text).toContain('paid sick leave')
     expect(n.text).toContain('Santa Clara County within 30 days before your first day of work')
-    expect(n.missing).toEqual(['Regular payday (Settings > Company); a default for your pay schedule is shown'])
+    // A blank regular payday is not missing: the notice prints the pay calendar's own words.
+    expect(n.text).toContain('Regular payday: the 15th and the last day of each month, or the business day before when that is a weekend or holiday.')
+    expect(n.missing).toEqual([])
+  })
+
+  it('takes the regular payday from the pay calendar when Settings leaves it blank, so the notice never drifts', () => {
+    const db = produce(fixtureDB(), (d) => {
+      delete d.company.regularPayday
+    })
+    expect(regularPaydayText(db)).toBe('the 15th and the last day of each month, or the business day before when that is a weekend or holiday')
+    const moved = produce(db, (d) => {
+      d.company.paySchedule = 'monthly'
+      d.company.payroll = { paydayShift: 'after' }
+    })
+    // Monthly pay is on the 26th (Labor Code 204), never 'the last business day'.
+    expect(regularPaydayText(moved)).toBe('the 26th of each month, for the whole month, or the next business day when that is a weekend or holiday')
+    const typed = produce(db, (d) => {
+      d.company.regularPayday = ' the 10th and 25th of each month '
+    })
+    expect(regularPaydayText(typed)).toBe('the 10th and 25th of each month')
   })
 
   it('builds the notice for an existing person from their comp record and lists missing settings', () => {

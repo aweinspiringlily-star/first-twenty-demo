@@ -1272,8 +1272,11 @@
 }
 
 /* The grid costs about 4px a column (2px spacing plus two 1px cell borders). The kit pads full-size
-   cells 16px a side and dense ones 12px; 12px and 10px here pay for the grid, so this look never
-   makes a table wider than the others do (the checklists table fits at 1280 again). */
+   cells 16px a side and dense ones 12px; 12px and 10px here would pay for the grid, so this look
+   never makes a table wider than the others do (the checklists table fits at 1280 again). Dense
+   cells get 8px: dense tables often sit in a half-width panel, whose beveled frame leaves about
+   10px less room than the default look's panel, and at 10px the 409A table (Comp and plan, Equity)
+   came out 5px wider than its panel at 1280. */
 [data-look="web90s"] .ft-table:not(.ft-table--dense) .ft-table__th:not(.ft-lookpreview:not([data-look="web90s"]) *),
 [data-look="web90s"] .ft-table:not(.ft-table--dense) .ft-table__cell:not(.ft-lookpreview:not([data-look="web90s"]) *) {
   padding-inline: 12px;
@@ -1281,7 +1284,29 @@
 
 [data-look="web90s"] .ft-table.ft-table--dense .ft-table__th:not(.ft-lookpreview:not([data-look="web90s"]) *),
 [data-look="web90s"] .ft-table.ft-table--dense .ft-table__cell:not(.ft-lookpreview:not([data-look="web90s"]) *) {
-  padding-inline: 10px;
+  padding-inline: 8px;
+}
+
+/* A dense table's long column head wraps to two lines instead of setting its column's width, as the comic look's
+   heads do: the padding alone left no slack, and with every head on one line ('Safe harbor until', 'Price a share')
+   the 409A table (Comp and plan, Equity) was 29px wider than its half-width panel at 1200. Its narrowest is then set
+   by the cells (a date, the Superseded badge), not the heads. Heads sit on the bottom bevel. */
+[data-look="web90s"] .ft-table.ft-table--dense .ft-table__th:not(.ft-lookpreview:not([data-look="web90s"]) *) {
+  white-space: normal;
+  line-height: 1.2;
+  vertical-align: bottom;
+}
+
+/* A sort head stays a 40px target and grows for a second line. */
+[data-look="web90s"] .ft-table.ft-table--dense .ft-table__sort:not(.ft-lookpreview:not([data-look="web90s"]) *) {
+  min-height: 40px;
+  height: auto;
+  padding-block: 4px;
+  text-align: inherit;
+}
+
+[data-look="web90s"] .ft-table.ft-table--dense .ft-table__th.text-right > .ft-table__sort:not(.ft-lookpreview:not([data-look="web90s"]) *) {
+  justify-content: flex-end;
 }
 
 [data-look="web90s"] .ft-table__th:not(.ft-lookpreview:not([data-look="web90s"]) *) {

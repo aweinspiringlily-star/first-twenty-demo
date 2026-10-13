@@ -1,6 +1,8 @@
 // Date formatting never throws on a value that is not a real date, and date fields pass on only real ones.
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  bankHolidays,
+  federalHolidays,
   fmtDate,
   fmtDateTime,
   fmtDay,
@@ -71,5 +73,34 @@ describe('fmtDayAnyYear (r2-36: a date a year out read like today)', () => {
     setClockOverride('2026-10-11')
     expect(fmtDayAnyYear('2027-10-11')).toBe('Mon, Oct 11, 2027')
     expect(fmtDayAnyYear('2026-11-02')).toBe('Mon, Nov 2')
+  })
+})
+
+describe('bankHolidays (docs/LAW.md w-bank-holidays, Federal Reserve K.8 schedule)', () => {
+  it('lists the 2026 closures: Jul 4 is a Saturday, so the Reserve Banks stay open Fri Jul 3', () => {
+    expect(bankHolidays(2026)).toEqual([
+      '2026-01-01',
+      '2026-01-19',
+      '2026-02-16',
+      '2026-05-25',
+      '2026-06-19',
+      '2026-09-07',
+      '2026-10-12',
+      '2026-11-11',
+      '2026-11-26',
+      '2026-12-25',
+    ])
+    expect(federalHolidays(2026)).toContain('2026-07-03')
+    expect(bankHolidays(2026)).not.toContain('2026-07-03')
+  })
+
+  it('moves a Sunday holiday to Monday and gives a Saturday one no weekday closure (2027)', () => {
+    expect(bankHolidays(2027)).toEqual(['2027-01-01', '2027-01-18', '2027-02-15', '2027-05-31', '2027-07-05', '2027-09-06', '2027-10-11', '2027-11-11', '2027-11-25'])
+    // Jun 19 and Dec 25, 2027 are Saturdays: banks open Fri Jun 18 and Fri Dec 24 (federal offices close).
+    expect(bankHolidays(2027)).not.toContain('2027-06-18')
+    expect(bankHolidays(2027)).not.toContain('2027-12-24')
+    // New Year's Day 2028 is a Saturday: only the Board closes Dec 31, 2027.
+    expect(bankHolidays(2027)).not.toContain('2027-12-31')
+    expect(bankHolidays(2028)).not.toContain('2028-01-01')
   })
 })

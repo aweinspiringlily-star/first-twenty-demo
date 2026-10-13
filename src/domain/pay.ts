@@ -73,6 +73,11 @@ export function compHistoryByLastDay(db: DB, person: Person): { history: CompRec
   return { history: all.filter((r) => r.effectiveOn <= lastDay), afterLastDay: all.filter((r) => r.effectiveOn > lastDay), lastDay }
 }
 
+/** Pay periods in a year for a pay schedule: 24 semi-monthly, 26 every two weeks, 12 monthly. */
+export function payPeriodsPerYear(schedule: DB['company']['paySchedule']): number {
+  return schedule === 'monthly' ? 12 : schedule === 'biweekly' ? 26 : 24
+}
+
 /** Annual base pay: the salary, or hourly rate x hours per week x 52. */
 export function annualBase(rec: PayFields, hoursPerWeek = 40): number {
   if (rec.payType === 'hourly') return r2((rec.hourlyRate ?? 0) * hoursPerWeek * 52)
@@ -652,6 +657,78 @@ export function runRate(db: DB, date: ISODate, opts: { include: RunRateInclude }
 // Runway
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Payroll totals entered from the provider (Comp and plan > Pay runs) for paydays in a window, against what the
+ * run-rate estimates for the same pay periods: wages at target plus employer taxes, over the periods in a year.
+ */
+export type PayrollActuals = {
+  /** Paydays in the window with totals entered. */
+  paydays: number
+  /** Gross wages plus employer taxes, as the provider reported them. */
+  actual: number
+  /** The run-rate's wages and employer taxes for the same number of pay periods. */
+  estimated: number
+  /** actual - estimated: what runway spends on top of its estimate (negative when payroll cost less). */
+  difference: number
+}
+
+/**
+ * The payroll actuals for paydays after `from` and on or before `to` (the cash on hand already counts a payday on
+ * its own date), measured against `rr`'s wages and employer taxes per pay period. Null when no payday in the
+ * window has totals, so runway stays a pure estimate until the provider's numbers come in.
+ */
+export function payrollActualsBetween(db: Pick<DB, 'company'>, from: ISODate, to: ISODate, rr: Pick<RunRate, 'lines'>): PayrollActuals | null {
+  const runs = (db.company.payRuns ?? []).filter((r) => r.totals && r.payday > from && r.payday <= to)
+  if (!runs.length) return null
+  const perPeriod = rr.lines.reduce((t, l) => t + l.cost.wages + l.cost.employerTaxes.total, 0) / payPeriodsPerYear(db.company.paySchedule)
+  const actual = r2(runs.reduce((t, r) => t + (r.totals?.gross ?? 0) + (r.totals?.employerTaxes ?? 0), 0))
+  const estimated = r2(perPeriod * runs.length)
+  return { paydays: runs.length, actual, estimated, difference: r2(actual - estimated) }
+}
+
+/** How a payday's provider totals count in runway: spent on top of the estimate, already in cash, or not yet paid. */
+export type ActualUse = 'runway' | 'in_cash' | 'upcoming'
+
+export type PayrollActualRow = {
+  periodStart: ISODate
+  periodEnd: ISODate
+  payday: ISODate
+  gross: number
+  employerTaxes: number
+  /** gross + employerTaxes */
+  actual: number
+  /** The run-rate's wages and employer taxes for one pay period (what runway's burn assumes). */
+  estimated: number
+  difference: number
+  /**
+   * 'runway': paid after the cash-as-of date and by today, so cash now spends the difference (payrollActualsBetween).
+   * 'in_cash': paid on or before the cash-as-of date (or with no date, by today): cash on hand already includes it.
+   * 'upcoming': the payday is still ahead.
+   */
+  use: ActualUse
+}
+
+/**
+ * Every pay run with provider totals, newest payday first, against the run-rate per pay period, and how each one
+ * counts in runway (Comp and plan > Cost and runway shows it as an actual vs estimate history).
+ */
+export function payrollActualsHistory(db: Pick<DB, 'company'>, date: ISODate, rr: Pick<RunRate, 'lines'>): PayrollActualRow[] {
+  const c = db.company
+  const asOf = c.cashAsOf && c.cashAsOf < date ? c.cashAsOf : date
+  const perPeriod = rr.lines.reduce((t, l) => t + l.cost.wages + l.cost.employerTaxes.total, 0) / payPeriodsPerYear(c.paySchedule)
+  return (c.payRuns ?? [])
+    .filter((r) => r.totals)
+    .sort((a, b) => b.payday.localeCompare(a.payday))
+    .map((r) => {
+      const gross = r.totals?.gross ?? 0
+      const employerTaxes = r.totals?.employerTaxes ?? 0
+      const actual = r2(gross + employerTaxes)
+      const estimated = r2(perPeriod)
+      const use: ActualUse = r.payday > date ? 'upcoming' : r.payday > asOf ? 'runway' : 'in_cash'
+      return { periodStart: r.periodStart, periodEnd: r.periodEnd, payday: r.payday, gross, employerTaxes, actual, estimated, difference: r2(actual - estimated), use }
+    })
+}
+
 export type Runway = {
   scenario: RunRateInclude
   /** Months of cash left from `date`; null when cash on hand is unknown, Infinity when revenue covers spend, 0 when spent. */
@@ -669,6 +746,8 @@ export type Runway = {
   /** Estimated date cash runs out, or null. */
   runsOutOn: ISODate | null
   text: string
+  /** Provider totals for paydays since the cash-as-of date, when any were entered: cashNow spends these instead of the estimate. */
+  actuals?: PayrollActuals
 }
 
 /** Average days in a month (365.25 / 12). */
@@ -703,7 +782,9 @@ export function runwayMonthsLabel(months: number): string {
  * Runway on `date`. Cash on hand is as of company.cashAsOf, so the net burn since then is spent first:
  * cashNow = cash on hand - today's burn x days since cashAsOf / 30.4375, and months = cashNow / scenario burn,
  * where burn = payroll + other monthly spend + contractors - monthly revenue. The spend since cashAsOf uses
- * today's burn in every scenario, because planned hires were not on payroll then.
+ * today's burn in every scenario, because planned hires were not on payroll then. Paydays since cashAsOf with
+ * totals entered from the provider count what payroll really cost (payrollActualsBetween): cashNow also spends
+ * the difference between those totals and the estimate. Future months stay estimates.
  */
 export function runway(db: DB, date: ISODate, scenario: RunRateInclude = 'now', opts: TaxOptions = {}): Runway {
   const rr = runRate(db, date, { include: scenario, ...opts })
@@ -713,8 +794,11 @@ export function runway(db: DB, date: ISODate, scenario: RunRateInclude = 'now', 
   const burn = rr.monthly + other + rr.contractorsMonthly - revenue
   const rrNow = scenario === 'now' ? rr : runRate(db, date, { include: 'now', ...opts })
   const burnSoFar = rrNow.monthly + other + rrNow.contractorsMonthly - revenue
+  const asOf = c.cashAsOf && c.cashAsOf < date ? c.cashAsOf : date
+  const actuals = c.cashOnHand == null ? null : payrollActualsBetween(db, asOf, date, rrNow)
   const base = {
     scenario,
+    ...(actuals ? { actuals } : {}),
     cashOnHand: c.cashOnHand ?? null,
     ...(c.cashAsOf ? { cashAsOf: c.cashAsOf } : {}),
     payrollMonthly: rr.monthly,
@@ -726,8 +810,8 @@ export function runway(db: DB, date: ISODate, scenario: RunRateInclude = 'now', 
   if (c.cashOnHand == null) {
     return { ...base, cashNow: null, months: null, runsOutOn: null, text: 'Add cash on hand in Settings to see runway.' }
   }
-  const asOf = c.cashAsOf && c.cashAsOf < date ? c.cashAsOf : date
-  const cashNow = c.cashOnHand - (burnSoFar * daysBetween(asOf, date)) / DAYS_PER_MONTH
+  const extra = actuals?.difference ?? 0
+  const cashNow = c.cashOnHand - (burnSoFar * daysBetween(asOf, date)) / DAYS_PER_MONTH - extra
   const stale = asOf < date && daysBetween(asOf, date) > STALE_CASH_DAYS ? ` (cash as of ${fmtDate(asOf)})` : ''
   if (burn <= 0) {
     return {
@@ -739,7 +823,7 @@ export function runway(db: DB, date: ISODate, scenario: RunRateInclude = 'now', 
     }
   }
   if (cashNow <= 0) {
-    const runsOutOn = burnSoFar > 0 ? addDays(asOf, Math.max(0, Math.floor((c.cashOnHand / burnSoFar) * DAYS_PER_MONTH))) : date
+    const runsOutOn = burnSoFar > 0 ? addDays(asOf, Math.max(0, Math.floor(((c.cashOnHand - extra) / burnSoFar) * DAYS_PER_MONTH))) : date
     return {
       ...base,
       cashNow: Math.round(cashNow),

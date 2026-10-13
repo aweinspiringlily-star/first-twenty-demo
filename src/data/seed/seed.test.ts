@@ -10,13 +10,15 @@ import { boardConsentQueue, cliffDate, poolSummary, sharesHeld, vestedShares } f
 import { allScorecardsOwed } from '@/domain/hiring/scorecards'
 import { postingBlockReason, postingHeadcount } from '@/domain/hiring/postings'
 import { pacificDateOf } from '@/domain/hiring/util'
-import { exemptCheck, exemptFlags } from '@/domain/pay'
+import { currentComp, exemptCheck, exemptFlags } from '@/domain/pay'
+import { payCalendar, payRunPrep, periodStarting } from '@/domain/payrun'
 import { employmentState, headcountOn, incomingOn, onLeave } from '@/domain/people'
 import { pendingApprovals, whoIsOut } from '@/domain/timeoff'
 import { trainingRequirements } from '@/domain/trainings'
 import type { DB, EntityType, ID } from '@/domain/types'
 import { addDays, setClockOverride } from '@/lib/dates'
 import { buildSampleDB, SAMPLE_ANCHOR } from './index'
+import { samplePayRuns } from './payroll'
 
 const TODAY = '2026-10-09'
 
@@ -292,7 +294,8 @@ describe('composed sample: headcount and people', () => {
     expect(employmentState(omar, TODAY, db)).toBe('former')
     expect(omar.endDate).toBe('2026-08-28')
     expect(omar.separation).toMatchObject({ type: 'resigned_notice', noticeGivenOn: '2026-08-14', lastDay: '2026-08-28', rehireEligible: true, finalPayIssuedOn: '2026-08-28' })
-    expect(db.people.filter((p) => p.endDate).map((p) => p.id)).toEqual(['p-omar'])
+    // The only former employee on the anchor (Luis gave notice; his last day is Nov 10, see pay run prep below).
+    expect(db.people.filter((p) => p.endDate && p.endDate < TODAY).map((p) => p.id)).toEqual(['p-omar'])
   })
 
   it('stores no protected characteristics or identity numbers on people', () => {
@@ -679,5 +682,88 @@ describe('composed sample: seeded situations (docs/SAMPLE.md)', () => {
     }
     const newest = db.people.filter((p) => p.startDate <= TODAY && !p.endDate).sort((a, b) => b.startDate.localeCompare(a.startDate))[0]
     expect(newest.id).toBe('p-aisha')
+  })
+})
+
+describe('composed sample: pay run prep (docs/SPEC.md PAY RUN PREP)', () => {
+  const prep = (start: string) => {
+    const period = periodStarting(db, start)
+    if (!period) throw new Error(`no period starts ${start}`)
+    return payRunPrep(db, period, TODAY)
+  }
+  const rowOf = (start: string, id: ID) => {
+    const r = prep(start).rows.find((x) => x.personId === id)
+    if (!r) throw new Error(`${id} is not on the ${start} payroll`)
+    return r
+  }
+
+  it('marks the six payrolls through Sep 30 submitted on their cutoff days, with the PEO totals for September', () => {
+    const runs = db.company.payRuns ?? []
+    expect(runs.map((r) => [r.periodStart, r.payday, r.submittedOn])).toEqual([
+      ['2026-07-01', '2026-07-15', '2026-07-13'],
+      ['2026-07-16', '2026-07-31', '2026-07-29'],
+      ['2026-08-01', '2026-08-14', '2026-08-12'],
+      ['2026-08-16', '2026-08-31', '2026-08-27'],
+      ['2026-09-01', '2026-09-15', '2026-09-11'],
+      ['2026-09-16', '2026-09-30', '2026-09-28'],
+    ])
+    expect(runs.every((r) => r.submittedById === 'p-jasmine')).toBe(true)
+    expect(runs.filter((r) => r.totals).map((r) => [r.periodStart, r.totals?.enteredOn])).toEqual([
+      ['2026-09-01', '2026-09-16'],
+      ['2026-09-16', '2026-10-01'],
+    ])
+    // Each record matches the pay calendar exactly, and the next payroll (Oct 1-15, payday Thu Oct 15) is still open.
+    const cal = payCalendar(db, '2026-07-01', '2026-09-30')
+    expect(runs.map((r) => [r.periodEnd, r.payday])).toEqual(cal.map((p) => [p.end, p.payday]))
+    expect(prep('2026-10-01').status).toBe('open')
+    // The first payroll date (the EDD clock) stays the real one.
+    expect(db.company.firstPayrollOn).toBe('2025-05-15')
+  })
+
+  it('rebuilds the submitted payrolls from the calendar for the day the sample is shifted to', () => {
+    // Fri Oct 30: the Oct 16-31 cutoff (Wed Oct 28) has passed, its payday is today, so the totals are the two before.
+    const runs = samplePayRuns(db, '2026-10-30')
+    expect(runs.map((r) => r.periodStart)).toEqual(['2026-08-01', '2026-08-16', '2026-09-01', '2026-09-16', '2026-10-01', '2026-10-16'])
+    expect(runs.filter((r) => r.totals).map((r) => [r.periodStart, r.totals?.enteredOn])).toEqual([
+      ['2026-09-16', '2026-10-01'],
+      ['2026-10-01', '2026-10-16'],
+    ])
+  })
+
+  it("pays Lucas's prorated first check with his sign-on bonus: 195,000 / 260 x 10 weekdays + 10,000", () => {
+    const offer = db.offers.find((o) => o.personId === 'p-lucas' && o.status === 'accepted')
+    expect(offer?.signOnBonus).toBe(10_000)
+    const task = db.checklists.find((c) => c.personId === 'p-lucas' && c.kind === 'onboarding')?.tasks.find((t) => /sign-on bonus/i.test(t.title))
+    expect(task).toMatchObject({ status: 'open', dueOn: '2026-10-19' })
+    const lucas = rowOf('2026-10-16', 'p-lucas')
+    expect(lucas).toMatchObject({ startInPeriod: '2026-10-19', weekdays: 11, weekdaysOnPayroll: 10, salaryEstimate: 7500, bonus: 10_000, estimatedGross: 17_500 })
+  })
+
+  it("splits Nikhil's Oct 16-31 check at his raise on Wed Oct 21: 8,333.33 x 3/11 + 8,916.67 x 8/11", () => {
+    expect(currentComp(db, 'p-nikhil', TODAY)?.salary).toBe(200_000)
+    const raise = db.comp.find((c) => c.id === 'cr-nikhil-merit-2026-10')
+    expect(raise).toMatchObject({ effectiveOn: '2026-10-21', salary: 214_000, reason: 'merit', scheduled: true })
+    const change = db.checklists.find((c) => c.id === 'ck-change-nikhil')
+    expect(change?.tasks.length).toBeGreaterThan(0)
+    expect(change?.tasks.filter((t) => t.status === 'open')).toEqual([])
+    const nikhil = rowOf('2026-10-16', 'p-nikhil')
+    expect(nikhil.estimatedGross).toBe(8757.58)
+    expect(nikhil.payChanges).toEqual([{ effectiveOn: '2026-10-21', from: { payType: 'salary', salary: 200_000, hourlyRate: undefined }, to: { payType: 'salary', salary: 214_000, hourlyRate: undefined } }])
+  })
+
+  it("shows Luis's last day: final pay due Tue Nov 10, before the Fri Nov 13 payday, with his vacation paid out", () => {
+    const luis = person('p-luis')
+    expect(luis.separation).toMatchObject({ type: 'resigned_notice', noticeGivenOn: '2026-10-08', lastDay: '2026-11-10', rehireEligible: true })
+    expect(db.people.filter((p) => p.endDate).map((p) => p.id)).toEqual(['p-omar', 'p-luis'])
+    expect(employmentState(luis, TODAY, db)).not.toBe('former')
+    expect(db.checklists.some((c) => c.id === 'ck-off-luis' && c.kind === 'offboarding')).toBe(true)
+    // 16 when Mei starts, 15 after Luis's last day.
+    expect(headcountOn(db, '2026-11-10')).toBe(16)
+    expect(headcountOn(db, '2026-11-11')).toBe(15)
+    const r = rowOf('2026-11-01', 'p-luis')
+    expect(r.finalPay).toMatchObject({ dueOn: '2026-11-10', rule: 'last_day', beforePayday: true })
+    expect(r.flags.map((f) => f.kind)).toContain('final_pay_off_cycle')
+    expect(r.vacationPayout?.rate).toBe(30)
+    expect(r.vacationPayout?.hours).toBeGreaterThan(0)
   })
 })
