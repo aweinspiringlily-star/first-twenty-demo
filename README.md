@@ -14,6 +14,11 @@
 This repository is a snapshot of the source. The optional server (Fastify and Postgres, local-first
 sync) and its EC2 deploy kit are included: see `docs/SERVER.md` and `docs/SYNC.md`.
 
+## License
+
+Anyone may use, change, share and sell First Twenty, as long as they keep the license notice. It is
+under the Apache License 2.0: see [LICENSE](LICENSE).
+
 ---
 
 
