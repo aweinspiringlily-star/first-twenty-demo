@@ -55,21 +55,21 @@
 :where(:root),
 [data-look="sleek"] {
   /* Color */
-  --paper: #e8f4ec;
-  --surface: #f3faf5;
-  --surface-2: #dcece1;
-  --surface-3: #cde1d3;
+  --paper: #cfeedb;
+  --surface: #e6f7ec;
+  --surface-2: #c3e6cf;
+  --surface-3: #b0dbbf;
   --ink: #000000;
   --ink-2: #262626;
   --ink-3: #575757;
-  --line: #b8cfbf;
-  --line-strong: #6f8c7a;
+  --line: #9cc4aa;
+  --line-strong: #5f8a70;
   /* Borders that are the only cue a control exists (inputs, switches): 4.5:1 on the paper. */
-  --control-border: #5f7d6b;
+  --control-border: #4f7a60;
   --accent: #0b6b3a;
   --accent-hover: #07502a;
   --accent-ink: #ffffff;
-  --accent-soft: #d6ecdd;
+  --accent-soft: #c9ecd5;
   --accent-soft-ink: #07502a;
   --good: #0e6b35;
   --good-soft: #e8f3eb;
@@ -96,7 +96,7 @@
   --sleek-selection: rgb(11 107 58 / 0.2);
   /* The scrim's alpha as a mix amount: the page gutter beside a dialog takes the scrimmed paper tone. */
   --sleek-scrim-mix: 38%;
-  --sleek-raised: #f3faf5;
+  --sleek-raised: #e6f7ec;
   /* Chosen values (segments, single chips, date picks): inverse ink, never the action color. */
   --sleek-pick: #000000;
   --sleek-pick-ink: #ffffff;
