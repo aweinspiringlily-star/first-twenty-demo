@@ -21,7 +21,7 @@
   Color:
   - Ink does everything structural. Hierarchy comes from size, weight, case and spacing; ink-2 is a dark
     secondary for metadata only, never a pale gray.
-  - One accent, green (#0b6b3a light, #1b7f4a dark), for action and place: the primary button, the
+  - One accent, sea green (#1a6f46 light, #1b7f4a dark), for action and place: the primary button, the
     4px bar that marks where you are (nav item, tab, selected board card), the current stage, and the
     keyboard focus ring. Choosing a value (a segment, a chip, a date pick) is not an action, so it is drawn
     as inverse ink and can never be mistaken for the primary button beside it. Links are ink with an
@@ -55,29 +55,29 @@
 :where(:root),
 [data-look="sleek"] {
   /* Color */
-  --paper: #cfeedb;
-  --surface: #e6f7ec;
-  --surface-2: #c3e6cf;
-  --surface-3: #b0dbbf;
+  --paper: #c4e8d8;
+  --surface: #e1f4ea;
+  --surface-2: #b4dcc8;
+  --surface-3: #a0d0b8;
   --ink: #000000;
   --ink-2: #262626;
   --ink-3: #575757;
-  --line: #9cc4aa;
-  --line-strong: #5f8a70;
+  --line: #8cbfa6;
+  --line-strong: #4f8a6c;
   /* Borders that are the only cue a control exists (inputs, switches): 4.5:1 on the paper. */
-  --control-border: #4f7a60;
-  --accent: #0b6b3a;
-  --accent-hover: #07502a;
+  --control-border: #3f7a5c;
+  --accent: #1a6f46;
+  --accent-hover: #124f32;
   --accent-ink: #ffffff;
-  --accent-soft: #c9ecd5;
-  --accent-soft-ink: #07502a;
+  --accent-soft: #b9e3cf;
+  --accent-soft-ink: #124f32;
   --good: #0e6b35;
   --good-soft: #e8f3eb;
   --warn: #8a5300;
   --warn-soft: #fbf0dd;
   --bad: #c2170c;
   --bad-soft: #fcebea;
-  --focus: #0b6b3a;
+  --focus: #1a6f46;
   --scrim: rgb(0 0 0 / 0.38);
   /* Categorical chart hues: the dataviz reference set, validated on #ffffff (light slots 3-5 sit under
      3:1, so categorical charts always carry direct labels or a table). */
@@ -93,16 +93,16 @@
   --sleek-rule: #000000;
   --sleek-hover: rgb(0 0 0 / 0.045);
   --sleek-press: rgb(0 0 0 / 0.1);
-  --sleek-selection: rgb(11 107 58 / 0.2);
+  --sleek-selection: rgb(26 111 70 / 0.2);
   /* The scrim's alpha as a mix amount: the page gutter beside a dialog takes the scrimmed paper tone. */
   --sleek-scrim-mix: 38%;
-  --sleek-raised: #e6f7ec;
+  --sleek-raised: #e1f4ea;
   /* Chosen values (segments, single chips, date picks): inverse ink, never the action color. */
   --sleek-pick: #000000;
   --sleek-pick-ink: #ffffff;
   /* The accent where it is a line or a word rather than a fill (focus ring, checks): the fill itself in
      light, a lighter tint of the same blue in dark. */
-  --sleek-accent-line: #0b6b3a;
+  --sleek-accent-line: #1a6f46;
   /* Weights. Dark mode thins them a step (light words on near-black bloom); Archivo is variable. */
   --sleek-w-regular: 400;
   --sleek-w-medium: 500;
