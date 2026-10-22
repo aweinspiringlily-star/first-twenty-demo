@@ -114,8 +114,8 @@
   --sleek-gutter: 40px;
 
   /* Type: one family. Key caps alone use the system mono (no web font). */
-  --font-display: "Archivo Variable", "Helvetica Neue", Arial, sans-serif;
-  --font-body: "Archivo Variable", "Helvetica Neue", Arial, system-ui, sans-serif;
+  --font-display: "Merriweather", Georgia, "Times New Roman", serif;
+  --font-body: "Merriweather", Georgia, "Times New Roman", serif;
   --font-mono: "Cascadia Mono", Consolas, ui-monospace, "SF Mono", monospace;
   --font-size-base: 14px;
   --line-height-base: 1.45;
