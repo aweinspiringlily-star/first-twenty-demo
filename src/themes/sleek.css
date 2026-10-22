@@ -21,7 +21,7 @@
   Color:
   - Ink does everything structural. Hierarchy comes from size, weight, case and spacing; ink-2 is a dark
     secondary for metadata only, never a pale gray.
-  - One accent, sea green (#1a6f46 light, #34a56b dark), for action and place: the primary button, the
+  - One accent, sky blue (#0b6aa8 light, #4aa8e0 dark), for action and place: the primary button, the
     4px bar that marks where you are (nav item, tab, selected board card), the current stage, and the
     keyboard focus ring. Choosing a value (a segment, a chip, a date pick) is not an action, so it is drawn
     as inverse ink and can never be mistaken for the primary button beside it. Links are ink with an
@@ -55,29 +55,29 @@
 :where(:root),
 [data-look="sleek"] {
   /* Color */
-  --paper: #c4e8d8;
-  --surface: #e1f4ea;
-  --surface-2: #b4dcc8;
-  --surface-3: #a0d0b8;
+  --paper: #cfe8fa;
+  --surface: #e8f4fd;
+  --surface-2: #bddcf3;
+  --surface-3: #aacfec;
   --ink: #000000;
   --ink-2: #262626;
   --ink-3: #575757;
-  --line: #8cbfa6;
-  --line-strong: #4f8a6c;
+  --line: #94bfe0;
+  --line-strong: #4f86b3;
   /* Borders that are the only cue a control exists (inputs, switches): 4.5:1 on the paper. */
-  --control-border: #3f7a5c;
-  --accent: #1a6f46;
-  --accent-hover: #124f32;
+  --control-border: #3f77a5;
+  --accent: #0b6aa8;
+  --accent-hover: #08507f;
   --accent-ink: #ffffff;
-  --accent-soft: #b9e3cf;
-  --accent-soft-ink: #124f32;
+  --accent-soft: #c3e2f7;
+  --accent-soft-ink: #08507f;
   --good: #0e6b35;
   --good-soft: #e8f3eb;
   --warn: #8a5300;
   --warn-soft: #fbf0dd;
   --bad: #c2170c;
   --bad-soft: #fcebea;
-  --focus: #1a6f46;
+  --focus: #0b6aa8;
   --scrim: rgb(0 0 0 / 0.38);
   /* Categorical chart hues: the dataviz reference set, validated on #ffffff (light slots 3-5 sit under
      3:1, so categorical charts always carry direct labels or a table). */
@@ -93,16 +93,16 @@
   --sleek-rule: #000000;
   --sleek-hover: rgb(0 0 0 / 0.045);
   --sleek-press: rgb(0 0 0 / 0.1);
-  --sleek-selection: rgb(26 111 70 / 0.2);
+  --sleek-selection: rgb(11 106 168 / 0.2);
   /* The scrim's alpha as a mix amount: the page gutter beside a dialog takes the scrimmed paper tone. */
   --sleek-scrim-mix: 38%;
-  --sleek-raised: #e1f4ea;
+  --sleek-raised: #e8f4fd;
   /* Chosen values (segments, single chips, date picks): inverse ink, never the action color. */
   --sleek-pick: #000000;
   --sleek-pick-ink: #ffffff;
   /* The accent where it is a line or a word rather than a fill (focus ring, checks): the fill itself in
      light, a lighter tint of the same blue in dark. */
-  --sleek-accent-line: #1a6f46;
+  --sleek-accent-line: #0b6aa8;
   /* Weights. Dark mode thins them a step (light words on near-black bloom); Archivo is variable. */
   --sleek-w-regular: 400;
   --sleek-w-medium: 500;
@@ -149,28 +149,28 @@
    blue (hue 218, never periwinkle) for the focus ring; weights a step thinner. */
 @media (prefers-color-scheme: dark) {
   [data-look="sleek"]:not([data-theme="light"]) {
-    --paper: #0d2a1c;
-    --surface: #0d2a1c;
-    --surface-2: #143826;
-    --surface-3: #1c4733;
+    --paper: #0d2236;
+    --surface: #0d2236;
+    --surface-2: #14324d;
+    --surface-3: #1c4263;
     --ink: #f3f2ee;
     --ink-2: #dddcd6;
     --ink-3: #aaa9a2;
-    --line: #2f6048;
-    --line-strong: #6fa088;
-    --control-border: #85a392;
-    --accent: #34a56b;
-    --accent-hover: #2b8f5b;
-    --accent-ink: #04210f;
-    --accent-soft: #12402a;
-    --accent-soft-ink: #b7f0cf;
+    --line: #2f5f86;
+    --line-strong: #6f9fc4;
+    --control-border: #86aecb;
+    --accent: #4aa8e0;
+    --accent-hover: #3a92c8;
+    --accent-ink: #04202f;
+    --accent-soft: #123a57;
+    --accent-soft-ink: #bfe3fa;
     --good: #56c78f;
     --good-soft: #10251a;
     --warn: #e3a852;
     --warn-soft: #2b200d;
     --bad: #ff7468;
     --bad-soft: #301513;
-    --focus: #6fd6a0;
+    --focus: #7cc4f0;
     --scrim: rgb(0 0 0 / 0.66);
     --cat-1: #3987e5;
     --cat-2: #d95926;
@@ -181,12 +181,12 @@
     --sleek-rule: #f3f2ee;
     --sleek-hover: rgb(255 255 255 / 0.06);
     --sleek-press: rgb(255 255 255 / 0.13);
-    --sleek-selection: rgb(111 214 160 / 0.3);
+    --sleek-selection: rgb(124 196 240 / 0.3);
     --sleek-scrim-mix: 66%;
-    --sleek-raised: #10311f;
+    --sleek-raised: #10293f;
     --sleek-pick: #f3f2ee;
     --sleek-pick-ink: #141413;
-    --sleek-accent-line: #6fd6a0;
+    --sleek-accent-line: #7cc4f0;
     --sleek-w-regular: 370;
     --sleek-w-medium: 460;
     --sleek-w-semi: 560;
@@ -196,28 +196,28 @@
 }
 
 [data-look="sleek"][data-theme="dark"] {
-  --paper: #0d2a1c;
-  --surface: #0d2a1c;
-  --surface-2: #143826;
-  --surface-3: #1c4733;
+  --paper: #0d2236;
+  --surface: #0d2236;
+  --surface-2: #14324d;
+  --surface-3: #1c4263;
   --ink: #f3f2ee;
   --ink-2: #dddcd6;
   --ink-3: #aaa9a2;
-  --line: #2f6048;
-  --line-strong: #6fa088;
-  --control-border: #85a392;
-  --accent: #34a56b;
-  --accent-hover: #2b8f5b;
-  --accent-ink: #04210f;
-  --accent-soft: #12402a;
-  --accent-soft-ink: #b7f0cf;
+  --line: #2f5f86;
+  --line-strong: #6f9fc4;
+  --control-border: #86aecb;
+  --accent: #4aa8e0;
+  --accent-hover: #3a92c8;
+  --accent-ink: #04202f;
+  --accent-soft: #123a57;
+  --accent-soft-ink: #bfe3fa;
   --good: #56c78f;
   --good-soft: #10251a;
   --warn: #e3a852;
   --warn-soft: #2b200d;
   --bad: #ff7468;
   --bad-soft: #301513;
-  --focus: #6fd6a0;
+  --focus: #7cc4f0;
   --scrim: rgb(0 0 0 / 0.66);
   --cat-1: #3987e5;
   --cat-2: #d95926;
@@ -233,7 +233,7 @@
   --sleek-raised: #191918;
   --sleek-pick: #f3f2ee;
   --sleek-pick-ink: #141413;
-  --sleek-accent-line: #6fd6a0;
+  --sleek-accent-line: #7cc4f0;
   --sleek-w-regular: 370;
   --sleek-w-medium: 460;
   --sleek-w-semi: 560;
