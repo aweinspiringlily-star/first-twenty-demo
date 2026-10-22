@@ -114,8 +114,8 @@
   --sleek-gutter: 40px;
 
   /* Type: one family. Key caps alone use the system mono (no web font). */
-  --font-display: "Merriweather", Georgia, "Times New Roman", serif;
-  --font-body: "Merriweather", Georgia, "Times New Roman", serif;
+  --font-display: "Playfair Display", Georgia, "Times New Roman", serif;
+  --font-body: "Playfair Display", Georgia, "Times New Roman", serif;
   --font-mono: "Cascadia Mono", Consolas, ui-monospace, "SF Mono", monospace;
   --font-size-base: 14px;
   --line-height-base: 1.45;
