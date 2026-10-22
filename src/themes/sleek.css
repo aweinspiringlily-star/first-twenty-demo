@@ -21,7 +21,7 @@
   Color:
   - Ink does everything structural. Hierarchy comes from size, weight, case and spacing; ink-2 is a dark
     secondary for metadata only, never a pale gray.
-  - One accent, sea green (#1a6f46 light, #1b7f4a dark), for action and place: the primary button, the
+  - One accent, sea green (#1a6f46 light, #34a56b dark), for action and place: the primary button, the
     4px bar that marks where you are (nav item, tab, selected board card), the current stage, and the
     keyboard focus ring. Choosing a value (a segment, a chip, a date pick) is not an action, so it is drawn
     as inverse ink and can never be mistaken for the primary button beside it. Links are ink with an
@@ -149,20 +149,20 @@
    blue (hue 218, never periwinkle) for the focus ring; weights a step thinner. */
 @media (prefers-color-scheme: dark) {
   [data-look="sleek"]:not([data-theme="light"]) {
-    --paper: #0f1a14;
-    --surface: #0f1a14;
-    --surface-2: #17261d;
-    --surface-3: #213428;
+    --paper: #0d2a1c;
+    --surface: #0d2a1c;
+    --surface-2: #143826;
+    --surface-3: #1c4733;
     --ink: #f3f2ee;
     --ink-2: #dddcd6;
     --ink-3: #aaa9a2;
-    --line: #2f4a3a;
-    --line-strong: #6f8f7c;
+    --line: #2f6048;
+    --line-strong: #6fa088;
     --control-border: #85a392;
-    --accent: #1b7f4a;
-    --accent-hover: #146438;
-    --accent-ink: #ffffff;
-    --accent-soft: #12291c;
+    --accent: #34a56b;
+    --accent-hover: #2b8f5b;
+    --accent-ink: #04210f;
+    --accent-soft: #12402a;
     --accent-soft-ink: #b7f0cf;
     --good: #56c78f;
     --good-soft: #10251a;
@@ -183,7 +183,7 @@
     --sleek-press: rgb(255 255 255 / 0.13);
     --sleek-selection: rgb(111 214 160 / 0.3);
     --sleek-scrim-mix: 66%;
-    --sleek-raised: #13211a;
+    --sleek-raised: #10311f;
     --sleek-pick: #f3f2ee;
     --sleek-pick-ink: #141413;
     --sleek-accent-line: #6fd6a0;
@@ -196,20 +196,20 @@
 }
 
 [data-look="sleek"][data-theme="dark"] {
-  --paper: #0f1a14;
-  --surface: #0f1a14;
-  --surface-2: #17261d;
-  --surface-3: #213428;
+  --paper: #0d2a1c;
+  --surface: #0d2a1c;
+  --surface-2: #143826;
+  --surface-3: #1c4733;
   --ink: #f3f2ee;
   --ink-2: #dddcd6;
   --ink-3: #aaa9a2;
-  --line: #2f4a3a;
-  --line-strong: #6f8f7c;
+  --line: #2f6048;
+  --line-strong: #6fa088;
   --control-border: #85a392;
-  --accent: #1b7f4a;
-  --accent-hover: #146438;
-  --accent-ink: #ffffff;
-  --accent-soft: #12291c;
+  --accent: #34a56b;
+  --accent-hover: #2b8f5b;
+  --accent-ink: #04210f;
+  --accent-soft: #12402a;
   --accent-soft-ink: #b7f0cf;
   --good: #56c78f;
   --good-soft: #10251a;
