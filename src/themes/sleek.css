@@ -4829,3 +4829,34 @@ html[data-look="sleek"]::-webkit-scrollbar-corner {
     flex: 1 0 100%;
   }
 }
+
+/* Tie-dye page background. Soft blooms of dye in six hues, with a faint ripple of rings like the folds of a
+   twisted shirt, behind the page. The dyes are mixed into --paper, so they come out pastel in light mode and
+   deep jewel tones in dark mode, and the ink keeps its contrast on them. The side rail, panels and form
+   controls keep their solid paper and surface fills, so only the open page area shows the dye. */
+html[data-look="sleek"] {
+  --td-pink: color-mix(in srgb, #ff3d9a 34%, var(--paper));
+  --td-orange: color-mix(in srgb, #ff8a1f 34%, var(--paper));
+  --td-yellow: color-mix(in srgb, #ffd400 38%, var(--paper));
+  --td-green: color-mix(in srgb, #2fd37a 32%, var(--paper));
+  --td-cyan: color-mix(in srgb, #19c3e6 34%, var(--paper));
+  --td-purple: color-mix(in srgb, #8a4dff 32%, var(--paper));
+  background-color: var(--paper);
+  background-image:
+    repeating-radial-gradient(circle at 24% 30%, transparent 0 34px, color-mix(in srgb, var(--ink) 5%, transparent) 34px 37px),
+    repeating-radial-gradient(circle at 80% 72%, transparent 0 42px, color-mix(in srgb, var(--ink) 4%, transparent) 42px 45px),
+    radial-gradient(circle at 12% 18%, var(--td-pink) 0, transparent 38%),
+    radial-gradient(circle at 48% 8%, var(--td-yellow) 0, transparent 36%),
+    radial-gradient(circle at 88% 20%, var(--td-orange) 0, transparent 40%),
+    radial-gradient(circle at 70% 55%, var(--td-purple) 0, transparent 42%),
+    radial-gradient(circle at 20% 70%, var(--td-cyan) 0, transparent 44%),
+    radial-gradient(circle at 50% 92%, var(--td-green) 0, transparent 42%),
+    radial-gradient(circle at 92% 90%, var(--td-pink) 0, transparent 36%);
+  background-attachment: fixed;
+  background-size: cover;
+}
+
+/* The body is transparent so the dye on the page root shows through. */
+html[data-look="sleek"] body {
+  background: transparent;
+}
