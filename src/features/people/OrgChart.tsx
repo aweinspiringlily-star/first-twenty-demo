@@ -1,5 +1,7 @@
-// Org chart: a keyboard-navigable tree (role=tree) built from managerId. Arrow keys move, Right and
-// Left expand or collapse, Home and End jump, Enter opens the profile. Planned roles from the
+// Org chart, built from managerId, in two views. Chart (the default): one rectangle per person, executives and
+// managers on top, each linked by lines to their direct reports below. List: a keyboard-navigable tree (role=tree).
+// The list view: arrow keys move, Right and Left expand or collapse, Home and End jump, Enter opens the
+// profile. Planned roles from the
 // headcount plan show as dashed boxes; incoming people are marked 'Starts Oct 19'.
 import { type CSSProperties, useMemo, useRef, useState } from 'react'
 import { links, navigate } from '@/app/router'
@@ -35,6 +37,7 @@ export function OrgChart() {
     () => buildOrgTree(db, t, { planned: canPlan && showPlanned, contractors: showContractors }),
     [db, t, canPlan, showPlanned, showContractors],
   )
+  const [view, setView] = useState<'chart' | 'list'>('chart')
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const expanded = useMemo(() => new Set(allOrgIds(roots).filter((id) => !collapsed.has(id))), [roots, collapsed])
   const visible = useMemo(() => visibleOrgNodes(roots, expanded), [roots, expanded])
@@ -111,15 +114,106 @@ export function OrgChart() {
     }
   }
 
+
+  // One rectangle in the chart view, with its direct reports in a row below it.
+  const chartNode = (n: OrgNode): React.ReactNode => {
+    const p = n.person
+    const hasKids = n.children.length > 0
+    const isOpen = expanded.has(n.id)
+    const incoming = !!p && p.startDate > t
+    const leave = p ? onLeave(db, p.id, t) : undefined
+    const name =
+      n.kind === 'person' && p
+        ? fullName(p)
+        : n.kind === 'planned' && n.slot
+          ? n.slot.title
+          : n.contractor
+            ? n.contractor.entityName || n.contractor.name
+            : n.id
+    const sub =
+      n.kind === 'person' && p
+        ? p.title
+        : n.kind === 'planned' && n.slot
+          ? `Planned for ${fmtQuarter(n.slot.quarter)}${n.slot.isBackfill ? ', backfill' : ''}`
+          : n.contractor
+            ? n.contractor.scope
+            : ''
+    const label =
+      n.kind === 'person' && p
+        ? `${fullName(p)}, ${p.title}${incoming ? `, starts ${fmtShort(p.startDate)}` : ''}${leave ? ', on leave' : ''}`
+        : n.kind === 'planned' && n.slot
+          ? `Planned role: ${n.slot.title}, ${fmtQuarter(n.slot.quarter)}, ${SLOT_STATUS[n.slotStatus ?? 'planned']}`
+          : `${n.kind === 'advisor' ? 'Advisor' : 'Contractor'}: ${name}`
+    return (
+      <li key={n.id}>
+        <div className="ft-orgchart__cell">
+          <button
+            type="button"
+            aria-label={label}
+            onClick={() => openNode(n)}
+            className={cx(
+              'ft-orgbox',
+              n.kind === 'planned' && 'ft-orgbox--planned',
+              n.kind !== 'planned' && n.kind !== 'person' && 'ft-orgbox--contractor',
+            )}
+          >
+            {n.kind === 'person' && p ? (
+              <Avatar name={name} size={32} />
+            ) : n.kind === 'planned' ? (
+              <span aria-hidden className="ft-orgbox__plus">
+                <Icon name="plus" size={14} />
+              </span>
+            ) : (
+              <Avatar name={name} size={32} muted />
+            )}
+            <span className="ft-orgbox__name">{name}</span>
+            <span className="ft-orgbox__sub">{sub}</span>
+            {(incoming || leave || n.kind !== 'person') && (
+              <span className="ft-orgbox__badges">
+                {incoming && p && <Badge tone="accent">Starts {fmtShort(p.startDate)}</Badge>}
+                {leave && <Badge tone="neutral">On leave</Badge>}
+                {n.kind === 'planned' && <Badge tone={n.slotStatus === 'open' ? 'accent' : 'outline'}>{SLOT_STATUS[n.slotStatus ?? 'planned']}</Badge>}
+                {(n.kind === 'contractor' || n.kind === 'advisor') && <Badge tone="outline">{n.kind === 'advisor' ? 'Advisor' : 'Contractor'}</Badge>}
+              </span>
+            )}
+          </button>
+          {hasKids && (
+            <button
+              type="button"
+              className="ft-orgbox__toggle"
+              aria-expanded={isOpen}
+              aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${name}, ${n.children.length} direct ${n.children.length === 1 ? 'report' : 'reports'}`}
+              onClick={() => toggle(n.id)}
+            >
+              <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={14} />
+              {n.children.length}
+            </button>
+          )}
+        </div>
+        {hasKids && isOpen && <ul>{n.children.map(chartNode)}</ul>}
+      </li>
+    )
+  }
+
   const siblingsOf = (parentId: string | null) => visible.filter((v) => v.parentId === parentId)
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-[13.5px] text-ink-3">
-          <Kbd>↑</Kbd> <Kbd>↓</Kbd> move, <Kbd>→</Kbd> <Kbd>←</Kbd> expand or collapse, <Kbd>Enter</Kbd> opens the profile.
-        </p>
+        {view === 'list' ? (
+          <p className="text-[13.5px] text-ink-3">
+            <Kbd>↑</Kbd> <Kbd>↓</Kbd> move, <Kbd>→</Kbd> <Kbd>←</Kbd> expand or collapse, <Kbd>Enter</Kbd> opens the profile.
+          </p>
+        ) : (
+          <p className="text-[13.5px] text-ink-3">Each box is a person. Lines run from a manager down to their direct reports. Select a box to open the profile.</p>
+        )}
         <div className="flex flex-wrap gap-2">
+          <Button variant={view === 'chart' ? 'primary' : 'ghost'} size="sm" aria-pressed={view === 'chart'} onClick={() => setView('chart')}>
+            Chart
+          </Button>
+          <Button variant={view === 'list' ? 'primary' : 'ghost'} size="sm" aria-pressed={view === 'list'} onClick={() => setView('list')}>
+            List
+          </Button>
           <Button variant="ghost" size="sm" icon="plus" onClick={() => setCollapsed(new Set())}>
             Expand all
           </Button>
@@ -132,7 +226,12 @@ export function OrgChart() {
         {canPlan && <Switch checked={showPlanned} onChange={setShowPlanned} label="Show planned roles" />}
         <Switch checked={showContractors} onChange={setShowContractors} label="Show contractors and advisors" />
       </div>
-      <ul role="tree" aria-label="Org chart" className="flex flex-col gap-1.5">
+      {view === 'chart' && visible.length > 0 && (
+        <div className="ft-orgchart" role="region" aria-label="Org chart, boxes and lines" tabIndex={0}>
+          <ul>{roots.map(chartNode)}</ul>
+        </div>
+      )}
+      <ul role="tree" aria-label="Org chart" className={view === 'list' ? 'flex flex-col gap-1.5' : 'hidden'}>
         {visible.map((row, i) => {
           const n = row.node
           const hasKids = n.children.length > 0
